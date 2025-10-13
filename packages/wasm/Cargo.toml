@@ -12,3 +12,6 @@ crate-type = ["cdylib"]
 wasm-bindgen = "0.2"
 ndarray = "0.15"
 num_rs_core = { path = "../core-rs" }
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

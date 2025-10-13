@@ -6,6 +6,3 @@ edition = "2021"
 
 [dependencies]
 ndarray = { version = "0.15", features = ["std"] }
-ndarray-stats = "0.6"
-matrixmultiply = "0.3"
-rand = "0.8"

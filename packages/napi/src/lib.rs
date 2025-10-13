@@ -35,10 +35,8 @@ impl Matrix {
     }
 
     #[napi]
-    pub fn to_vec(&self, env: Env) -> Result<Float64Array> {
-        let mut arr = Float64Array::new(env, self.data.len() as u32)?;
-        arr.copy_from(&self.data)?;
-        Ok(arr)
+    pub fn to_vec(&self) -> Result<Float64Array> {
+        Ok(Float64Array::from(self.data.clone()))
     }
 }
 

@@ -3,14 +3,21 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "npm run build:backends && npm run build:js",
+    "build:backends": "npm run build:napi && npm run build:wasm",
+    "build:js": "npm --prefix packages/js run build",
+    "build:napi": "npm --prefix packages/napi run build",
+    "build:wasm": "npm --prefix packages/wasm run build"
   },
   "workspaces": [
     "packages/*"
   ],
   "devDependencies": {
+    "@napi-rs/cli": "^2.16.4",
     "tsup": "^8",
-    "typescript": "^5"
+    "typescript": "^5",
+    "wasm-pack": "^0.10.3"
   },
   "keywords": [],
   "author": "",
