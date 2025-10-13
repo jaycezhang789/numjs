@@ -5,6 +5,16 @@
 
 export declare function add(a: Matrix, b: Matrix): Matrix
 export declare function matmul(a: Matrix, b: Matrix): Matrix
+export declare function clip(matrix: Matrix, min: number, max: number): Matrix
+export declare function whereSelect(condition: Matrix, truthy: Matrix, falsy: Matrix): Matrix
+export declare function concat(a: Matrix, b: Matrix, axis: number): Matrix
+export declare function stack(a: Matrix, b: Matrix, axis: number): Matrix
+export declare function svd(matrix: Matrix): object
+export declare function qr(matrix: Matrix): object
+export declare function solve(a: Matrix, b: Matrix): Matrix
+export declare function eigen(matrix: Matrix): object
+export declare function readNpy(buffer: Buffer): Matrix
+export declare function writeNpy(matrix: Matrix): Buffer
 export class Matrix {
   constructor(data: Float64Array, rows: number, cols: number)
   get rows(): number
