@@ -1,6 +1,6 @@
 {
   "name": "@jayce789/numjs",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -19,7 +19,14 @@
     "typescript": "^5",
     "wasm-pack": "^0.10.3"
   },
-  "keywords": [],
+  "keywords": [
+    "numerical",
+    "matrix",
+    "linear-algebra",
+    "wasm",
+    "napi",
+    "typescript"
+  ],
   "author": "",
   "license": "ISC",
   "description": ""
