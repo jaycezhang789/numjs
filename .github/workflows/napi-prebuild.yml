@@ -1,0 +1,133 @@
+name: napi-prebuild
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform_tag: linux-x64-gnu
+            needs_zig: false
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            platform_tag: linux-arm64-gnu
+            needs_zig: true
+          - host: macos-13
+            target: x86_64-apple-darwin
+            platform_tag: darwin-x64
+            needs_zig: false
+          - host: macos-13
+            target: aarch64-apple-darwin
+            platform_tag: darwin-arm64
+            needs_zig: false
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform_tag: win32-x64-msvc
+            needs_zig: false
+          - host: windows-latest
+            target: aarch64-pc-windows-msvc
+            platform_tag: win32-arm64-msvc
+            needs_zig: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm install
+        shell: bash
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        if: ${{ matrix.needs_zig }}
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Build native addon
+        run: npm --prefix packages/napi run build -- --platform --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Prepare artifact (POSIX)
+        if: ${{ matrix.host != 'windows-latest' }}
+        run: |
+          mkdir -p artifacts
+          cp "packages/napi/index.${{ matrix.platform_tag }}.node" artifacts/
+        shell: bash
+
+      - name: Prepare artifact (Windows)
+        if: ${{ matrix.host == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Copy-Item "packages/napi/index.${{ matrix.platform_tag }}.node" artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: artifacts/*
+          retention-days: 7
+
+  publish:
+    name: Publish platform packages
+    needs: build
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bindings-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Distribute binaries into npm packages
+        working-directory: packages/js
+        run: npx @napi-rs/cli@2.16.4 artifacts -d ../artifacts --dist npm
+
+      - name: Publish platform-specific packages
+        working-directory: packages/js
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN is not configured; skipping publish step."
+            exit 0
+          fi
+          npx @napi-rs/cli@2.16.4 prepublish -p npm --skip-gh-release

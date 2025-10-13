@@ -1,0 +1,18 @@
+{
+  "name": "@jayce789/numjs-linux-x64-gnu",
+  "version": "0.1.0",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "index.linux-x64-gnu.node",
+  "files": [
+    "index.linux-x64-gnu.node"
+  ],
+  "description": "NumPy-inspired numerical computing for JavaScript with automatic Node N-API fallback to WebAssembly.",
+  "libc": [
+    "glibc"
+  ]
+}

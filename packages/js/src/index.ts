@@ -18,6 +18,42 @@ type BackendModule = {
 
 const WASM_ENTRY = "./bindings/wasm/num_rs_wasm.js";
 const NAPI_ENTRY = "./bindings/napi/index.node";
+const NAPI_BINDING_PREFIX = "./bindings/napi/index";
+
+type NapiDistribution = {
+  packages: readonly string[];
+  binaries: readonly string[];
+};
+
+const NAPI_DISTRIBUTIONS: Record<string, NapiDistribution> = {
+  "win32-x64": {
+    packages: ["@jayce789/numjs-win32-x64-msvc"],
+    binaries: ["win32-x64-msvc"],
+  },
+  "win32-arm64": {
+    packages: ["@jayce789/numjs-win32-arm64-msvc"],
+    binaries: ["win32-arm64-msvc"],
+  },
+  "darwin-x64": {
+    packages: ["@jayce789/numjs-darwin-x64"],
+    binaries: ["darwin-x64"],
+  },
+  "darwin-arm64": {
+    packages: [
+      "@jayce789/numjs-darwin-arm64",
+      "@jayce789/numjs-darwin-x64",
+    ],
+    binaries: ["darwin-arm64", "darwin-x64"],
+  },
+  "linux-x64": {
+    packages: ["@jayce789/numjs-linux-x64-gnu"],
+    binaries: ["linux-x64-gnu"],
+  },
+  "linux-arm64": {
+    packages: ["@jayce789/numjs-linux-arm64-gnu"],
+    binaries: ["linux-arm64-gnu"],
+  },
+};
 
 let activeBackend: BackendModule | null = null;
 let activeKind: BackendKind | null = null;
@@ -46,16 +82,21 @@ async function loadBackend(): Promise<void> {
 }
 
 async function loadNapiBackend(): Promise<BackendModule | null> {
-  try {
-    if (typeof require === "function") {
-      return require(NAPI_ENTRY) as BackendModule;
+  const candidates = resolveNapiCandidates();
+  for (const specifier of candidates) {
+    try {
+      const required = (await getRequire())(specifier) as BackendModule;
+      return required;
+    } catch (error) {
+      if (!isModuleNotFound(error)) {
+        console.warn(
+          `[numjs] Failed to load native backend from "${specifier}". Falling back if possible.`,
+          error
+        );
+      }
     }
-    const { createRequire } = await import("node:module");
-    const localRequire = createRequire(import.meta.url);
-    return localRequire(NAPI_ENTRY) as BackendModule;
-  } catch {
-    return null;
   }
+  return null;
 }
 
 async function loadWasmBackend(): Promise<BackendModule> {
@@ -146,4 +187,39 @@ export function backendKind(): BackendKind {
     throw new Error("Backend not initialised. Call init() first.");
   }
   return activeKind;
+}
+
+async function getRequire(): Promise<(id: string) => unknown> {
+  if (typeof require === "function") {
+    return require;
+  }
+  const { createRequire } = await import("node:module");
+  return createRequire(import.meta.url);
+}
+
+function resolveNapiCandidates(): string[] {
+  if (!isNode) {
+    return [];
+  }
+  const platformKey = `${process.platform}-${process.arch}`;
+  const distribution = NAPI_DISTRIBUTIONS[platformKey];
+  const candidates = new Set<string>();
+  if (distribution) {
+    for (const pkg of distribution.packages) {
+      candidates.add(pkg);
+    }
+    for (const suffix of distribution.binaries) {
+      candidates.add(`${NAPI_BINDING_PREFIX}.${suffix}.node`);
+    }
+  }
+  candidates.add(NAPI_ENTRY);
+  return Array.from(candidates);
+}
+
+function isModuleNotFound(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const candidate = error as { code?: unknown };
+  return candidate.code === "MODULE_NOT_FOUND";
 }

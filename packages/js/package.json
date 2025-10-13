@@ -28,5 +28,18 @@
     "@types/node": "^20",
     "tsup": "^8",
     "typescript": "^5"
+  },
+  "napi": {
+    "name": "index",
+    "package": {
+      "name": "@jayce789/numjs"
+    },
+    "triples": {
+      "additional": [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-pc-windows-msvc"
+      ]
+    }
   }
 }
