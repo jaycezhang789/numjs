@@ -1,0 +1,16 @@
+# Node / pnpm / npm
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# TypeScript build output
+dist/
+
+# Rust build output
+target/
+Cargo.lock
+
+# Misc
+.DS_Store
+*.log

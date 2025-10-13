@@ -1,0 +1,7 @@
+{
+  "name": "@jayce789/numjs-wasm",
+  "private": true,
+  "scripts": {
+    "build": "npx wasm-pack@0.10.3 build --release --target web --out-name num_rs_wasm --out-dir pkg"
+  }
+}

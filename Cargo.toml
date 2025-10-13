@@ -1,0 +1,7 @@
+[workspace]
+members = [
+"packages/core-rs",
+"packages/wasm",
+"packages/napi",
+]
+resolver = "2"

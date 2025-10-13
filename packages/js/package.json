@@ -1,0 +1,32 @@
+{
+  "name": "@jayce789/numjs",
+  "version": "0.1.0",
+  "description": "NumPy-inspired numerical computing for JavaScript with automatic Node N-API fallback to WebAssembly.",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist/**/*",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "npm run build:js && npm run copy:artifacts",
+    "build:js": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "copy:artifacts": "node ./scripts/copy-artifacts.mjs",
+    "prepublishOnly": "npm --prefix ../wasm run build && npm --prefix ../napi run build && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsup": "^8",
+    "typescript": "^5"
+  }
+}
