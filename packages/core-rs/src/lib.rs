@@ -1,6 +1,8 @@
-use cfg_if::cfg_if;
+﻿use cfg_if::cfg_if;
 use ndarray::{concatenate, Array1, Array2, ArrayView2, ArrayViewMut2, Axis};
+#[cfg(feature = "npy")]
 use ndarray_npy::{NpzReader, NpzWriter, ReadNpyExt, WriteNpyExt};
+#[cfg(feature = "npy")]
 use std::io::Cursor;
 
 cfg_if! {
@@ -112,11 +114,13 @@ pub fn eigen(a: ArrayView2<'_, f64>) -> CoreResult<(Array1<f64>, Array2<f64>)> {
     Ok((values, dmatrix_to_array(eigen.eigenvectors)))
 }
 
+#[cfg(feature = "npy")]
 pub fn read_npy_matrix(data: &[u8]) -> CoreResult<Array2<f64>> {
     let mut cursor = Cursor::new(data);
     Array2::<f64>::read_npy(&mut cursor).map_err(|e| e.to_string())
 }
 
+#[cfg(feature = "npy")]
 pub fn write_npy_matrix(matrix: ArrayView2<'_, f64>) -> CoreResult<Vec<u8>> {
     let mut cursor = Cursor::new(Vec::new());
     matrix
@@ -126,6 +130,7 @@ pub fn write_npy_matrix(matrix: ArrayView2<'_, f64>) -> CoreResult<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
+#[cfg(feature = "npy")]
 pub fn read_npz_matrices(data: &[u8]) -> CoreResult<Vec<(String, Array2<f64>)>> {
     let cursor = Cursor::new(data);
     let mut reader = NpzReader::new(cursor).map_err(|e| e.to_string())?;
@@ -138,6 +143,7 @@ pub fn read_npz_matrices(data: &[u8]) -> CoreResult<Vec<(String, Array2<f64>)>> 
     Ok(results)
 }
 
+#[cfg(feature = "npy")]
 pub fn write_npz_matrices(entries: &[(&str, ArrayView2<'_, f64>)]) -> CoreResult<Vec<u8>> {
     let cursor = Cursor::new(Vec::new());
     let mut npz = NpzWriter::new(cursor);
@@ -166,4 +172,24 @@ fn dmatrix_to_array(matrix: DMatrix<f64>) -> Array2<f64> {
     }
     Array2::from_shape_vec((rows, cols), data)
         .expect("nalgebra matrix should map to ndarray shape")
+}
+
+#[cfg(not(feature = "npy"))]
+pub fn read_npy_matrix(_data: &[u8]) -> CoreResult<Array2<f64>> {
+    Err("npy support is disabled".into())
+}
+
+#[cfg(not(feature = "npy"))]
+pub fn write_npy_matrix(_matrix: ArrayView2<'_, f64>) -> CoreResult<Vec<u8>> {
+    Err("npy support is disabled".into())
+}
+
+#[cfg(not(feature = "npy"))]
+pub fn read_npz_matrices(_data: &[u8]) -> CoreResult<Vec<(String, Array2<f64>)>> {
+    Err("npz support is disabled".into())
+}
+
+#[cfg(not(feature = "npy"))]
+pub fn write_npz_matrices(_entries: &[(&str, ArrayView2<'_, f64>)]) -> CoreResult<Vec<u8>> {
+    Err("npz support is disabled".into())
 }

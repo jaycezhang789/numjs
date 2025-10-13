@@ -24,6 +24,9 @@
     "copy:artifacts": "node ./scripts/copy-artifacts.mjs",
     "prepublishOnly": "npm --prefix ../wasm run build && npm --prefix ../napi run build && npm run build"
   },
+  "dependencies": {
+    "fflate": "^0.8.1"
+  },
   "devDependencies": {
     "@types/node": "^20",
     "tsup": "^8",
