@@ -19,6 +19,7 @@
   ],
   "sideEffects": false,
   "scripts": {
+    "test": "node --test ./test/**/*.mjs",
     "build": "npm run build:js && npm run copy:artifacts",
     "build:js": "tsup src/index.ts --format esm,cjs --dts --clean",
     "copy:artifacts": "node ./scripts/copy-artifacts.mjs",

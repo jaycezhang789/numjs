@@ -15,9 +15,16 @@ export declare function solve(a: Matrix, b: Matrix): Matrix
 export declare function eigen(matrix: Matrix): object
 export declare function readNpy(buffer: Buffer): Matrix
 export declare function writeNpy(matrix: Matrix): Buffer
+export declare function copyBytesTotal(): number
+export declare function takeCopyBytes(): number
+export declare function resetCopyBytes(): void
 export class Matrix {
   constructor(data: Float64Array, rows: number, cols: number)
+  static fromBytes(data: Buffer, rows: number, cols: number, dtype: string): Matrix
   get rows(): number
   get cols(): number
+  get dtype(): string
+  astype(dtype: string, copy?: boolean | undefined | null): Matrix
   toVec(): Float64Array
+  toBytes(): Buffer
 }

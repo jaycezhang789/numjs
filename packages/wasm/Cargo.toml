@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "num_rs_wasm"
 version = "0.1.0"
 edition = "2021"
