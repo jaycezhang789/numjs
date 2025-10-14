@@ -1,6 +1,7 @@
 use crate::dtype::DType;
 use crate::element::Element;
 use crate::metrics::record_copy_bytes;
+use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::sync::Arc;
 
@@ -199,6 +200,7 @@ impl MatrixBuffer {
     pub fn to_contiguous_bytes_vec(&self) -> Vec<u8> {
         let mut bytes = vec![0u8; self.len() * self.element_size()];
         self.copy_into_bytes(&mut bytes);
+        record_copy_bytes(bytes.len());
         bytes
     }
 
@@ -501,6 +503,15 @@ impl MatrixBuffer {
         values: &MatrixBuffer,
         pairwise: bool,
     ) -> Result<Self, String> {
+        let values_cow = if values.dtype() == self.dtype() {
+            Cow::Borrowed(values)
+        } else {
+            Cow::Owned(values.cast(self.dtype()).map_err(|err| {
+                format!("scatter: unable to cast source values to destination dtype: {err}")
+            })?)
+        };
+        let values = values_cow.as_ref();
+
         let mut base = self.to_contiguous()?;
         base.ensure_contiguous_mut();
         let elem_size = base.element_size();
