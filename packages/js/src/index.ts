@@ -18,10 +18,13 @@ export type DType =
 type BackendMatrixHandle = {
   readonly rows: number;
   readonly cols: number;
-  readonly dtype: DType;
-  to_vec(): Float64Array | number[];
+  // dtype may be missing on some backends; we cache it separately when needed
+  readonly dtype?: DType;
+  to_vec?(): Float64Array | number[];
+  toVec?(): Float64Array | number[];
   astype(dtype: DType, copy?: boolean): BackendMatrixHandle;
-  to_bytes(): Uint8Array;
+  to_bytes?(): Uint8Array;
+  toBytes?(): Uint8Array;
 };
 
 type BackendMatrixConstructor = {
@@ -30,7 +33,13 @@ type BackendMatrixConstructor = {
     rows: number,
     cols: number
   ): BackendMatrixHandle;
-  from_bytes(
+  from_bytes?(
+    data: Uint8Array,
+    rows: number,
+    cols: number,
+    dtype: DType
+  ): BackendMatrixHandle;
+  fromBytes?(
     data: Uint8Array,
     rows: number,
     cols: number,
@@ -443,12 +452,39 @@ function getHandle(matrix: Matrix): BackendMatrixHandle {
   return matrix["_handle"];
 }
 
+function getMatrixDTypeFromHandle(handle: BackendMatrixHandle): DType {
+  const dt = (handle as any).dtype;
+  if (typeof dt === "string") return dt as DType;
+  // Fallback: many minimal backends expose only float64 vectors
+  return "float64";
+}
+
+function getMatrixDType(matrix: Matrix): DType {
+  const cache = (matrix as any)._dtypeCache as DType | undefined;
+  if (cache) return cache;
+  const dtype = getMatrixDTypeFromHandle(getHandle(matrix));
+  (matrix as any)._dtypeCache = dtype;
+  return dtype;
+}
+
 function toBackendBytes(data: ArrayBuffer | Uint8Array): Uint8Array {
   return data instanceof Uint8Array ? data : new Uint8Array(data);
 }
 
+function callHandleToVec(handle: BackendMatrixHandle): Float64Array | number[] {
+  if (typeof handle.to_vec === "function") return handle.to_vec();
+  if (typeof handle.toVec === "function") return handle.toVec();
+  throw new Error("Backend handle lacks to_vec/toVec method");
+}
+
+function callHandleToBytes(handle: BackendMatrixHandle): Uint8Array {
+  if (typeof handle.to_bytes === "function") return handle.to_bytes();
+  if (typeof handle.toBytes === "function") return handle.toBytes();
+  throw new Error("Backend handle lacks to_bytes/toBytes method");
+}
+
 function handleToFloat64(handle: BackendMatrixHandle): Float64Array {
-  const raw = handle.to_vec();
+  const raw = callHandleToVec(handle);
   return raw instanceof Float64Array ? raw : Float64Array.from(raw);
 }
 
@@ -564,11 +600,11 @@ function typedArrayFromBytes(bytes: Uint8Array, dtype: DType): TypedArray {
 }
 
 function handleToTypedArray(handle: BackendMatrixHandle): TypedArray {
-  const dtype = handle.dtype;
+  const dtype = getMatrixDTypeFromHandle(handle);
   if (dtype === "float64") {
     return handleToFloat64(handle);
   }
-  const bytes = handle.to_bytes();
+  const bytes = callHandleToBytes(handle);
   return typedArrayFromBytes(bytes, dtype);
 }
 
@@ -586,6 +622,7 @@ export async function init(): Promise<void> {
 
 export class Matrix {
   private _handle: BackendMatrixHandle;
+  private _dtypeCache?: DType;
 
   constructor(
     data: MatrixInputData,
@@ -606,8 +643,12 @@ export class Matrix {
     const targetDType = options.dtype ?? inferred ?? "float64";
     const MatrixCtor = backend.Matrix as BackendMatrixConstructor;
 
-    if (isTypedArrayData(data) && inferred && typeof MatrixCtor.from_bytes === "function") {
-      const baseHandle = MatrixCtor.from_bytes(
+    const fromBytes = (MatrixCtor as BackendMatrixConstructor).from_bytes ??
+      (MatrixCtor as BackendMatrixConstructor).fromBytes;
+
+    if (isTypedArrayData(data) && inferred && typeof fromBytes === "function") {
+      const baseHandle = fromBytes.call(
+        MatrixCtor,
         copyTypedArrayToUint8(data),
         rows,
         cols,
@@ -615,16 +656,24 @@ export class Matrix {
       );
       this._handle =
         targetDType === inferred ? baseHandle : baseHandle.astype(targetDType);
+      this._dtypeCache = targetDType;
       return;
     }
 
     const base = new MatrixCtor(toFloat64Array(data), rows, cols);
     this._handle =
       targetDType === "float64" ? base : base.astype(targetDType);
+    this._dtypeCache = targetDType;
   }
 
   static fromHandle(handle: BackendMatrixHandle): Matrix {
     return wrapMatrix(handle);
+  }
+
+  static fromHandleWithDType(handle: BackendMatrixHandle, dtype: DType): Matrix {
+    const m = wrapMatrix(handle);
+    (m as any)._dtypeCache = dtype;
+    return m;
   }
 
   static fromBytes(
@@ -645,7 +694,7 @@ export class Matrix {
   }
 
   get dtype(): DType {
-    return this._handle.dtype;
+    return getMatrixDType(this);
   }
 
   toArray(): TypedArray {
@@ -657,7 +706,7 @@ export class Matrix {
   }
 
   toBytes(): Uint8Array {
-    return this._handle.to_bytes();
+    return callHandleToBytes(this._handle);
   }
 
   clip(min: number, max: number): Matrix {
@@ -715,6 +764,27 @@ export class Matrix {
 
   round(decimals = 12): Matrix {
     return round(this, decimals);
+  }
+
+  toOutputArray(options?: Partial<OutputFormat>): (number | string | bigint)[] {
+    return toOutputArray(this, options);
+  }
+
+  toJSON(): unknown {
+    const format = getOutputFormat();
+    return {
+      rows: this.rows,
+      cols: this.cols,
+      dtype: this.dtype,
+      data: toOutput2D(this, format),
+    };
+  }
+
+  toString(): string {
+    const format = getOutputFormat();
+    const rows = toOutput2D(this, { ...format, as: "string" });
+    const lines = rows.map((row) => row.join("\t"));
+    return `Matrix(${this.rows}x${this.cols}, dtype=${this.dtype})\n` + lines.join("\n");
   }
 }
 
@@ -929,11 +999,13 @@ export function matrixFromBytes(
 ): Matrix {
   const backend = ensureBackend();
   const MatrixCtor = backend.Matrix as BackendMatrixConstructor;
-  if (typeof MatrixCtor.from_bytes !== "function") {
+  const fromBytes = (MatrixCtor as BackendMatrixConstructor).from_bytes ??
+    (MatrixCtor as BackendMatrixConstructor).fromBytes;
+  if (typeof fromBytes !== "function") {
     throw new Error("Matrix.from_bytes is not supported by current backend");
   }
-  const handle = MatrixCtor.from_bytes(toBackendBytes(data), rows, cols, dtype);
-  return Matrix.fromHandle(handle);
+  const handle = fromBytes.call(MatrixCtor, toBackendBytes(data), rows, cols, dtype);
+  return Matrix.fromHandleWithDType(handle, dtype);
 }
 
 export function add(a: Matrix, b: Matrix): Matrix {
@@ -942,7 +1014,7 @@ export function add(a: Matrix, b: Matrix): Matrix {
   const right = castToDType(b, dtype);
   const backend = ensureBackend();
   const result = backend.add(getHandle(left), getHandle(right));
-  return Matrix.fromHandle(result);
+  return Matrix.fromHandleWithDType(result, dtype);
 }
 
 export function matmul(a: Matrix, b: Matrix): Matrix {
@@ -951,7 +1023,7 @@ export function matmul(a: Matrix, b: Matrix): Matrix {
   const right = castToDType(b, dtype);
   const backend = ensureBackend();
   const result = backend.matmul(getHandle(left), getHandle(right));
-  return Matrix.fromHandle(result);
+  return Matrix.fromHandleWithDType(result, dtype);
 }
 
 export function clip(matrix: Matrix, min: number, max: number): Matrix {
@@ -960,7 +1032,7 @@ export function clip(matrix: Matrix, min: number, max: number): Matrix {
     throw new Error("clip is not supported by current backend");
   }
   const result = backend.clip(getHandle(matrix), min, max);
-  return Matrix.fromHandle(result);
+  return Matrix.fromHandleWithDType(result, matrix.dtype);
 }
 
 export function where(
@@ -988,7 +1060,7 @@ export function where(
       getHandle(lhs),
       getHandle(rhs)
     );
-    return Matrix.fromHandle(result);
+    return Matrix.fromHandleWithDType(result, dtype);
   }
 
   const conditionList = Array.isArray(condition) ? condition : [condition];
@@ -1034,7 +1106,7 @@ export function where(
       castChoices.map(getHandle),
       defaultCast ? getHandle(defaultCast) : undefined
     );
-    return Matrix.fromHandle(result);
+    return Matrix.fromHandleWithDType(result, dtype);
   }
 
   const resultData = defaultCast
@@ -1062,7 +1134,7 @@ export function take(
   }
   const normalized = normalizeIndices(indices);
   const result = backend.take(getHandle(matrix), axis, normalized);
-  return Matrix.fromHandle(result);
+  return Matrix.fromHandleWithDType(result, matrix.dtype);
 }
 
 export function put(
@@ -1083,7 +1155,7 @@ export function put(
     normalized,
     getHandle(castValues)
   );
-  return Matrix.fromHandle(result);
+  return Matrix.fromHandleWithDType(result, matrix.dtype);
 }
 
 export function gather(
@@ -1098,7 +1170,7 @@ export function gather(
   const rows = normalizeIndices(rowIndices);
   const cols = normalizeIndices(colIndices);
   const result = backend.gather(getHandle(matrix), rows, cols);
-  return Matrix.fromHandle(result);
+  return Matrix.fromHandleWithDType(result, matrix.dtype);
 }
 
 export function gatherPairs(
@@ -1113,7 +1185,7 @@ export function gatherPairs(
   const rows = normalizeIndices(rowIndices);
   const cols = normalizeIndices(colIndices);
   const result = backend.gather_pairs(getHandle(matrix), rows, cols);
-  return Matrix.fromHandle(result);
+  return Matrix.fromHandleWithDType(result, matrix.dtype);
 }
 
 export function scatter(
@@ -1135,7 +1207,7 @@ export function scatter(
     cols,
     getHandle(castValues)
   );
-  return Matrix.fromHandle(result);
+  return Matrix.fromHandleWithDType(result, matrix.dtype);
 }
 
 export function scatterPairs(
@@ -1157,7 +1229,7 @@ export function scatterPairs(
     cols,
     getHandle(castValues)
   );
-  return Matrix.fromHandle(result);
+  return Matrix.fromHandleWithDType(result, matrix.dtype);
 }
 
 export function concat(a: Matrix, b: Matrix, axis = 0): Matrix {
@@ -1168,7 +1240,7 @@ export function concat(a: Matrix, b: Matrix, axis = 0): Matrix {
     throw new Error("concat is not supported by current backend");
   }
   const result = backend.concat(getHandle(left), getHandle(right), axis);
-  return Matrix.fromHandle(result);
+  return Matrix.fromHandleWithDType(result, dtype);
 }
 
 export function stack(a: Matrix, b: Matrix, axis = 0): Matrix {
@@ -1179,7 +1251,7 @@ export function stack(a: Matrix, b: Matrix, axis = 0): Matrix {
     throw new Error("stack is not supported by current backend");
   }
   const result = backend.stack(getHandle(left), getHandle(right), axis);
-  return Matrix.fromHandle(result);
+  return Matrix.fromHandleWithDType(result, dtype);
 }
 
 export function svd(matrix: Matrix): {
@@ -1193,9 +1265,9 @@ export function svd(matrix: Matrix): {
   }
   const result = backend.svd(getHandle(matrix));
   return {
-    u: Matrix.fromHandle(result.u),
+    u: Matrix.fromHandleWithDType(result.u, matrix.dtype),
     s: result.s,
-    vt: Matrix.fromHandle(result.vt),
+    vt: Matrix.fromHandleWithDType(result.vt, matrix.dtype),
   };
 }
 
@@ -1206,8 +1278,8 @@ export function qr(matrix: Matrix): { q: Matrix; r: Matrix } {
   }
   const result = backend.qr(getHandle(matrix));
   return {
-    q: Matrix.fromHandle(result.q),
-    r: Matrix.fromHandle(result.r),
+    q: Matrix.fromHandleWithDType(result.q, matrix.dtype),
+    r: Matrix.fromHandleWithDType(result.r, matrix.dtype),
   };
 }
 
@@ -1217,7 +1289,7 @@ export function solve(a: Matrix, b: Matrix): Matrix {
     throw new Error("solve is not supported by current backend");
   }
   const result = backend.solve(getHandle(a), getHandle(b));
-  return Matrix.fromHandle(result);
+  return Matrix.fromHandleWithDType(result, a.dtype);
 }
 
 export function eigen(matrix: Matrix): {
@@ -1231,7 +1303,7 @@ export function eigen(matrix: Matrix): {
   const result = backend.eigen(getHandle(matrix));
   return {
     values: result.values,
-    vectors: Matrix.fromHandle(result.vectors),
+    vectors: Matrix.fromHandleWithDType(result.vectors, matrix.dtype),
   };
 }
 
@@ -1240,8 +1312,11 @@ export function readNpy(data: ArrayBuffer | Uint8Array): Matrix {
   if (!backend.read_npy) {
     throw new Error("read_npy is not supported by current backend");
   }
-  const handle = backend.read_npy(toBackendBytes(data));
-  return Matrix.fromHandle(handle);
+  const readNpyFn = (backend as any).read_npy ?? (backend as any).readNpy;
+  const handle = readNpyFn(toBackendBytes(data));
+  // dtype unknown from interface; rely on handle or fallback
+  const m = Matrix.fromHandle(handle);
+  return m;
 }
 
 export function writeNpy(matrix: Matrix): Uint8Array {
@@ -1249,7 +1324,8 @@ export function writeNpy(matrix: Matrix): Uint8Array {
   if (!backend.write_npy) {
     throw new Error("write_npy is not supported by current backend");
   }
-  return backend.write_npy(getHandle(matrix));
+  const writeNpyFn = (backend as any).write_npy ?? (backend as any).writeNpy;
+  return writeNpyFn(getHandle(matrix));
 }
 
 export function copyBytesTotal(): number {
@@ -1257,7 +1333,8 @@ export function copyBytesTotal(): number {
   if (!backend.copy_bytes_total) {
     throw new Error("copy_bytes_total is not supported by current backend");
   }
-  return backend.copy_bytes_total();
+  const fn = (backend as any).copy_bytes_total ?? (backend as any).copyBytesTotal;
+  return fn();
 }
 
 export function takeCopyBytes(): number {
@@ -1265,7 +1342,8 @@ export function takeCopyBytes(): number {
   if (!backend.take_copy_bytes) {
     throw new Error("take_copy_bytes is not supported by current backend");
   }
-  return backend.take_copy_bytes();
+  const fn = (backend as any).take_copy_bytes ?? (backend as any).takeCopyBytes;
+  return fn();
 }
 
 export function resetCopyBytes(): void {
@@ -1273,7 +1351,8 @@ export function resetCopyBytes(): void {
   if (!backend.reset_copy_bytes) {
     throw new Error("reset_copy_bytes is not supported by current backend");
   }
-  backend.reset_copy_bytes();
+  const fn = (backend as any).reset_copy_bytes ?? (backend as any).resetCopyBytes;
+  fn();
 }
 
 export function backendKind(): BackendKind {
@@ -1343,6 +1422,197 @@ export function round(matrix: Matrix, decimals = 12): Matrix {
     }
     return new Matrix(out, matrix.rows, matrix.cols, { dtype });
   }
+}
+
+// ---------------------------------------------------------------------
+// Output formatting context (affects only printing/JSON/export)
+// ---------------------------------------------------------------------
+
+export type OutputAs = "string" | "number" | "bigint";
+
+export type OutputFormat = {
+  as: OutputAs;
+  decimals?: number; // for string/number modes
+  scale?: number; // for bigint (fixed-point) mode
+  trimTrailingZeros?: boolean; // for string mode
+};
+
+const DEFAULT_OUTPUT_FORMAT: OutputFormat = {
+  as: "number",
+  decimals: 12,
+  trimTrailingZeros: true,
+};
+
+let CURRENT_OUTPUT_FORMAT: OutputFormat = { ...DEFAULT_OUTPUT_FORMAT };
+const OUTPUT_FORMAT_STACK: OutputFormat[] = [];
+
+export function setOutputFormat(options: Partial<OutputFormat>): void {
+  CURRENT_OUTPUT_FORMAT = { ...CURRENT_OUTPUT_FORMAT, ...options };
+}
+
+export function getOutputFormat(): OutputFormat {
+  return { ...CURRENT_OUTPUT_FORMAT };
+}
+
+export async function withOutputFormat<T>(
+  options: Partial<OutputFormat>,
+  fn: () => T | Promise<T>
+): Promise<T> {
+  OUTPUT_FORMAT_STACK.push(CURRENT_OUTPUT_FORMAT);
+  try {
+    setOutputFormat(options);
+    return await fn();
+  } finally {
+    const prev = OUTPUT_FORMAT_STACK.pop();
+    if (prev) CURRENT_OUTPUT_FORMAT = prev;
+  }
+}
+
+function formatNumberToString(value: number, decimals = 12, trim = true): string {
+  if (!Number.isFinite(value)) {
+    return String(value);
+  }
+  const s = value.toFixed(decimals);
+  if (!trim) return s;
+  // trim trailing zeros and an optional trailing dot
+  return s.replace(/\.0+$/, "").replace(/(\.[0-9]*?)0+$/, "$1");
+}
+
+function toScaledBigIntFromNumber(value: number, scale: number): bigint {
+  if (!Number.isFinite(value)) {
+    throw new Error(`Cannot convert non-finite number ${value} to bigint with scale ${scale}`);
+  }
+  // Use string rounding to avoid binary float artifacts
+  const s = value.toFixed(Math.max(0, scale));
+  const neg = s.startsWith("-");
+  const abs = neg ? s.slice(1) : s;
+  const [intPart, fracPartRaw = ""] = abs.split(".");
+  const fracPart = fracPartRaw.padEnd(scale, "0").slice(0, scale);
+  const digits = (intPart + fracPart).replace(/^0+/, "");
+  const bi = BigInt(digits.length ? digits : "0");
+  return neg ? -bi : bi;
+}
+
+export function toOutputArray(
+  matrix: Matrix,
+  options: Partial<OutputFormat> = {}
+): (number | string | bigint)[] {
+  const fmt = { ...CURRENT_OUTPUT_FORMAT, ...options } as OutputFormat;
+  const values = matrix.toArray();
+  const length = matrix.rows * matrix.cols;
+
+  if (fmt.as === "string") {
+    const decimals = fmt.decimals ?? DEFAULT_OUTPUT_FORMAT.decimals!;
+    const trim = fmt.trimTrailingZeros ?? DEFAULT_OUTPUT_FORMAT.trimTrailingZeros!;
+    const out = new Array<string>(length);
+    for (let i = 0; i < length; i += 1) {
+      const v = (values as any)[i];
+      if (typeof v === "number") {
+        out[i] = formatNumberToString(v, decimals, trim);
+      } else if (typeof v === "bigint") {
+        out[i] = v.toString();
+      } else if (typeof v === "boolean") {
+        out[i] = v ? "true" : "false";
+      } else {
+        out[i] = String(v);
+      }
+    }
+    return out;
+  }
+
+  if (fmt.as === "bigint") {
+    const scale = fmt.scale;
+    if (!Number.isInteger(scale) || (scale as number) < 0) {
+      throw new Error("toOutputArray(as=\"bigint\"): a non-negative integer 'scale' is required");
+    }
+    const out = new Array<bigint>(length);
+    for (let i = 0; i < length; i += 1) {
+      const v = (values as any)[i];
+      if (typeof v === "number") {
+        out[i] = toScaledBigIntFromNumber(v, scale as number);
+      } else if (typeof v === "bigint") {
+        // integers: multiply by 10^scale
+        const factor = BigInt("1" + "0".repeat(scale as number));
+        out[i] = v * factor;
+      } else if (typeof v === "boolean") {
+        const factor = BigInt("1" + "0".repeat(scale as number));
+        out[i] = (v ? 1n : 0n) * factor;
+      } else {
+        out[i] = 0n;
+      }
+    }
+    return out;
+  }
+
+  // default: as number
+  const decimals = fmt.decimals ?? DEFAULT_OUTPUT_FORMAT.decimals!;
+  const out = new Array<number>(length);
+  for (let i = 0; i < length; i += 1) {
+    const v = (values as any)[i];
+    if (typeof v === "number") {
+      out[i] = parseFloat((v as number).toFixed(decimals));
+    } else if (typeof v === "bigint") {
+      out[i] = Number(v);
+    } else if (typeof v === "boolean") {
+      out[i] = v ? 1 : 0;
+    } else {
+      out[i] = Number(v);
+    }
+  }
+  return out;
+}
+
+export function toOutput2D(
+  matrix: Matrix,
+  options: Partial<OutputFormat> = {}
+): (number | string | bigint)[][] {
+  const flat = toOutputArray(matrix, options);
+  const rows: (number | string | bigint)[][] = [];
+  let index = 0;
+  for (let r = 0; r < matrix.rows; r += 1) {
+    const row: (number | string | bigint)[] = [];
+    for (let c = 0; c < matrix.cols; c += 1) {
+      row.push(flat[index++]);
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+// ---------------------------------------------------------------------
+// Float helpers for comparisons (stability-friendly)
+// ---------------------------------------------------------------------
+
+export function isClose(
+  a: number,
+  b: number,
+  { rtol = 1e-12, atol = 0, equalNaN = false }: { rtol?: number; atol?: number; equalNaN?: boolean } = {}
+): boolean {
+  if (Number.isNaN(a) || Number.isNaN(b)) {
+    return equalNaN && Number.isNaN(a) && Number.isNaN(b);
+  }
+  if (!Number.isFinite(a) || !Number.isFinite(b)) {
+    return a === b;
+  }
+  const diff = Math.abs(a - b);
+  return diff <= atol + rtol * Math.max(Math.abs(a), Math.abs(b));
+}
+
+export function allClose(
+  a: Matrix,
+  b: Matrix,
+  { rtol = 1e-12, atol = 0, equalNaN = false }: { rtol?: number; atol?: number; equalNaN?: boolean } = {}
+): boolean {
+  if (a.rows !== b.rows || a.cols !== b.cols) return false;
+  const aArr = a.astype("float64", { copy: false }).toArray() as Float64Array;
+  const bArr = b.astype("float64", { copy: false }).toArray() as Float64Array;
+  const n = a.rows * a.cols;
+  for (let i = 0; i < n; i += 1) {
+    if (!isClose(aArr[i], bArr[i], { rtol, atol, equalNaN })) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function getCurrentModuleFile(): string | undefined {

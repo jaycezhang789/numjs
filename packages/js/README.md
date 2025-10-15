@@ -72,6 +72,74 @@ console.log(vector.toArray());
 - For heavier workloads, prefer the N-API backend; prebuild platform-specific binaries in your deployment pipeline when possible.
 - Use `copyBytesTotal()`, `takeCopyBytes()`, and `resetCopyBytes()` to monitor internal buffer copies and optimize data movement.
 
+## Output & Rounding (Display-Only)
+
+JavaScript numbers use IEEE‑754 binary floating‑point, so decimal values like `0.1 + 0.2` cannot be represented exactly. This library keeps computations in native float dtypes for performance, and adds a configurable output layer to make results look clean when printing/exporting.
+
+- Default output behavior:
+  - `as: 'number'`, `decimals: 12`, `trimTrailingZeros: true`
+  - Affects only `toString()`, `toJSON()`, `toOutputArray()`, and `toOutput2D()`.
+  - Does not change internal computation or matrix storage.
+
+- Configure globally or per scope:
+  - `setOutputFormat({ as?: 'string'|'number'|'bigint', decimals?, scale?, trimTrailingZeros? })`
+  - `withOutputFormat(opts, fn)` to apply within a limited scope
+  - `getOutputFormat()` to inspect current settings
+
+- Export helpers:
+  - `toOutputArray(matrix, options?)` → 1D array
+  - `toOutput2D(matrix, options?)` → 2D rows×cols array
+  - Instance: `matrix.toOutputArray(options?)`, `matrix.toString()`, `matrix.toJSON()`
+
+- Output modes and trade‑offs:
+  - `as: 'string'` (precise decimal rendering). Best for reports/JSON. Controlled by `decimals` and `trimTrailingZeros`.
+  - `as: 'number'` (rounded Numbers). Looks clean for display, but follow‑up math is still binary float and can reintroduce artifacts.
+  - `as: 'bigint'` + `scale` (fixed‑point integers). Great for currency exporting (e.g., cents). Not suitable for general arithmetic in JS unless you implement your own fixed‑point operators.
+
+Example:
+```ts
+import {
+  setOutputFormat, withOutputFormat,
+  toOutputArray, toOutput2D, round,
+} from '@jayce789/numjs';
+
+// Global output as string with 2 decimals
+setOutputFormat({ as: 'string', decimals: 2 });
+
+// Per-call overrides
+const pretty = toOutputArray(matrix, { as: 'number', decimals: 6 });
+const cents  = toOutputArray(matrix, { as: 'bigint', scale: 2 });
+
+// Scoped output format
+await withOutputFormat({ as: 'string', decimals: 3 }, async () => {
+  console.log(String(matrix));
+});
+
+// Explicit compute-layer quantization (optional, not default)
+const quantized = round(matrix, 2); // returns a new Matrix
+```
+
+## Modes & Trade‑offs
+
+- Float (default):
+  - Fastest path (SIMD/FMA where applicable via Rust/N-API/wasm).
+  - Display artifacts are handled by the output layer; internal computations remain floating‑point.
+  - For comparisons, prefer `isClose`/`allClose` instead of `===`.
+
+- Fixed‑point export (`as: 'bigint'` + `scale`):
+  - Ideal for currency when exporting/serializing; keeps decimal semantics externally.
+  - Not a compute dtype in JS; do not feed back into numeric math unless you convert deliberately.
+
+- Decimal/Fixed dtypes (roadmap):
+  - A true decimal dtype (`decimal` using `rust_decimal`) or fixed (`i64 + scale`) can provide decimal semantics in the core.
+  - Trade‑off: linear algebra and vectorized ops will be slower vs float. Not enabled by default; will be introduced behind explicit opt‑in when available.
+
+## Stability & Comparisons
+
+- Use `isClose(a, b, { rtol=1e-12, atol=0, equalNaN=false })` for scalar comparisons.
+- Use `allClose(A, B, same options)` for matrices.
+- Future work may adopt numerically stable algorithms (e.g., pairwise/Kahan sum, Welford variance) in the core where it makes sense.
+
 ## Publishing
 Before publishing to npm, build all artifacts (`dist/` and `dist/bindings/**`) so consumers receive both backends. Run the root build pipeline:
 ```bash
