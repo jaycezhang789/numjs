@@ -6,6 +6,10 @@ yarn.lock
 
 # TypeScript build output
 dist/
+packages/js/index.*.node
+packages/js/npm/*/*.node
+packages/napi/index.*.node
+packages/napi/index.d.ts
 
 # Rust build output
 target/

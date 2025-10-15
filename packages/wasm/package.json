@@ -1,7 +1,7 @@
-{
+﻿{
   "name": "@jayce789/numjs-wasm",
   "private": true,
   "scripts": {
-    "build": "npx wasm-pack@0.10.3 build --release --target web --out-name num_rs_wasm --out-dir pkg"
+    "build": "npx cross-env WASM_BINDGEN_DISABLE_REFERENCE_TYPES=1 npx wasm-pack@0.9.1 build --release --target web --out-name num_rs_wasm --out-dir pkg"
   }
 }

@@ -19,14 +19,31 @@
   ],
   "sideEffects": false,
   "scripts": {
+    "test": "node --test ./test/**/*.mjs",
     "build": "npm run build:js && npm run copy:artifacts",
     "build:js": "tsup src/index.ts --format esm,cjs --dts --clean",
     "copy:artifacts": "node ./scripts/copy-artifacts.mjs",
     "prepublishOnly": "npm --prefix ../wasm run build && npm --prefix ../napi run build && npm run build"
   },
+  "dependencies": {
+    "fflate": "^0.8.1"
+  },
   "devDependencies": {
     "@types/node": "^20",
     "tsup": "^8",
     "typescript": "^5"
+  },
+  "napi": {
+    "name": "index",
+    "package": {
+      "name": "@jayce789/numjs"
+    },
+    "triples": {
+      "additional": [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-pc-windows-msvc"
+      ]
+    }
   }
 }

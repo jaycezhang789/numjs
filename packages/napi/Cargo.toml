@@ -3,17 +3,18 @@ name = "num_rs_napi"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["linalg"]
+linalg = ["num_rs_core/linalg"]
 
 [lib]
 crate-type = ["cdylib"]
-
 
 [dependencies]
 napi = { version = "2", features = ["napi4"] }
 napi-derive = "2"
 ndarray = "0.15"
 num_rs_core = { path = "../core-rs" }
-
 
 [build-dependencies]
 cc = "1"

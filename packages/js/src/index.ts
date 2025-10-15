@@ -1,31 +1,382 @@
+import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
+
 type BackendKind = "napi" | "wasm";
 
-type MatrixHandle = {
-  rows: number;
-  cols: number;
+export type DType =
+  | "bool"
+  | "int8"
+  | "int16"
+  | "int32"
+  | "int64"
+  | "uint8"
+  | "uint16"
+  | "uint32"
+  | "uint64"
+  | "float32"
+  | "float64";
+
+type BackendMatrixHandle = {
+  readonly rows: number;
+  readonly cols: number;
+  readonly dtype: DType;
   to_vec(): Float64Array | number[];
+  astype(dtype: DType, copy?: boolean): BackendMatrixHandle;
+  to_bytes(): Uint8Array;
 };
 
-type BackendModule = {
-  Matrix: new (
+type BackendMatrixConstructor = {
+  new (
     data: Float64Array,
     rows: number,
     cols: number
-  ) => MatrixHandle;
-  add(a: MatrixHandle, b: MatrixHandle): MatrixHandle;
-  matmul(a: MatrixHandle, b: MatrixHandle): MatrixHandle;
+  ): BackendMatrixHandle;
+  from_bytes(
+    data: Uint8Array,
+    rows: number,
+    cols: number,
+    dtype: DType
+  ): BackendMatrixHandle;
+};
+
+type BackendModule = {
+  Matrix: BackendMatrixConstructor;
+  add(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
+  matmul(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
+  clip?(
+    matrix: BackendMatrixHandle,
+    min: number,
+    max: number
+  ): BackendMatrixHandle;
+  where_select?(
+    condition: BackendMatrixHandle,
+    truthy: BackendMatrixHandle,
+    falsy: BackendMatrixHandle
+  ): BackendMatrixHandle;
+  where_select_multi?(
+    conditions: readonly BackendMatrixHandle[],
+    choices: readonly BackendMatrixHandle[],
+    defaultValue?: BackendMatrixHandle
+  ): BackendMatrixHandle;
+  concat?(
+    a: BackendMatrixHandle,
+    b: BackendMatrixHandle,
+    axis: number
+  ): BackendMatrixHandle;
+  stack?(
+    a: BackendMatrixHandle,
+    b: BackendMatrixHandle,
+    axis: number
+  ): BackendMatrixHandle;
+  svd?(
+    matrix: BackendMatrixHandle
+  ): {
+    u: BackendMatrixHandle;
+    s: Float64Array;
+    vt: BackendMatrixHandle;
+  };
+  qr?(
+    matrix: BackendMatrixHandle
+  ): {
+    q: BackendMatrixHandle;
+    r: BackendMatrixHandle;
+  };
+  solve?(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
+  eigen?(
+    matrix: BackendMatrixHandle
+  ): {
+    values: Float64Array;
+    vectors: BackendMatrixHandle;
+  };
+  take?(
+    matrix: BackendMatrixHandle,
+    axis: number,
+    indices: readonly number[]
+  ): BackendMatrixHandle;
+  put?(
+    matrix: BackendMatrixHandle,
+    axis: number,
+    indices: readonly number[],
+    values: BackendMatrixHandle
+  ): BackendMatrixHandle;
+  gather?(
+    matrix: BackendMatrixHandle,
+    rowIndices: readonly number[],
+    colIndices: readonly number[]
+  ): BackendMatrixHandle;
+  gather_pairs?(
+    matrix: BackendMatrixHandle,
+    rowIndices: readonly number[],
+    colIndices: readonly number[]
+  ): BackendMatrixHandle;
+  scatter?(
+    matrix: BackendMatrixHandle,
+    rowIndices: readonly number[],
+    colIndices: readonly number[],
+    values: BackendMatrixHandle
+  ): BackendMatrixHandle;
+  scatter_pairs?(
+    matrix: BackendMatrixHandle,
+    rowIndices: readonly number[],
+    colIndices: readonly number[],
+    values: BackendMatrixHandle
+  ): BackendMatrixHandle;
+  read_npy?(buffer: Uint8Array): BackendMatrixHandle;
+  write_npy?(matrix: BackendMatrixHandle): Uint8Array;
+  copy_bytes_total?: () => number;
+  take_copy_bytes?: () => number;
+  reset_copy_bytes?: () => void;
 };
 
 const WASM_ENTRY = "./bindings/wasm/num_rs_wasm.js";
 const NAPI_ENTRY = "./bindings/napi/index.node";
+const NAPI_BINDING_PREFIX = "./bindings/napi/index";
+
+type NapiDistribution = {
+  packages: readonly string[];
+  binaries: readonly string[];
+};
+
+const NAPI_DISTRIBUTIONS: Record<string, NapiDistribution> = {
+  "win32-x64": {
+    packages: ["@jayce789/numjs-win32-x64-msvc"],
+    binaries: ["win32-x64-msvc"],
+  },
+  "win32-arm64": {
+    packages: ["@jayce789/numjs-win32-arm64-msvc"],
+    binaries: ["win32-arm64-msvc"],
+  },
+  "darwin-x64": {
+    packages: ["@jayce789/numjs-darwin-x64"],
+    binaries: ["darwin-x64"],
+  },
+  "darwin-arm64": {
+    packages: [
+      "@jayce789/numjs-darwin-arm64",
+      "@jayce789/numjs-darwin-x64",
+    ],
+    binaries: ["darwin-arm64", "darwin-x64"],
+  },
+  "linux-x64": {
+    packages: ["@jayce789/numjs-linux-x64-gnu"],
+    binaries: ["linux-x64-gnu"],
+  },
+  "linux-arm64": {
+    packages: ["@jayce789/numjs-linux-arm64-gnu"],
+    binaries: ["linux-arm64-gnu"],
+  },
+};
 
 let activeBackend: BackendModule | null = null;
 let activeKind: BackendKind | null = null;
 let pendingLoad: Promise<void> | null = null;
 
+export type NamedMatrix = { name: string; matrix: Matrix };
+
 const isNode =
   typeof process !== "undefined" && typeof process.versions?.node === "string";
 
+export type DTypeKind = "bool" | "unsigned" | "signed" | "float";
+
+export type DTypeInfo = {
+  size: number;
+  kind: DTypeKind;
+  isFloat: boolean;
+  isSigned: boolean;
+};
+
+export const DTYPE_INFO: Record<DType, DTypeInfo> = {
+  bool: { size: 1, kind: "bool", isFloat: false, isSigned: false },
+  int8: { size: 1, kind: "signed", isFloat: false, isSigned: true },
+  int16: { size: 2, kind: "signed", isFloat: false, isSigned: true },
+  int32: { size: 4, kind: "signed", isFloat: false, isSigned: true },
+  int64: { size: 8, kind: "signed", isFloat: false, isSigned: true },
+  uint8: { size: 1, kind: "unsigned", isFloat: false, isSigned: false },
+  uint16: { size: 2, kind: "unsigned", isFloat: false, isSigned: false },
+  uint32: { size: 4, kind: "unsigned", isFloat: false, isSigned: false },
+  uint64: { size: 8, kind: "unsigned", isFloat: false, isSigned: false },
+  float32: { size: 4, kind: "float", isFloat: true, isSigned: true },
+  float64: { size: 8, kind: "float", isFloat: true, isSigned: true },
+};
+
+export type BackendCapabilities = {
+  kind: BackendKind;
+  supportsMatrixFromBytes: boolean;
+  supportsReadNpy: boolean;
+  supportsWriteNpy: boolean;
+  supportsCopyMetrics: boolean;
+  supportedDTypes: readonly DType[];
+};
+
+const PROMOTION_TABLE: Record<DType, Record<DType, DType>> = {
+  bool: {
+    bool: "bool",
+    int8: "int8",
+    int16: "int16",
+    int32: "int32",
+    int64: "int64",
+    uint8: "uint8",
+    uint16: "uint16",
+    uint32: "uint32",
+    uint64: "uint64",
+    float32: "float32",
+    float64: "float64",
+  },
+  int8: {
+    bool: "int8",
+    int8: "int8",
+    int16: "int16",
+    int32: "int32",
+    int64: "int64",
+    uint8: "int16",
+    uint16: "int32",
+    uint32: "float64",
+    uint64: "float64",
+    float32: "float32",
+    float64: "float64",
+  },
+  int16: {
+    bool: "int16",
+    int8: "int16",
+    int16: "int16",
+    int32: "int32",
+    int64: "int64",
+    uint8: "int32",
+    uint16: "int32",
+    uint32: "float64",
+    uint64: "float64",
+    float32: "float32",
+    float64: "float64",
+  },
+  int32: {
+    bool: "int32",
+    int8: "int32",
+    int16: "int32",
+    int32: "int32",
+    int64: "int64",
+    uint8: "int32",
+    uint16: "int32",
+    uint32: "int64",
+    uint64: "float64",
+    float32: "float32",
+    float64: "float64",
+  },
+  int64: {
+    bool: "int64",
+    int8: "int64",
+    int16: "int64",
+    int32: "int64",
+    int64: "int64",
+    uint8: "int64",
+    uint16: "int64",
+    uint32: "int64",
+    uint64: "float64",
+    float32: "float64",
+    float64: "float64",
+  },
+  uint8: {
+    bool: "uint8",
+    int8: "int16",
+    int16: "int32",
+    int32: "int32",
+    int64: "int64",
+    uint8: "uint8",
+    uint16: "uint16",
+    uint32: "uint32",
+    uint64: "uint64",
+    float32: "float32",
+    float64: "float64",
+  },
+  uint16: {
+    bool: "uint16",
+    int8: "int32",
+    int16: "int32",
+    int32: "int32",
+    int64: "int64",
+    uint8: "uint16",
+    uint16: "uint16",
+    uint32: "uint32",
+    uint64: "uint64",
+    float32: "float32",
+    float64: "float64",
+  },
+  uint32: {
+    bool: "uint32",
+    int8: "float64",
+    int16: "float64",
+    int32: "int64",
+    int64: "int64",
+    uint8: "uint32",
+    uint16: "uint32",
+    uint32: "uint32",
+    uint64: "uint64",
+    float32: "float32",
+    float64: "float64",
+  },
+  uint64: {
+    bool: "uint64",
+    int8: "float64",
+    int16: "float64",
+    int32: "float64",
+    int64: "float64",
+    uint8: "uint64",
+    uint16: "uint64",
+    uint32: "uint64",
+    uint64: "uint64",
+    float32: "float64",
+    float64: "float64",
+  },
+  float32: {
+    bool: "float32",
+    int8: "float32",
+    int16: "float32",
+    int32: "float32",
+    int64: "float64",
+    uint8: "float32",
+    uint16: "float32",
+    uint32: "float32",
+    uint64: "float64",
+    float32: "float32",
+    float64: "float64",
+  },
+  float64: {
+    bool: "float64",
+    int8: "float64",
+    int16: "float64",
+    int32: "float64",
+    int64: "float64",
+    uint8: "float64",
+    uint16: "float64",
+    uint32: "float64",
+    uint64: "float64",
+    float32: "float64",
+    float64: "float64",
+  },
+};
+
+function promoteBinaryDType(left: DType, right: DType): DType {
+  const table = PROMOTION_TABLE[left];
+  if (!table) {
+    throw new Error(`promoteBinaryDType: unsupported dtype "${left}"`);
+  }
+  const promoted = table[right];
+  if (!promoted) {
+    throw new Error(
+      `promoteBinaryDType: unable to promote "${left}" with "${right}"`
+    );
+  }
+  return promoted;
+}
+
+function promoteManyDType(dtypes: readonly DType[]): DType {
+  if (dtypes.length === 0) {
+    throw new Error("promoteManyDType requires at least one dtype");
+  }
+  let result = dtypes[0];
+  for (let index = 1; index < dtypes.length; index += 1) {
+    result = promoteBinaryDType(result, dtypes[index]);
+  }
+  return result;
+}
 async function loadBackend(): Promise<void> {
   if (activeBackend) {
     return;
@@ -46,16 +397,21 @@ async function loadBackend(): Promise<void> {
 }
 
 async function loadNapiBackend(): Promise<BackendModule | null> {
-  try {
-    if (typeof require === "function") {
-      return require(NAPI_ENTRY) as BackendModule;
+  const candidates = resolveNapiCandidates();
+  for (const specifier of candidates) {
+    try {
+      const required = (await getRequire())(specifier) as BackendModule;
+      return required;
+    } catch (error) {
+      if (!isModuleNotFound(error)) {
+        console.warn(
+          `[numjs] Failed to load native backend from "${specifier}". Falling back if possible.`,
+          error
+        );
+      }
     }
-    const { createRequire } = await import("node:module");
-    const localRequire = createRequire(import.meta.url);
-    return localRequire(NAPI_ENTRY) as BackendModule;
-  } catch {
-    return null;
   }
+  return null;
 }
 
 async function loadWasmBackend(): Promise<BackendModule> {
@@ -77,14 +433,143 @@ function ensureBackend(): BackendModule {
   return activeBackend;
 }
 
-function wrapMatrix(inner: MatrixHandle): Matrix {
+function wrapMatrix(handle: BackendMatrixHandle): Matrix {
   const matrix = Object.create(Matrix.prototype) as Matrix;
-  (matrix as unknown as { inner: MatrixHandle }).inner = inner;
+  matrix["_handle"] = handle;
   return matrix;
 }
 
-function normaliseData(data: Float64Array | number[]): Float64Array {
-  return data instanceof Float64Array ? data : Float64Array.from(data);
+function getHandle(matrix: Matrix): BackendMatrixHandle {
+  return matrix["_handle"];
+}
+
+function toBackendBytes(data: ArrayBuffer | Uint8Array): Uint8Array {
+  return data instanceof Uint8Array ? data : new Uint8Array(data);
+}
+
+function handleToFloat64(handle: BackendMatrixHandle): Float64Array {
+  const raw = handle.to_vec();
+  return raw instanceof Float64Array ? raw : Float64Array.from(raw);
+}
+
+type TypedArray =
+  | Float64Array
+  | Float32Array
+  | Int8Array
+  | Int16Array
+  | Int32Array
+  | Uint8Array
+  | Uint16Array
+  | Uint32Array
+  | BigInt64Array
+  | BigUint64Array
+  | Uint8ClampedArray;
+
+type MatrixInputData = Float64Array | number[] | boolean[] | TypedArray;
+
+export type MatrixOptions = {
+  dtype?: DType;
+};
+
+const TYPED_ARRAY_TO_DTYPE: Array<[new (...args: any[]) => TypedArray, DType]> = [
+  [Float64Array, "float64"],
+  [Float32Array, "float32"],
+  [Int8Array, "int8"],
+  [Int16Array, "int16"],
+  [Int32Array, "int32"],
+  [Uint8Array, "uint8"],
+  [Uint8ClampedArray, "uint8"],
+  [Uint16Array, "uint16"],
+  [Uint32Array, "uint32"],
+  [BigInt64Array, "int64"],
+  [BigUint64Array, "uint64"],
+];
+
+function inferDTypeFromData(data: MatrixInputData): DType | null {
+  for (const [ctor, dtype] of TYPED_ARRAY_TO_DTYPE) {
+    if (data instanceof ctor) {
+      return dtype;
+    }
+  }
+  return null;
+}
+
+function toFloat64Array(data: MatrixInputData): Float64Array {
+  if (data instanceof Float64Array) {
+    return data;
+  }
+  if (data instanceof BigInt64Array || data instanceof BigUint64Array) {
+    return Float64Array.from(data, (value) => Number(value));
+  }
+  if (ArrayBuffer.isView(data)) {
+    return Float64Array.from(data as ArrayLike<number>);
+  }
+  if (Array.isArray(data)) {
+    if (data.length === 0) {
+      return new Float64Array();
+    }
+    if (typeof data[0] === "boolean") {
+      return Float64Array.from(
+        data as boolean[],
+        (value) => (value ? 1 : 0)
+      );
+    }
+  }
+  return Float64Array.from(data as number[]);
+}
+
+function copyTypedArrayToUint8(data: TypedArray): Uint8Array {
+  return new Uint8Array(
+    data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+  );
+}
+
+function isTypedArrayData(data: MatrixInputData): data is TypedArray {
+  return ArrayBuffer.isView(data) && !(data instanceof DataView);
+}
+
+function elementCount(data: MatrixInputData): number {
+  return Array.isArray(data) ? data.length : data.length;
+}
+
+function typedArrayFromBytes(bytes: Uint8Array, dtype: DType): TypedArray {
+  const view = bytes.slice();
+  const buffer = view.buffer;
+  switch (dtype) {
+    case "float64":
+      return new Float64Array(buffer);
+    case "float32":
+      return new Float32Array(buffer);
+    case "int8":
+      return new Int8Array(buffer);
+    case "int16":
+      return new Int16Array(buffer);
+    case "int32":
+      return new Int32Array(buffer);
+    case "int64":
+      return new BigInt64Array(buffer);
+    case "uint8":
+      return view;
+    case "uint16":
+      return new Uint16Array(buffer);
+    case "uint32":
+      return new Uint32Array(buffer);
+    case "uint64":
+      return new BigUint64Array(buffer);
+    case "bool":
+      return Uint8Array.from(view, (value) => (value !== 0 ? 1 : 0));
+    default:
+      return view;
+  }
+}
+
+function handleToTypedArray(handle: BackendMatrixHandle): TypedArray {
+  const dtype = handle.dtype;
+  if (dtype === "float64") {
+    return handleToFloat64(handle);
+  }
+  const bytes = handle.to_bytes();
+  return typedArrayFromBytes(bytes, dtype);
 }
 
 export async function init(): Promise<void> {
@@ -100,45 +585,691 @@ export async function init(): Promise<void> {
 }
 
 export class Matrix {
-  private inner: MatrixHandle;
+  private _handle: BackendMatrixHandle;
 
-  constructor(data: Float64Array | number[], rows: number, cols: number) {
+  constructor(
+    data: MatrixInputData,
+    rows: number,
+    cols: number,
+    options: MatrixOptions = {}
+  ) {
+    const expectedLength = rows * cols;
+    const length = elementCount(data);
+    if (expectedLength !== length) {
+      throw new Error(
+        `Matrix data length (${length}) does not match shape (${rows} x ${cols})`
+      );
+    }
+
     const backend = ensureBackend();
-    this.inner = new backend.Matrix(normaliseData(data), rows, cols);
+    const inferred = inferDTypeFromData(data);
+    const targetDType = options.dtype ?? inferred ?? "float64";
+    const MatrixCtor = backend.Matrix as BackendMatrixConstructor;
+
+    if (isTypedArrayData(data) && inferred && typeof MatrixCtor.from_bytes === "function") {
+      const baseHandle = MatrixCtor.from_bytes(
+        copyTypedArrayToUint8(data),
+        rows,
+        cols,
+        inferred
+      );
+      this._handle =
+        targetDType === inferred ? baseHandle : baseHandle.astype(targetDType);
+      return;
+    }
+
+    const base = new MatrixCtor(toFloat64Array(data), rows, cols);
+    this._handle =
+      targetDType === "float64" ? base : base.astype(targetDType);
+  }
+
+  static fromHandle(handle: BackendMatrixHandle): Matrix {
+    return wrapMatrix(handle);
+  }
+
+  static fromBytes(
+    data: ArrayBuffer | Uint8Array,
+    rows: number,
+    cols: number,
+    dtype: DType
+  ): Matrix {
+    return matrixFromBytes(data, rows, cols, dtype);
   }
 
   get rows(): number {
-    return this.inner.rows;
+    return this._handle.rows;
   }
 
   get cols(): number {
-    return this.inner.cols;
+    return this._handle.cols;
   }
 
-  toArray(): Float64Array {
-    const raw = this.inner.to_vec();
-    return raw instanceof Float64Array
-      ? raw
-      : Float64Array.from(raw as number[]);
+  get dtype(): DType {
+    return this._handle.dtype;
   }
+
+  toArray(): TypedArray {
+    return handleToTypedArray(this._handle);
+  }
+
+  get dtypeInfo(): DTypeInfo {
+    return DTYPE_INFO[this.dtype];
+  }
+
+  toBytes(): Uint8Array {
+    return this._handle.to_bytes();
+  }
+
+  clip(min: number, max: number): Matrix {
+    return clip(this, min, max);
+  }
+
+  concat(other: Matrix, axis = 0): Matrix {
+    return concat(this, other, axis);
+  }
+
+  stack(other: Matrix, axis = 0): Matrix {
+    return stack(this, other, axis);
+  }
+
+  take(axis: number, indices: IndexCollection): Matrix {
+    return take(this, axis, indices);
+  }
+
+  put(axis: number, indices: IndexCollection, values: Matrix): Matrix {
+    return put(this, axis, indices, values);
+  }
+
+  gather(rowIndices: IndexCollection, colIndices: IndexCollection): Matrix {
+    return gather(this, rowIndices, colIndices);
+  }
+
+  gatherPairs(rowIndices: IndexCollection, colIndices: IndexCollection): Matrix {
+    return gatherPairs(this, rowIndices, colIndices);
+  }
+
+  scatter(
+    rowIndices: IndexCollection,
+    colIndices: IndexCollection,
+    values: Matrix
+  ): Matrix {
+    return scatter(this, rowIndices, colIndices, values);
+  }
+
+  scatterPairs(
+    rowIndices: IndexCollection,
+    colIndices: IndexCollection,
+    values: Matrix
+  ): Matrix {
+    return scatterPairs(this, rowIndices, colIndices, values);
+  }
+
+  astype(dtype: DType, options: { copy?: boolean } = {}): Matrix {
+    const copy = options.copy ?? false;
+    if (!copy && dtype === this.dtype) {
+      return this;
+    }
+    const handle = getHandle(this).astype(dtype, copy);
+    return Matrix.fromHandle(handle);
+  }
+}
+
+function castToDType(matrix: Matrix, dtype: DType): Matrix {
+  return matrix.astype(dtype, { copy: false });
+}
+
+function castAllToDType(matrices: readonly Matrix[], dtype: DType): Matrix[] {
+  return matrices.map((matrix) => castToDType(matrix, dtype));
+}
+
+export type WhereOptions = {
+  default?: Matrix;
+};
+
+type IndexCollection = readonly number[] | ArrayLike<number>;
+
+function normalizeIndices(indices: IndexCollection): number[] {
+  return Array.from(indices as ArrayLike<number>, ensureIntegerIndex);
+}
+
+function ensureIntegerIndex(value: number): number {
+  if (!Number.isFinite(value) || !Number.isInteger(value)) {
+    throw new Error(`Index "${value}" must be a finite integer`);
+  }
+  return value;
+}
+
+type MatrixShape = { rows: number; cols: number };
+
+function broadcastDim(current: number, next: number): number {
+  if (current === 0) {
+    return next;
+  }
+  if (next === 0) {
+    return current;
+  }
+  if (current === next) {
+    return current;
+  }
+  if (current === 1) {
+    return next;
+  }
+  if (next === 1) {
+    return current;
+  }
+  throw new Error(
+    `Shapes are not broadcast compatible (${current} vs ${next})`
+  );
+}
+
+function computeBroadcastShape(
+  conditions: readonly Matrix[],
+  choices: readonly Matrix[],
+  fallback: Matrix | null
+): MatrixShape {
+  let rows = 0;
+  let cols = 0;
+
+  const updateShape = (matrix: Matrix) => {
+    rows = broadcastDim(rows, matrix.rows);
+    cols = broadcastDim(cols, matrix.cols);
+  };
+
+  for (const matrix of conditions) {
+    updateShape(matrix);
+  }
+  for (const matrix of choices) {
+    updateShape(matrix);
+  }
+  if (fallback) {
+    updateShape(fallback);
+  }
+  if (rows === 0 || cols === 0) {
+    throw new Error("Unable to infer broadcast shape for where operation");
+  }
+  return { rows, cols };
+}
+
+function allocateArrayForDType(dtype: DType, length: number): MatrixInputData {
+  switch (dtype) {
+    case "bool":
+      return Array.from({ length }, () => false);
+    case "int8":
+      return new Int8Array(length);
+    case "int16":
+      return new Int16Array(length);
+    case "int32":
+      return new Int32Array(length);
+    case "int64":
+      return new BigInt64Array(length);
+    case "uint8":
+      return new Uint8Array(length);
+    case "uint16":
+      return new Uint16Array(length);
+    case "uint32":
+      return new Uint32Array(length);
+    case "uint64":
+      return new BigUint64Array(length);
+    case "float32":
+      return new Float32Array(length);
+    case "float64":
+      return new Float64Array(length);
+    default:
+      throw new Error(`Unsupported dtype "${dtype}"`);
+  }
+}
+
+function fillZeros(data: MatrixInputData, dtype: DType): void {
+  if (dtype === "bool") {
+    (data as boolean[]).fill(false);
+  }
+}
+
+function cloneMatrixData(matrix: Matrix, dtype: DType): MatrixInputData {
+  if (dtype === "bool") {
+    const source = matrix
+    .astype("bool", { copy: true })
+    .toArray() as ArrayLike<number | boolean>;
+    return Array.from(source, (value) => Boolean(value));
+  }
+  const array = matrix.toArray();
+  if (Array.isArray(array)) {
+    return array.slice();
+  }
+  return array.slice();
+}
+
+function writeMatrixValue(
+  target: MatrixInputData,
+  index: number,
+  value: number | bigint | boolean,
+  dtype: DType
+): void {
+  switch (dtype) {
+    case "bool":
+      (target as boolean[])[index] = Boolean(value);
+      return;
+    case "int64":
+      (target as BigInt64Array)[index] =
+        typeof value === "bigint" ? value : BigInt(value as number);
+      return;
+    case "uint64":
+      (target as BigUint64Array)[index] =
+        typeof value === "bigint" ? value : BigInt(value as number);
+      return;
+    default:
+      (target as Exclude<MatrixInputData, boolean[] | BigInt64Array | BigUint64Array>)[
+        index
+      ] = Number(value);
+  }
+}
+
+function maskValueTrue(value: number | bigint | boolean): boolean {
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+  if (typeof value === "bigint") {
+    return value !== 0n;
+  }
+  return value === true;
+}
+
+function applyMaskToData(
+  dest: MatrixInputData,
+  mask: ArrayLike<number | bigint | boolean>,
+  src: ArrayLike<number | bigint | boolean>,
+  dtype: DType
+): void {
+  for (let index = 0; index < mask.length; index += 1) {
+    if (maskValueTrue(mask[index])) {
+      writeMatrixValue(dest, index, src[index], dtype);
+    }
+  }
+}
+
+function broadcastMatrixTo(matrix: Matrix, rows: number, cols: number): Matrix {
+  if (matrix.rows === rows && matrix.cols === cols) {
+    return matrix;
+  }
+  if (
+    (matrix.rows !== 1 && matrix.rows !== rows) ||
+    (matrix.cols !== 1 && matrix.cols !== cols)
+  ) {
+    throw new Error(
+      `Cannot broadcast matrix of shape ${matrix.rows}x${matrix.cols} to ${rows}x${cols}`
+    );
+  }
+  const dtype = matrix.dtype;
+  const source = matrix.toArray();
+  const target = allocateArrayForDType(dtype, rows * cols);
+  const srcRows = matrix.rows;
+  const srcCols = matrix.cols;
+  for (let row = 0; row < rows; row += 1) {
+    const srcRow = srcRows === 1 ? 0 : row;
+    for (let col = 0; col < cols; col += 1) {
+      const srcCol = srcCols === 1 ? 0 : col;
+      const srcIndex = srcRow * srcCols + srcCol;
+      const dstIndex = row * cols + col;
+      writeMatrixValue(target, dstIndex, source[srcIndex], dtype);
+    }
+  }
+  return new Matrix(target, rows, cols, { dtype });
+}
+
+
+export function matrixFromBytes(
+  data: ArrayBuffer | Uint8Array,
+  rows: number,
+  cols: number,
+  dtype: DType
+): Matrix {
+  const backend = ensureBackend();
+  const MatrixCtor = backend.Matrix as BackendMatrixConstructor;
+  if (typeof MatrixCtor.from_bytes !== "function") {
+    throw new Error("Matrix.from_bytes is not supported by current backend");
+  }
+  const handle = MatrixCtor.from_bytes(toBackendBytes(data), rows, cols, dtype);
+  return Matrix.fromHandle(handle);
 }
 
 export function add(a: Matrix, b: Matrix): Matrix {
+  const dtype = promoteBinaryDType(a.dtype, b.dtype);
+  const left = castToDType(a, dtype);
+  const right = castToDType(b, dtype);
   const backend = ensureBackend();
-  const result = backend.add(
-    (a as unknown as { inner: MatrixHandle }).inner,
-    (b as unknown as { inner: MatrixHandle }).inner
-  );
-  return wrapMatrix(result);
+  const result = backend.add(getHandle(left), getHandle(right));
+  return Matrix.fromHandle(result);
 }
 
 export function matmul(a: Matrix, b: Matrix): Matrix {
+  const dtype = promoteBinaryDType(a.dtype, b.dtype);
+  const left = castToDType(a, dtype);
+  const right = castToDType(b, dtype);
   const backend = ensureBackend();
-  const result = backend.matmul(
-    (a as unknown as { inner: MatrixHandle }).inner,
-    (b as unknown as { inner: MatrixHandle }).inner
+  const result = backend.matmul(getHandle(left), getHandle(right));
+  return Matrix.fromHandle(result);
+}
+
+export function clip(matrix: Matrix, min: number, max: number): Matrix {
+  const backend = ensureBackend();
+  if (!backend.clip) {
+    throw new Error("clip is not supported by current backend");
+  }
+  const result = backend.clip(getHandle(matrix), min, max);
+  return Matrix.fromHandle(result);
+}
+
+export function where(
+  condition: Matrix | Matrix[],
+  truthy: Matrix | Matrix[],
+  falsy?: Matrix,
+  options: WhereOptions = {}
+): Matrix {
+  const backend = ensureBackend();
+  const defaultMatrix = falsy ?? options.default ?? null;
+
+  if (!Array.isArray(condition) && !Array.isArray(truthy)) {
+    if (!backend.where_select) {
+      throw new Error("where_select is not supported by current backend");
+    }
+    if (!defaultMatrix) {
+      throw new Error("where requires a falsy matrix or a default option");
+    }
+    const dtype = promoteBinaryDType(truthy.dtype, defaultMatrix.dtype);
+    const cond = condition.astype("bool", { copy: false });
+    const lhs = castToDType(truthy, dtype);
+    const rhs = castToDType(defaultMatrix, dtype);
+    const result = backend.where_select(
+      getHandle(cond),
+      getHandle(lhs),
+      getHandle(rhs)
+    );
+    return Matrix.fromHandle(result);
+  }
+
+  const conditionList = Array.isArray(condition) ? condition : [condition];
+  const choiceList = Array.isArray(truthy) ? truthy : [truthy];
+
+  if (conditionList.length !== choiceList.length) {
+    throw new Error(
+      `where: expected ${choiceList.length} condition(s), received ${conditionList.length}`
+    );
+  }
+  if (choiceList.length === 0) {
+    throw new Error("where: at least one condition/choice pair is required");
+  }
+
+  const dtypeCandidates = choiceList.map((item) => item.dtype);
+  if (defaultMatrix) {
+    dtypeCandidates.push(defaultMatrix.dtype);
+  }
+  const dtype = promoteManyDType(dtypeCandidates);
+  const targetShape = computeBroadcastShape(
+    conditionList,
+    choiceList,
+    defaultMatrix
   );
-  return wrapMatrix(result);
+
+  const boolConditions = conditionList.map((cond) =>
+    broadcastMatrixTo(cond.astype("bool", { copy: false }), targetShape.rows, targetShape.cols)
+  );
+  const broadcastChoices = choiceList.map((choice) =>
+    broadcastMatrixTo(choice, targetShape.rows, targetShape.cols)
+  );
+  const castChoices = castAllToDType(broadcastChoices, dtype);
+  const defaultCast = defaultMatrix
+    ? castToDType(
+        broadcastMatrixTo(defaultMatrix, targetShape.rows, targetShape.cols),
+        dtype
+      )
+    : undefined;
+
+  if (backend.where_select_multi) {
+    const result = backend.where_select_multi(
+      boolConditions.map(getHandle),
+      castChoices.map(getHandle),
+      defaultCast ? getHandle(defaultCast) : undefined
+    );
+    return Matrix.fromHandle(result);
+  }
+
+  const resultData = defaultCast
+    ? cloneMatrixData(defaultCast, dtype)
+    : allocateArrayForDType(dtype, targetShape.rows * targetShape.cols);
+  if (!defaultCast) {
+    fillZeros(resultData, dtype);
+  }
+  for (let index = 0; index < boolConditions.length; index += 1) {
+    const maskArray = boolConditions[index].toArray();
+    const choiceArray = castChoices[index].toArray();
+    applyMaskToData(resultData, maskArray, choiceArray, dtype);
+  }
+  return new Matrix(resultData, targetShape.rows, targetShape.cols, { dtype });
+}
+
+export function take(
+  matrix: Matrix,
+  axis: number,
+  indices: IndexCollection
+): Matrix {
+  const backend = ensureBackend();
+  if (!backend.take) {
+    throw new Error("take is not supported by current backend");
+  }
+  const normalized = normalizeIndices(indices);
+  const result = backend.take(getHandle(matrix), axis, normalized);
+  return Matrix.fromHandle(result);
+}
+
+export function put(
+  matrix: Matrix,
+  axis: number,
+  indices: IndexCollection,
+  values: Matrix
+): Matrix {
+  const backend = ensureBackend();
+  if (!backend.put) {
+    throw new Error("put is not supported by current backend");
+  }
+  const normalized = normalizeIndices(indices);
+  const castValues = castToDType(values, matrix.dtype);
+  const result = backend.put(
+    getHandle(matrix),
+    axis,
+    normalized,
+    getHandle(castValues)
+  );
+  return Matrix.fromHandle(result);
+}
+
+export function gather(
+  matrix: Matrix,
+  rowIndices: IndexCollection,
+  colIndices: IndexCollection
+): Matrix {
+  const backend = ensureBackend();
+  if (!backend.gather) {
+    throw new Error("gather is not supported by current backend");
+  }
+  const rows = normalizeIndices(rowIndices);
+  const cols = normalizeIndices(colIndices);
+  const result = backend.gather(getHandle(matrix), rows, cols);
+  return Matrix.fromHandle(result);
+}
+
+export function gatherPairs(
+  matrix: Matrix,
+  rowIndices: IndexCollection,
+  colIndices: IndexCollection
+): Matrix {
+  const backend = ensureBackend();
+  if (!backend.gather_pairs) {
+    throw new Error("gather_pairs is not supported by current backend");
+  }
+  const rows = normalizeIndices(rowIndices);
+  const cols = normalizeIndices(colIndices);
+  const result = backend.gather_pairs(getHandle(matrix), rows, cols);
+  return Matrix.fromHandle(result);
+}
+
+export function scatter(
+  matrix: Matrix,
+  rowIndices: IndexCollection,
+  colIndices: IndexCollection,
+  values: Matrix
+): Matrix {
+  const backend = ensureBackend();
+  if (!backend.scatter) {
+    throw new Error("scatter is not supported by current backend");
+  }
+  const rows = normalizeIndices(rowIndices);
+  const cols = normalizeIndices(colIndices);
+  const castValues = castToDType(values, matrix.dtype);
+  const result = backend.scatter(
+    getHandle(matrix),
+    rows,
+    cols,
+    getHandle(castValues)
+  );
+  return Matrix.fromHandle(result);
+}
+
+export function scatterPairs(
+  matrix: Matrix,
+  rowIndices: IndexCollection,
+  colIndices: IndexCollection,
+  values: Matrix
+): Matrix {
+  const backend = ensureBackend();
+  if (!backend.scatter_pairs) {
+    throw new Error("scatter_pairs is not supported by current backend");
+  }
+  const rows = normalizeIndices(rowIndices);
+  const cols = normalizeIndices(colIndices);
+  const castValues = castToDType(values, matrix.dtype);
+  const result = backend.scatter_pairs(
+    getHandle(matrix),
+    rows,
+    cols,
+    getHandle(castValues)
+  );
+  return Matrix.fromHandle(result);
+}
+
+export function concat(a: Matrix, b: Matrix, axis = 0): Matrix {
+  const dtype = promoteManyDType([a.dtype, b.dtype]);
+  const [left, right] = castAllToDType([a, b], dtype);
+  const backend = ensureBackend();
+  if (!backend.concat) {
+    throw new Error("concat is not supported by current backend");
+  }
+  const result = backend.concat(getHandle(left), getHandle(right), axis);
+  return Matrix.fromHandle(result);
+}
+
+export function stack(a: Matrix, b: Matrix, axis = 0): Matrix {
+  const dtype = promoteManyDType([a.dtype, b.dtype]);
+  const [left, right] = castAllToDType([a, b], dtype);
+  const backend = ensureBackend();
+  if (!backend.stack) {
+    throw new Error("stack is not supported by current backend");
+  }
+  const result = backend.stack(getHandle(left), getHandle(right), axis);
+  return Matrix.fromHandle(result);
+}
+
+export function svd(matrix: Matrix): {
+  u: Matrix;
+  s: Float64Array;
+  vt: Matrix;
+} {
+  const backend = ensureBackend();
+  if (!backend.svd) {
+    throw new Error("svd is not supported by current backend");
+  }
+  const result = backend.svd(getHandle(matrix));
+  return {
+    u: Matrix.fromHandle(result.u),
+    s: result.s,
+    vt: Matrix.fromHandle(result.vt),
+  };
+}
+
+export function qr(matrix: Matrix): { q: Matrix; r: Matrix } {
+  const backend = ensureBackend();
+  if (!backend.qr) {
+    throw new Error("qr is not supported by current backend");
+  }
+  const result = backend.qr(getHandle(matrix));
+  return {
+    q: Matrix.fromHandle(result.q),
+    r: Matrix.fromHandle(result.r),
+  };
+}
+
+export function solve(a: Matrix, b: Matrix): Matrix {
+  const backend = ensureBackend();
+  if (!backend.solve) {
+    throw new Error("solve is not supported by current backend");
+  }
+  const result = backend.solve(getHandle(a), getHandle(b));
+  return Matrix.fromHandle(result);
+}
+
+export function eigen(matrix: Matrix): {
+  values: Float64Array;
+  vectors: Matrix;
+} {
+  const backend = ensureBackend();
+  if (!backend.eigen) {
+    throw new Error("eigen is not supported by current backend");
+  }
+  const result = backend.eigen(getHandle(matrix));
+  return {
+    values: result.values,
+    vectors: Matrix.fromHandle(result.vectors),
+  };
+}
+
+export function readNpy(data: ArrayBuffer | Uint8Array): Matrix {
+  const backend = ensureBackend();
+  if (!backend.read_npy) {
+    throw new Error("read_npy is not supported by current backend");
+  }
+  const handle = backend.read_npy(toBackendBytes(data));
+  return Matrix.fromHandle(handle);
+}
+
+export function writeNpy(matrix: Matrix): Uint8Array {
+  const backend = ensureBackend();
+  if (!backend.write_npy) {
+    throw new Error("write_npy is not supported by current backend");
+  }
+  return backend.write_npy(getHandle(matrix));
+}
+
+export function copyBytesTotal(): number {
+  const backend = ensureBackend();
+  if (!backend.copy_bytes_total) {
+    throw new Error("copy_bytes_total is not supported by current backend");
+  }
+  return backend.copy_bytes_total();
+}
+
+export function takeCopyBytes(): number {
+  const backend = ensureBackend();
+  if (!backend.take_copy_bytes) {
+    throw new Error("take_copy_bytes is not supported by current backend");
+  }
+  return backend.take_copy_bytes();
+}
+
+export function resetCopyBytes(): void {
+  const backend = ensureBackend();
+  if (!backend.reset_copy_bytes) {
+    throw new Error("reset_copy_bytes is not supported by current backend");
+  }
+  backend.reset_copy_bytes();
 }
 
 export function backendKind(): BackendKind {
@@ -146,4 +1277,81 @@ export function backendKind(): BackendKind {
     throw new Error("Backend not initialised. Call init() first.");
   }
   return activeKind;
+}
+
+export function backendCapabilities(): BackendCapabilities {
+  const backend = ensureBackend();
+  const MatrixCtor = backend.Matrix as BackendMatrixConstructor;
+  return {
+    kind: backendKind(),
+    supportsMatrixFromBytes: typeof MatrixCtor.from_bytes === "function",
+    supportsReadNpy: typeof backend.read_npy === "function",
+    supportsWriteNpy: typeof backend.write_npy === "function",
+    supportsCopyMetrics:
+      typeof backend.copy_bytes_total === "function" &&
+      typeof backend.take_copy_bytes === "function" &&
+      typeof backend.reset_copy_bytes === "function",
+    supportedDTypes: Object.keys(DTYPE_INFO) as DType[],
+  };
+}
+
+async function getRequire(): Promise<(id: string) => unknown> {
+  if (typeof require === "function") {
+    return require;
+  }
+  const { createRequire } = await import("node:module");
+  return createRequire(import.meta.url);
+}
+
+function resolveNapiCandidates(): string[] {
+  if (!isNode) {
+    return [];
+  }
+  const platformKey = `${process.platform}-${process.arch}`;
+  const distribution = NAPI_DISTRIBUTIONS[platformKey];
+  const candidates = new Set<string>();
+  if (distribution) {
+    for (const pkg of distribution.packages) {
+      candidates.add(pkg);
+    }
+    for (const suffix of distribution.binaries) {
+      candidates.add(`${NAPI_BINDING_PREFIX}.${suffix}.node`);
+    }
+  }
+  candidates.add(NAPI_ENTRY);
+  return Array.from(candidates);
+}
+
+function isModuleNotFound(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const candidate = error as { code?: unknown };
+  return candidate.code === "MODULE_NOT_FOUND";
+}
+
+export function readNpz(data: ArrayBuffer | Uint8Array): NamedMatrix[] {
+  const archive = unzipSync(toBackendBytes(data));
+  const results: NamedMatrix[] = [];
+  for (const [name, content] of Object.entries(archive)) {
+    if (!name.endsWith(".npy")) {
+      continue;
+    }
+    const matrix = readNpy(content);
+    const baseName = name.slice(0, -4);
+    results.push({ name: baseName, matrix });
+  }
+  return results;
+}
+
+export function writeNpz(entries: NamedMatrix[]): Uint8Array {
+  if (entries.length === 0) {
+    throw new Error("writeNpz requires at least one matrix entry");
+  }
+  const archive: Record<string, Uint8Array> = {};
+  for (const entry of entries) {
+    const key = entry.name?.length ? `${entry.name}.npy` : "array.npy";
+    archive[key] = writeNpy(entry.matrix);
+  }
+  return zipSync(archive);
 }

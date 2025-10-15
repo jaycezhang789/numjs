@@ -1,0 +1,15 @@
+{
+  "name": "@jayce789/numjs-win32-arm64-msvc",
+  "version": "0.1.0",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "index.win32-arm64-msvc.node",
+  "files": [
+    "index.win32-arm64-msvc.node"
+  ],
+  "description": "NumPy-inspired numerical computing for JavaScript with automatic Node N-API fallback to WebAssembly."
+}

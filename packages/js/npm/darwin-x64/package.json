@@ -1,0 +1,15 @@
+{
+  "name": "@jayce789/numjs-darwin-x64",
+  "version": "0.1.0",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "index.darwin-x64.node",
+  "files": [
+    "index.darwin-x64.node"
+  ],
+  "description": "NumPy-inspired numerical computing for JavaScript with automatic Node N-API fallback to WebAssembly."
+}
