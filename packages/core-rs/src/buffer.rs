@@ -200,7 +200,10 @@ impl MatrixBuffer {
     pub fn to_contiguous_bytes_vec(&self) -> Vec<u8> {
         let mut bytes = vec![0u8; self.len() * self.element_size()];
         self.copy_into_bytes(&mut bytes);
-        record_copy_bytes(bytes.len());
+        // Do not record copy metrics here: exporting raw bytes to callers
+        // (e.g., over FFI to JS/WASM) should not count as an internal copy
+        // for performance metrics. Internal copies are tracked at the call
+        // sites that require them (e.g., cast/clone/to_contiguous).
         bytes
     }
 
