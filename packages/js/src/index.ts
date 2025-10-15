@@ -712,6 +712,10 @@ export class Matrix {
     const handle = getHandle(this).astype(dtype, copy);
     return Matrix.fromHandle(handle);
   }
+
+  round(decimals = 12): Matrix {
+    return round(this, decimals);
+  }
 }
 
 function castToDType(matrix: Matrix, dtype: DType): Matrix {
@@ -1300,7 +1304,67 @@ async function getRequire(): Promise<(id: string) => unknown> {
     return require;
   }
   const { createRequire } = await import("node:module");
-  return createRequire(import.meta.url);
+  const moduleFile = getCurrentModuleFile();
+  if (!moduleFile) {
+    throw new Error("Unable to determine current module path");
+  }
+  if (moduleFile.startsWith("file://")) {
+    return createRequire(moduleFile);
+  }
+  const { pathToFileURL } = await import("node:url");
+  return createRequire(pathToFileURL(moduleFile).href);
+}
+
+function roundNumber(value: number, decimals: number): number {
+  if (!Number.isFinite(value)) {
+    return value;
+  }
+  const factor = Math.pow(10, decimals);
+  return Math.round((value + Number.EPSILON) * factor) / factor;
+}
+
+export function round(matrix: Matrix, decimals = 12): Matrix {
+  const dtype = matrix.dtype;
+  if (dtype !== "float32" && dtype !== "float64") {
+    return matrix;
+  }
+  const src = matrix.toArray();
+  const length = matrix.rows * matrix.cols;
+  if (dtype === "float64") {
+    const out = new Float64Array(length);
+    for (let i = 0; i < length; i += 1) {
+      out[i] = roundNumber((src as Float64Array)[i], decimals);
+    }
+    return new Matrix(out, matrix.rows, matrix.cols, { dtype });
+  } else {
+    const out = new Float32Array(length);
+    for (let i = 0; i < length; i += 1) {
+      out[i] = roundNumber((src as Float32Array)[i], decimals);
+    }
+    return new Matrix(out, matrix.rows, matrix.cols, { dtype });
+  }
+}
+
+function getCurrentModuleFile(): string | undefined {
+  // Derive the current module path without relying on import.meta,
+  // which is absent in the CommonJS build emitted by tsup.
+  const previousPrepareStackTrace = Error.prepareStackTrace;
+  try {
+    Error.prepareStackTrace = (_, stack) => stack;
+    const stack = new Error().stack as unknown as NodeJS.CallSite[] | undefined;
+    if (!stack) {
+      return undefined;
+    }
+    for (const frame of stack) {
+      const fileName = frame.getFileName?.();
+      if (fileName) {
+        return fileName;
+      }
+    }
+    return undefined;
+  } finally {
+    Error.prepareStackTrace = previousPrepareStackTrace;
+  }
 }
 
 function resolveNapiCandidates(): string[] {
