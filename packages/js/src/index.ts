@@ -766,7 +766,7 @@ export class Matrix {
     return round(this, decimals);
   }
 
-  toOutputArray(options?: Partial<OutputFormat>): (number | string | bigint)[] {
+  toOutputArray(options?: Partial<OutputFormat>): (number | string | bigint)[] | BigInt64Array | BigUint64Array {
     return toOutputArray(this, options);
   }
 
@@ -776,15 +776,32 @@ export class Matrix {
       rows: this.rows,
       cols: this.cols,
       dtype: this.dtype,
-      data: toOutput2D(this, format),
+      // JSON-safe: always stringify values to avoid BigInt serialization errors
+      data: toOutput2D(this, { ...format, as: "string" }),
     };
   }
 
   toString(): string {
     const format = getOutputFormat();
     const rows = toOutput2D(this, { ...format, as: "string" });
-    const lines = rows.map((row) => row.join("\t"));
-    return `Matrix(${this.rows}x${this.cols}, dtype=${this.dtype})\n` + lines.join("\n");
+    const delimiter = format.delimiter ?? "\t";
+    const lineEnding = format.lineEnding ?? "\n";
+    const padTo = format.padTo ?? 0;
+    const align = format.align ?? "right";
+    let lines: string[] = [];
+    if (padTo > 0) {
+      lines = rows.map((row) =>
+        row
+          .map((cell) => {
+            const s = String(cell);
+            return align === "left" ? s.padEnd(padTo) : s.padStart(padTo);
+          })
+          .join(delimiter)
+      );
+    } else {
+      lines = rows.map((row) => row.join(delimiter));
+    }
+    return `Matrix(${this.rows}x${this.cols}, dtype=${this.dtype})` + lineEnding + lines.join(lineEnding);
   }
 }
 
@@ -1435,12 +1452,27 @@ export type OutputFormat = {
   decimals?: number; // for string/number modes
   scale?: number; // for bigint (fixed-point) mode
   trimTrailingZeros?: boolean; // for string mode
+  bigintBits?: 64 | 128; // bounds check for bigint export
+  bigintSigned?: boolean; // signed range (default true)
+  useScientific?: boolean; // enable scientific notation for large/small
+  sciMinExp?: number; // |exp| >= sciMinExp -> scientific
+  suppressSmall?: boolean; // |x| < 10^-decimals renders as 0
+  delimiter?: string; // toString delimiter
+  lineEnding?: string; // toString line ending
+  padTo?: number; // toString min width
+  align?: "left" | "right"; // toString alignment
 };
 
 const DEFAULT_OUTPUT_FORMAT: OutputFormat = {
   as: "number",
   decimals: 12,
   trimTrailingZeros: true,
+  useScientific: false,
+  sciMinExp: 6,
+  suppressSmall: true,
+  delimiter: "\t",
+  lineEnding: "\n",
+  align: "right",
 };
 
 let CURRENT_OUTPUT_FORMAT: OutputFormat = { ...DEFAULT_OUTPUT_FORMAT };
@@ -1468,14 +1500,54 @@ export async function withOutputFormat<T>(
   }
 }
 
-function formatNumberToString(value: number, decimals = 12, trim = true): string {
+// Manual scope helper for environments that cannot await (e.g. host not awaiting async callbacks)
+export function scopedOutputFormat(options: Partial<OutputFormat>): { restore(): void } {
+  const prev = CURRENT_OUTPUT_FORMAT;
+  setOutputFormat(options);
+  let restored = false;
+  return {
+    restore() {
+      if (!restored) {
+        CURRENT_OUTPUT_FORMAT = prev;
+        restored = true;
+      }
+    },
+  };
+}
+
+function isNegZero(n: number): boolean {
+  return n === 0 && 1 / n === -Infinity;
+}
+
+function formatNumberToString(
+  value: number,
+  decimals = 12,
+  trim = true,
+  useScientific = false,
+  sciMinExp = 6,
+  suppressSmall = true
+): string {
   if (!Number.isFinite(value)) {
+    // Safe textual representation for NaN/Infinity
     return String(value);
   }
-  const s = value.toFixed(decimals);
+  let v = value;
+  if (suppressSmall && Math.abs(v) < Math.pow(10, -Math.max(0, decimals))) {
+    v = 0;
+  }
+  if (useScientific && v !== 0) {
+    const exp = Math.floor(Math.log10(Math.abs(v)));
+    if (Math.abs(exp) >= (sciMinExp ?? 6)) {
+      const sExp = v.toExponential(decimals);
+      return sExp;
+    }
+  }
+  const s = v.toFixed(decimals);
   if (!trim) return s;
   // trim trailing zeros and an optional trailing dot
-  return s.replace(/\.0+$/, "").replace(/(\.[0-9]*?)0+$/, "$1");
+  const t = s.replace(/\.0+$/, "").replace(/(\.[0-9]*?)0+$/, "$1");
+  // normalize "-0" -> "0"
+  return t === "-0" ? "0" : t;
 }
 
 function toScaledBigIntFromNumber(value: number, scale: number): bigint {
@@ -1493,10 +1565,27 @@ function toScaledBigIntFromNumber(value: number, scale: number): bigint {
   return neg ? -bi : bi;
 }
 
+function bigIntBounds(bits: 64 | 128, signed: boolean): { min: bigint; max: bigint } {
+  if (bits === 64) {
+    if (signed) {
+      return { min: -(1n << 63n), max: (1n << 63n) - 1n };
+    }
+    return { min: 0n, max: (1n << 64n) - 1n };
+  }
+  // 128-bit
+  const one = 1n;
+  const shift = 128n;
+  if (signed) {
+    return { min: -(one << (shift - 1n)), max: (one << (shift - 1n)) - 1n };
+  }
+  return { min: 0n, max: (one << shift) - 1n };
+}
+
+ 
 export function toOutputArray(
   matrix: Matrix,
   options: Partial<OutputFormat> = {}
-): (number | string | bigint)[] {
+): (number | string | bigint)[] | BigInt64Array | BigUint64Array {
   const fmt = { ...CURRENT_OUTPUT_FORMAT, ...options } as OutputFormat;
   const values = matrix.toArray();
   const length = matrix.rows * matrix.cols;
@@ -1504,11 +1593,14 @@ export function toOutputArray(
   if (fmt.as === "string") {
     const decimals = fmt.decimals ?? DEFAULT_OUTPUT_FORMAT.decimals!;
     const trim = fmt.trimTrailingZeros ?? DEFAULT_OUTPUT_FORMAT.trimTrailingZeros!;
+    const useSci = fmt.useScientific ?? DEFAULT_OUTPUT_FORMAT.useScientific!;
+    const sciMin = fmt.sciMinExp ?? DEFAULT_OUTPUT_FORMAT.sciMinExp!;
+    const suppressSmall = fmt.suppressSmall ?? DEFAULT_OUTPUT_FORMAT.suppressSmall!;
     const out = new Array<string>(length);
     for (let i = 0; i < length; i += 1) {
       const v = (values as any)[i];
       if (typeof v === "number") {
-        out[i] = formatNumberToString(v, decimals, trim);
+        out[i] = formatNumberToString(v, decimals, trim, useSci, sciMin, suppressSmall);
       } else if (typeof v === "bigint") {
         out[i] = v.toString();
       } else if (typeof v === "boolean") {
@@ -1523,22 +1615,74 @@ export function toOutputArray(
   if (fmt.as === "bigint") {
     const scale = fmt.scale;
     if (!Number.isInteger(scale) || (scale as number) < 0) {
-      throw new Error("toOutputArray(as=\"bigint\"): a non-negative integer 'scale' is required");
+      throw new RangeError("toOutputArray(as=\"bigint\"): a non-negative integer 'scale' is required");
     }
-    const out = new Array<bigint>(length);
+    const bits = fmt.bigintBits ?? 64;
+    const signed = fmt.bigintSigned ?? true;
+    const factor = BigInt("1" + "0".repeat(scale as number));
+    const { min, max } = bigIntBounds(bits as 64 | 128, signed);
+    if (bits === 64) {
+      const out64 = signed ? new BigInt64Array(length) : new BigUint64Array(length);
+      for (let i = 0; i < length; i += 1) {
+        const v = (values as any)[i];
+        if (typeof v === "number") {
+          if (!Number.isFinite(v)) {
+            throw new RangeError("toOutputArray(as=\\\"bigint\\\", bigintBits=64): cannot convert NaN/Infinity; use as:'string' or as:'number'");
+          }
+          const bi = toScaledBigIntFromNumber(v, scale as number);
+          if (bi < min || bi > max) {
+            throw new RangeError(`toOutputArray(as=\\\"bigint\\\"): scaled value overflows ${bits}-bit ${signed ? "signed" : "unsigned"} range (value=${v}, scale=${scale})`);
+          }
+          out64[i] = bi as any;
+        } else if (typeof v === "bigint") {
+          const scaled = v * factor;
+          if (scaled < min || scaled > max) {
+            throw new RangeError(`toOutputArray(as=\\\"bigint\\\"): scaled bigint overflows ${bits}-bit ${signed ? "signed" : "unsigned"} range (value=${v}n, scale=${scale})`);
+          }
+          out64[i] = scaled as any;
+        } else if (typeof v === "boolean") {
+          const scaled = (v ? 1n : 0n) * factor;
+          out64[i] = scaled as any;
+        } else {
+          out64[i] = 0n as any;
+        }
+      }
+      return out64;
+    }
+    const out: (bigint | string)[] = new Array(length);
     for (let i = 0; i < length; i += 1) {
       const v = (values as any)[i];
       if (typeof v === "number") {
-        out[i] = toScaledBigIntFromNumber(v, scale as number);
+        if (!Number.isFinite(v)) {
+          // Represent non-finite as strings in bigint mode to be JSON-safe
+          out[i] = String(v);
+          continue;
+        }
+        const bi = toScaledBigIntFromNumber(v, scale as number);
+        if (bi < min || bi > max) {
+          throw new Error(
+            `toOutputArray(as="bigint"): scaled value overflows ${bits}-bit ${signed ? "signed" : "unsigned"} range (value=${v}, scale=${scale})`
+          );
+        }
+        out[i] = bi;
       } else if (typeof v === "bigint") {
-        // integers: multiply by 10^scale
-        const factor = BigInt("1" + "0".repeat(scale as number));
-        out[i] = v * factor;
+        const scaled = v * factor;
+        if (scaled < min || scaled > max) {
+          throw new Error(
+            `toOutputArray(as="bigint"): scaled bigint overflows ${bits}-bit ${signed ? "signed" : "unsigned"} range (value=${v}n, scale=${scale})`
+          );
+        }
+        out[i] = scaled;
       } else if (typeof v === "boolean") {
-        const factor = BigInt("1" + "0".repeat(scale as number));
-        out[i] = (v ? 1n : 0n) * factor;
+        const scaled = (v ? 1n : 0n) * factor;
+        if (scaled < min || scaled > max) {
+          throw new Error(
+            `toOutputArray(as="bigint"): scaled boolean overflows ${bits}-bit ${signed ? "signed" : "unsigned"} range (scale=${scale})`
+          );
+        }
+        out[i] = scaled;
       } else {
-        out[i] = 0n;
+        out[i] = "0";
       }
     }
     return out;
@@ -1550,7 +1694,8 @@ export function toOutputArray(
   for (let i = 0; i < length; i += 1) {
     const v = (values as any)[i];
     if (typeof v === "number") {
-      out[i] = parseFloat((v as number).toFixed(decimals));
+      const n = parseFloat((v as number ).toFixed(decimals));
+      out[i] = n === 0 ? 0 : n;
     } else if (typeof v === "bigint") {
       out[i] = Number(v);
     } else if (typeof v === "boolean") {
@@ -1566,7 +1711,7 @@ export function toOutput2D(
   matrix: Matrix,
   options: Partial<OutputFormat> = {}
 ): (number | string | bigint)[][] {
-  const flat = toOutputArray(matrix, options);
+  const flat = toOutputArray(matrix, options) as (number | string | bigint)[];
   const rows: (number | string | bigint)[][] = [];
   let index = 0;
   for (let r = 0; r < matrix.rows; r += 1) {
@@ -1577,6 +1722,35 @@ export function toOutput2D(
     rows.push(row);
   }
   return rows;
+}
+
+export function forEachRowToOutput(
+  matrix: Matrix,
+  options: Partial<OutputFormat>,
+  fn: (row: (number | string | bigint)[], rowIndex: number) => void
+): void {
+  const cols = matrix.cols;
+  const flat = toOutputArray(matrix, options) as (number | string | bigint)[];
+  let index = 0;
+  for (let r = 0; r < matrix.rows; r += 1) {
+    const row: (number | string | bigint)[] = new Array(cols);
+    for (let c = 0; c < cols; c += 1) row[c] = flat[index++];
+    fn(row, r);
+  }
+}
+
+export async function* iterOutputRows(
+  matrix: Matrix,
+  options: Partial<OutputFormat> = {}
+): AsyncIterable<(number | string | bigint)[]> {
+  const cols = matrix.cols;
+  const flat = toOutputArray(matrix, options) as (number | string | bigint)[];
+  let index = 0;
+  for (let r = 0; r < matrix.rows; r += 1) {
+    const row: (number | string | bigint)[] = new Array(cols);
+    for (let c = 0; c < cols; c += 1) row[c] = flat[index++];
+    yield row;
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -1689,3 +1863,14 @@ export function writeNpz(entries: NamedMatrix[]): Uint8Array {
   }
   return zipSync(archive);
 }
+
+
+
+
+
+
+
+
+
+
+

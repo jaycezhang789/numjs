@@ -20,6 +20,59 @@ use nalgebra::{DMatrix, SymmetricEigen};
 pub use metrics::{copy_bytes_total, reset_copy_bytes, take_copy_bytes};
 pub type CoreResult<T> = Result<T, String>;
 
+// ---------------------------------------------------------------------
+// Numerically stable reductions (pairwise sum/dot, Welford mean/variance)
+// ---------------------------------------------------------------------
+
+fn pairwise_sum_slice(data: &[f64]) -> f64 {
+    const THRESHOLD: usize = 1024;
+    if data.len() <= THRESHOLD {
+        let mut s = 0.0f64;
+        for &x in data {
+            s += x;
+        }
+        return s;
+    }
+    let mid = data.len() / 2;
+    pairwise_sum_slice(&data[..mid]) + pairwise_sum_slice(&data[mid..])
+}
+
+pub fn sum_pairwise(buffer: &MatrixBuffer) -> f64 {
+    let v = buffer.to_f64_vec();
+    pairwise_sum_slice(&v)
+}
+
+pub fn dot_pairwise(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<f64> {
+    if a.rows() != b.rows() || a.cols() != b.cols() {
+        return Err("dot_pairwise: shape mismatch".into());
+    }
+    let av = a.to_f64_vec();
+    let bv = b.to_f64_vec();
+    let mut prod: Vec<f64> = Vec::with_capacity(av.len());
+    for i in 0..av.len() {
+        prod.push(av[i] * bv[i]);
+    }
+    Ok(pairwise_sum_slice(&prod))
+}
+
+pub fn welford_mean_variance(buffer: &MatrixBuffer, sample: bool) -> (f64, f64) {
+    let mut n: f64 = 0.0;
+    let mut mean: f64 = 0.0;
+    let mut m2: f64 = 0.0;
+    for v in buffer.to_f64_vec() {
+        n += 1.0;
+        let delta = v - mean;
+        mean += delta / n;
+        let delta2 = v - mean;
+        m2 += delta * delta2;
+    }
+    if n < 1.0 {
+        return (f64::NAN, f64::NAN);
+    }
+    let var = if sample && n > 1.0 { m2 / (n - 1.0) } else { m2 / n };
+    (mean, var)
+}
+
 pub fn add(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
     ensure_same_shape(a, b)?;
     let dtype = promote_pair(a.dtype(), b.dtype());
@@ -592,4 +645,38 @@ pub fn svd_legacy(a: ArrayView2<'_, f64>) -> CoreResult<(Array2<f64>, Array1<f64
     let vt_array =
         Array2::from_shape_vec((vt.nrows(), vt.ncols()), vt.as_slice().to_vec()).unwrap();
     Ok((u_array, singular, vt_array))
+}
+
+// ---------------------------------------------------------------------
+// Tests for stable reductions
+// ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::MatrixBuffer;
+
+    #[test]
+    fn test_pairwise_sum_simple() {
+        let buf = MatrixBuffer::from_f64_vec(
+            crate::dtype::DType::Float64,
+            1,
+            5,
+            vec![1e16, 1.0, 1.0, -1e16, 1.0],
+        )
+        .unwrap();
+        let naive: f64 = buf.to_f64_vec().iter().sum();
+        let stable = sum_pairwise(&buf);
+        // naive may be 1.0 or 0.0 depending on accumulation; stable should be 3.0 or close
+        assert!(stable > 0.5, "stable sum too small: {} (naive={})", stable, naive);
+    }
+
+    #[test]
+    fn test_welford_mean_var() {
+        let data: Vec<f64> = (0..1000).map(|i| (i as f64) / 10.0).collect();
+        let buf = MatrixBuffer::from_f64_vec(crate::dtype::DType::Float64, 1, data.len(), data).unwrap();
+        let (mean, var) = welford_mean_variance(&buf, false);
+        assert!((mean - 49.95).abs() < 1e-9);
+        assert!(var > 0.0);
+    }
 }

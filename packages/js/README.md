@@ -84,17 +84,20 @@ JavaScript numbers use IEEE‑754 binary floating‑point, so decimal values lik
 - Configure globally or per scope:
   - `setOutputFormat({ as?: 'string'|'number'|'bigint', decimals?, scale?, trimTrailingZeros? })`
   - `withOutputFormat(opts, fn)` to apply within a limited scope
+  - `scopedOutputFormat(opts)` returns `{ restore() }` for manual scoping (useful when the host cannot await async callbacks)
   - `getOutputFormat()` to inspect current settings
 
 - Export helpers:
   - `toOutputArray(matrix, options?)` → 1D array
   - `toOutput2D(matrix, options?)` → 2D rows×cols array
   - Instance: `matrix.toOutputArray(options?)`, `matrix.toString()`, `matrix.toJSON()`
+  - Note: `toJSON()` always serializes values as strings (JSON‑safe), even if the global mode is `as: 'bigint'`.
 
 - Output modes and trade‑offs:
   - `as: 'string'` (precise decimal rendering). Best for reports/JSON. Controlled by `decimals` and `trimTrailingZeros`.
   - `as: 'number'` (rounded Numbers). Looks clean for display, but follow‑up math is still binary float and can reintroduce artifacts.
   - `as: 'bigint'` + `scale` (fixed‑point integers). Great for currency exporting (e.g., cents). Not suitable for general arithmetic in JS unless you implement your own fixed‑point operators.
+  - Bounds: when exporting as bigint, you can set `bigintBits` (64 or 128, default 64) and `bigintSigned` (default true). The exporter checks overflow against the scaled range and throws a friendly error if exceeded.
 
 Example:
 ```ts
