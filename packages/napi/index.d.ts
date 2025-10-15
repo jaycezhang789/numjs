@@ -7,8 +7,15 @@ export declare function add(a: Matrix, b: Matrix): Matrix
 export declare function matmul(a: Matrix, b: Matrix): Matrix
 export declare function clip(matrix: Matrix, min: number, max: number): Matrix
 export declare function whereSelect(condition: Matrix, truthy: Matrix, falsy: Matrix): Matrix
+export declare function whereSelectMulti(conditions: Array<Matrix>, choices: Array<Matrix>, defaultValue?: Matrix | undefined | null): Matrix
 export declare function concat(a: Matrix, b: Matrix, axis: number): Matrix
 export declare function stack(a: Matrix, b: Matrix, axis: number): Matrix
+export declare function take(matrix: Matrix, axis: number, indices: Array<number>): Matrix
+export declare function put(matrix: Matrix, axis: number, indices: Array<number>, values: Matrix): Matrix
+export declare function gather(matrix: Matrix, rowIndices: Array<number>, colIndices: Array<number>): Matrix
+export declare function gatherPairs(matrix: Matrix, rowIndices: Array<number>, colIndices: Array<number>): Matrix
+export declare function scatter(matrix: Matrix, rowIndices: Array<number>, colIndices: Array<number>, values: Matrix): Matrix
+export declare function scatterPairs(matrix: Matrix, rowIndices: Array<number>, colIndices: Array<number>, values: Matrix): Matrix
 export declare function svd(matrix: Matrix): object
 export declare function qr(matrix: Matrix): object
 export declare function solve(a: Matrix, b: Matrix): Matrix
