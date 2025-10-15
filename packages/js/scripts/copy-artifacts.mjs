@@ -28,6 +28,17 @@ await mkdir(distDir, { recursive: true });
 if (await exists(wasmSource)) {
   await mkdir(wasmTarget, { recursive: true });
   await cp(wasmSource, wasmTarget, { recursive: true, force: true });
+  // Ensure Node treats the wasm wrapper as ESM to avoid reparsing warning.
+  try {
+    const pkgJsonPath = resolve(wasmTarget, "package.json");
+    const pkg = JSON.parse(await (await import("node:fs/promises")).readFile(pkgJsonPath, "utf8"));
+    if (pkg && pkg.type !== "module") {
+      pkg.type = "module";
+      await (await import("node:fs/promises")).writeFile(pkgJsonPath, JSON.stringify(pkg, null, 2));
+    }
+  } catch (err) {
+    console.warn("[copy-artifacts] Failed to mark wasm package.json as module", err);
+  }
 } else {
   console.warn(
     "[copy-artifacts] wasm-pack output not found. Expected at",

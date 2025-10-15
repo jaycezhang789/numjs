@@ -31,7 +31,9 @@ router.get("/matmul", async (ctx) => {
   const a = new Matrix([1, 2, 3, 4], 2, 2);
   const b = new Matrix([5, 6, 7, 8], 2, 2);
   const result = matmul(a, b).toArray();
-  ctx.body = { result: Array.from(result) };
+  // Coerce potential bigint-typed arrays to numbers for JSON
+  const numbers = Array.from(result as unknown as ArrayLike<any>, Number);
+  ctx.body = { result: numbers };
 });
 
 router.get("/export.npy", async (ctx) => {

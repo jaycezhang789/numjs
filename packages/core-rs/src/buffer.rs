@@ -200,7 +200,6 @@ impl MatrixBuffer {
     pub fn to_contiguous_bytes_vec(&self) -> Vec<u8> {
         let mut bytes = vec![0u8; self.len() * self.element_size()];
         self.copy_into_bytes(&mut bytes);
-        record_copy_bytes(bytes.len());
         bytes
     }
 
@@ -212,8 +211,11 @@ impl MatrixBuffer {
     }
 
     pub fn clone_with_dtype(&self, dtype: DType) -> Result<Self, String> {
-        record_copy_bytes(self.len() * dtype.size_of());
-        let bytes = self.to_contiguous_bytes_vec();
+        // Allocate a new buffer of the target dtype size and copy the
+        // source bytes directly without double-accounting copy metrics.
+        let mut bytes = vec![0u8; self.len() * dtype.size_of()];
+        self.copy_into_bytes(&mut bytes);
+        record_copy_bytes(bytes.len());
         MatrixBuffer::from_bytes(dtype, self.rows, self.cols, bytes)
     }
 
