@@ -273,6 +273,178 @@ pub fn add(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
     }
 }
 
+pub fn sub(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    if a.dtype() == DType::Fixed64 && b.dtype() == DType::Fixed64 {
+        ensure_same_shape(a, b)?;
+        return sub_fixed64(a, b);
+    }
+    ensure_same_shape(a, b)?;
+    let dtype = promote_pair(a.dtype(), b.dtype());
+
+    if dtype == DType::Bool {
+        if a.dtype() != DType::Bool || b.dtype() != DType::Bool {
+            return Err("sub(bool, bool): unsupported mixed boolean subtraction".into());
+        }
+        let lhs_std = a.to_contiguous()?;
+        let rhs_std = b.to_contiguous()?;
+        let lhs = lhs_std.try_as_slice::<bool>()?;
+        let rhs = rhs_std.try_as_slice::<bool>()?;
+        let mut out: Vec<bool> = Vec::with_capacity(lhs.len());
+        for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+            out.push(x & !y);
+        }
+        return MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into);
+    }
+
+    let lhs_cast = a.cast(dtype)?;
+    let rhs_cast = b.cast(dtype)?;
+    let lhs_std = lhs_cast.to_contiguous()?;
+    let rhs_std = rhs_cast.to_contiguous()?;
+
+    match dtype {
+        DType::Int8 => sub_signed_numeric::<i8>(&lhs_std, &rhs_std),
+        DType::Int16 => sub_signed_numeric::<i16>(&lhs_std, &rhs_std),
+        DType::Int32 => sub_signed_numeric::<i32>(&lhs_std, &rhs_std),
+        DType::Int64 => sub_signed_numeric::<i64>(&lhs_std, &rhs_std),
+        DType::UInt8 => sub_unsigned_numeric::<u8>(&lhs_std, &rhs_std),
+        DType::UInt16 => sub_unsigned_numeric::<u16>(&lhs_std, &rhs_std),
+        DType::UInt32 => sub_unsigned_numeric::<u32>(&lhs_std, &rhs_std),
+        DType::UInt64 => sub_unsigned_numeric::<u64>(&lhs_std, &rhs_std),
+        DType::Float32 => sub_float_numeric::<f32>(&lhs_std, &rhs_std),
+        DType::Float64 => sub_float_numeric::<f64>(&lhs_std, &rhs_std),
+        DType::Bool | DType::Fixed64 => unreachable!(),
+    }
+}
+
+pub fn mul(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    if a.dtype() == DType::Fixed64 || b.dtype() == DType::Fixed64 {
+        return Err("mul(Fixed64): convert operands to float64 before multiplying".into());
+    }
+    ensure_same_shape(a, b)?;
+    let dtype = promote_pair(a.dtype(), b.dtype());
+
+    if dtype == DType::Bool {
+        if a.dtype() != DType::Bool || b.dtype() != DType::Bool {
+            return Err("mul(bool, bool): unsupported mixed boolean multiplication".into());
+        }
+        let lhs_std = a.to_contiguous()?;
+        let rhs_std = b.to_contiguous()?;
+        let lhs = lhs_std.try_as_slice::<bool>()?;
+        let rhs = rhs_std.try_as_slice::<bool>()?;
+        let mut out: Vec<bool> = Vec::with_capacity(lhs.len());
+        for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+            out.push(x && y);
+        }
+        return MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into);
+    }
+
+    let lhs_cast = a.cast(dtype)?;
+    let rhs_cast = b.cast(dtype)?;
+    let lhs_std = lhs_cast.to_contiguous()?;
+    let rhs_std = rhs_cast.to_contiguous()?;
+
+    match dtype {
+        DType::Int8 => mul_signed_numeric::<i8>(&lhs_std, &rhs_std),
+        DType::Int16 => mul_signed_numeric::<i16>(&lhs_std, &rhs_std),
+        DType::Int32 => mul_signed_numeric::<i32>(&lhs_std, &rhs_std),
+        DType::Int64 => mul_signed_numeric::<i64>(&lhs_std, &rhs_std),
+        DType::UInt8 => mul_unsigned_numeric::<u8>(&lhs_std, &rhs_std),
+        DType::UInt16 => mul_unsigned_numeric::<u16>(&lhs_std, &rhs_std),
+        DType::UInt32 => mul_unsigned_numeric::<u32>(&lhs_std, &rhs_std),
+        DType::UInt64 => mul_unsigned_numeric::<u64>(&lhs_std, &rhs_std),
+        DType::Float32 => mul_float_numeric::<f32>(&lhs_std, &rhs_std),
+        DType::Float64 => mul_float_numeric::<f64>(&lhs_std, &rhs_std),
+        DType::Bool | DType::Fixed64 => unreachable!(),
+    }
+}
+
+pub fn div(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    if a.dtype() == DType::Fixed64 || b.dtype() == DType::Fixed64 {
+        return Err("div(Fixed64): convert operands to float64 before dividing".into());
+    }
+    ensure_same_shape(a, b)?;
+    let dtype = promote_pair(a.dtype(), b.dtype());
+
+    if dtype == DType::Bool {
+        if a.dtype() != DType::Bool || b.dtype() != DType::Bool {
+            return Err("div(bool, bool): unsupported mixed boolean division".into());
+        }
+        let lhs_std = a.to_contiguous()?;
+        let rhs_std = b.to_contiguous()?;
+        let lhs = lhs_std.try_as_slice::<bool>()?;
+        let rhs = rhs_std.try_as_slice::<bool>()?;
+        let mut out: Vec<bool> = Vec::with_capacity(lhs.len());
+        for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+            if !y {
+                return Err("div(bool, bool): division by false".into());
+            }
+            out.push(x);
+        }
+        return MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into);
+    }
+
+    let lhs_cast = a.cast(dtype)?;
+    let rhs_cast = b.cast(dtype)?;
+    let lhs_std = lhs_cast.to_contiguous()?;
+    let rhs_std = rhs_cast.to_contiguous()?;
+
+    match dtype {
+        DType::Int8 => div_signed_numeric::<i8>(&lhs_std, &rhs_std),
+        DType::Int16 => div_signed_numeric::<i16>(&lhs_std, &rhs_std),
+        DType::Int32 => div_signed_numeric::<i32>(&lhs_std, &rhs_std),
+        DType::Int64 => div_signed_numeric::<i64>(&lhs_std, &rhs_std),
+        DType::UInt8 => div_unsigned_numeric::<u8>(&lhs_std, &rhs_std),
+        DType::UInt16 => div_unsigned_numeric::<u16>(&lhs_std, &rhs_std),
+        DType::UInt32 => div_unsigned_numeric::<u32>(&lhs_std, &rhs_std),
+        DType::UInt64 => div_unsigned_numeric::<u64>(&lhs_std, &rhs_std),
+        DType::Float32 => div_float_numeric::<f32>(&lhs_std, &rhs_std),
+        DType::Float64 => div_float_numeric::<f64>(&lhs_std, &rhs_std),
+        DType::Bool | DType::Fixed64 => unreachable!(),
+    }
+}
+
+pub fn neg(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    match matrix.dtype() {
+        DType::Fixed64 => neg_fixed64(matrix),
+        DType::Bool => {
+            let std = matrix.to_contiguous()?;
+            let src = std.try_as_slice::<bool>()?;
+            let mut out: Vec<bool> = Vec::with_capacity(src.len());
+            for &value in src {
+                out.push(!value);
+            }
+            MatrixBuffer::from_vec(out, matrix.rows(), matrix.cols()).map_err(Into::into)
+        }
+        DType::Int8 => {
+            let std = matrix.to_contiguous()?;
+            neg_signed_numeric::<i8>(&std)
+        }
+        DType::Int16 => {
+            let std = matrix.to_contiguous()?;
+            neg_signed_numeric::<i16>(&std)
+        }
+        DType::Int32 => {
+            let std = matrix.to_contiguous()?;
+            neg_signed_numeric::<i32>(&std)
+        }
+        DType::Int64 => {
+            let std = matrix.to_contiguous()?;
+            neg_signed_numeric::<i64>(&std)
+        }
+        DType::UInt8 | DType::UInt16 | DType::UInt32 | DType::UInt64 => Err(
+            "neg: unsigned dtypes are not supported; cast to a signed dtype first".into(),
+        ),
+        DType::Float32 => {
+            let std = matrix.to_contiguous()?;
+            neg_float_numeric::<f32>(&std)
+        }
+        DType::Float64 => {
+            let std = matrix.to_contiguous()?;
+            neg_float_numeric::<f64>(&std)
+        }
+    }
+}
+
 fn add_signed_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
 where
     T: PrimInt + Signed + Bounded + ToPrimitive + FromPrimitive + ElementTrait,
@@ -327,6 +499,244 @@ where
         out.push(x + y);
     }
     MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
+}
+
+fn sub_signed_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: PrimInt + Signed + Bounded + ToPrimitive + FromPrimitive + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let min = T::min_value()
+        .to_i128()
+        .ok_or_else(|| "failed to convert minimum to i128".to_string())?;
+    let max = T::max_value()
+        .to_i128()
+        .ok_or_else(|| "failed to convert maximum to i128".to_string())?;
+    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        let diff = x.to_i128().unwrap() - y.to_i128().unwrap();
+        let clamped = diff.clamp(min, max);
+        let value = T::from_i128(clamped)
+            .ok_or_else(|| "failed to cast difference back to target dtype".to_string())?;
+        out.push(value);
+    }
+    MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
+}
+
+fn sub_unsigned_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: PrimInt + Unsigned + Bounded + ToPrimitive + FromPrimitive + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        let left = x.to_u128().unwrap();
+        let right = y.to_u128().unwrap();
+        let diff = left.saturating_sub(right);
+        let value = T::from_u128(diff)
+            .ok_or_else(|| "failed to cast difference back to target dtype".to_string())?;
+        out.push(value);
+    }
+    MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
+}
+
+fn sub_float_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: Float + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        out.push(x - y);
+    }
+    MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
+}
+
+fn mul_signed_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: PrimInt + Signed + Bounded + ToPrimitive + FromPrimitive + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let min = T::min_value()
+        .to_i128()
+        .ok_or_else(|| "failed to convert minimum to i128".to_string())?;
+    let max = T::max_value()
+        .to_i128()
+        .ok_or_else(|| "failed to convert maximum to i128".to_string())?;
+    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        let product = x.to_i128().unwrap() * y.to_i128().unwrap();
+        let clamped = product.clamp(min, max);
+        let value = T::from_i128(clamped)
+            .ok_or_else(|| "failed to cast product back to target dtype".to_string())?;
+        out.push(value);
+    }
+    MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
+}
+
+fn mul_unsigned_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: PrimInt + Unsigned + Bounded + ToPrimitive + FromPrimitive + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let max = T::max_value()
+        .to_u128()
+        .ok_or_else(|| "failed to convert maximum to u128".to_string())?;
+    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        let product = x.to_u128().unwrap() * y.to_u128().unwrap();
+        let clamped = if product > max { max } else { product };
+        let value = T::from_u128(clamped)
+            .ok_or_else(|| "failed to cast product back to target dtype".to_string())?;
+        out.push(value);
+    }
+    MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
+}
+
+fn mul_float_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: Float + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        out.push(x * y);
+    }
+    MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
+}
+
+fn div_signed_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: PrimInt + Signed + Bounded + ToPrimitive + FromPrimitive + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let min = T::min_value()
+        .to_i128()
+        .ok_or_else(|| "failed to convert minimum to i128".to_string())?;
+    let max = T::max_value()
+        .to_i128()
+        .ok_or_else(|| "failed to convert maximum to i128".to_string())?;
+    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        let divisor = y.to_i128().unwrap();
+        if divisor == 0 {
+            return Err("div: division by zero".into());
+        }
+        let dividend = x.to_i128().unwrap();
+        let quotient = dividend / divisor;
+        let clamped = quotient.clamp(min, max);
+        let value = T::from_i128(clamped)
+            .ok_or_else(|| "failed to cast quotient back to target dtype".to_string())?;
+        out.push(value);
+    }
+    MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
+}
+
+fn div_unsigned_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: PrimInt + Unsigned + Bounded + ToPrimitive + FromPrimitive + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        let divisor = y.to_u128().unwrap();
+        if divisor == 0 {
+            return Err("div: division by zero".into());
+        }
+        let dividend = x.to_u128().unwrap();
+        let quotient = dividend / divisor;
+        let value = T::from_u128(quotient)
+            .ok_or_else(|| "failed to cast quotient back to target dtype".to_string())?;
+        out.push(value);
+    }
+    MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
+}
+
+fn div_float_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: Float + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        out.push(x / y);
+    }
+    MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
+}
+
+fn neg_signed_numeric<T>(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: PrimInt + Signed + Bounded + ToPrimitive + FromPrimitive + ElementTrait,
+{
+    let values = matrix.try_as_slice::<T>()?;
+    let min = T::min_value()
+        .to_i128()
+        .ok_or_else(|| "failed to convert minimum to i128".to_string())?;
+    let max = T::max_value()
+        .to_i128()
+        .ok_or_else(|| "failed to convert maximum to i128".to_string())?;
+    let mut out: Vec<T> = Vec::with_capacity(values.len());
+    for &value in values.iter() {
+        let negated = -value.to_i128().unwrap();
+        let clamped = negated.clamp(min, max);
+        let casted = T::from_i128(clamped)
+            .ok_or_else(|| "failed to cast negated value back to target dtype".to_string())?;
+        out.push(casted);
+    }
+    MatrixBuffer::from_vec(out, matrix.rows(), matrix.cols()).map_err(Into::into)
+}
+
+fn neg_float_numeric<T>(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: Float + ElementTrait,
+{
+    let values = matrix.try_as_slice::<T>()?;
+    let mut out: Vec<T> = Vec::with_capacity(values.len());
+    for &value in values.iter() {
+        out.push(-value);
+    }
+    MatrixBuffer::from_vec(out, matrix.rows(), matrix.cols()).map_err(Into::into)
+}
+
+fn sub_fixed64(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    if a.fixed_scale() != b.fixed_scale() {
+        return Err("sub(Fixed64): scale mismatch".into());
+    }
+    let scale = ensure_fixed64(a)?;
+    let vec_a = matrix_to_fixed_vec(a)?;
+    let vec_b = matrix_to_fixed_vec(b)?;
+    let mut out: Vec<i64> = Vec::with_capacity(vec_a.len());
+    for (lhs, rhs) in vec_a.into_iter().zip(vec_b.into_iter()) {
+        let (diff, overflow) = lhs.overflowing_sub(rhs);
+        if overflow {
+            return Err("sub(Fixed64): overflow".into());
+        }
+        out.push(diff);
+    }
+    MatrixBuffer::from_fixed_i64_vec(out, a.rows(), a.cols(), scale)
+}
+
+fn neg_fixed64(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    let scale = ensure_fixed64(matrix)?;
+    let vec = matrix_to_fixed_vec(matrix)?;
+    let mut out: Vec<i64> = Vec::with_capacity(vec.len());
+    for value in vec.into_iter() {
+        let (negated, overflow) = value.overflowing_neg();
+        if overflow {
+            return Err("neg(Fixed64): overflow".into());
+        }
+        out.push(negated);
+    }
+    MatrixBuffer::from_fixed_i64_vec(out, matrix.rows(), matrix.cols(), scale)
 }
 
 pub fn matmul(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
@@ -1028,5 +1438,48 @@ mod tests {
             expanded.to_f64_vec(),
             vec![10.5, 20.5, 10.5, 20.5, 10.5, 20.5]
         );
+    }
+
+    #[test]
+    fn test_sub_bool_difference() {
+        let lhs = MatrixBuffer::from_vec(vec![true, true, false], 1, 3).unwrap();
+        let rhs = MatrixBuffer::from_vec(vec![false, true, true], 1, 3).unwrap();
+        let diff = sub(&lhs, &rhs).expect("bool subtraction");
+        assert_eq!(diff.dtype(), DType::Bool);
+        assert_eq!(diff.to_bool_vec(), vec![true, false, false]);
+    }
+
+    #[test]
+    fn test_mul_uint8_saturates() {
+        let lhs = MatrixBuffer::from_vec(vec![200u8, 255u8], 1, 2).unwrap();
+        let rhs = MatrixBuffer::from_vec(vec![2u8, 2u8], 1, 2).unwrap();
+        let prod = mul(&lhs, &rhs).expect("uint8 multiply");
+        assert_eq!(prod.dtype(), DType::UInt8);
+        let values = prod.try_as_slice::<u8>().unwrap();
+        assert_eq!(values, &[255, 255]);
+    }
+
+    #[test]
+    fn test_div_detects_zero() {
+        let lhs = MatrixBuffer::from_vec(vec![7i32, -9i32], 1, 2).unwrap();
+        let zeros = MatrixBuffer::from_vec(vec![0i32, 1i32], 1, 2).unwrap();
+        let err = div(&lhs, &zeros).expect_err("division by zero should fail");
+        assert!(err.contains("division by zero"));
+    }
+
+    #[test]
+    fn test_neg_behaviour() {
+        let signed = MatrixBuffer::from_vec(vec![1i32, -2i32], 1, 2).unwrap();
+        let neg_signed = neg(&signed).expect("neg signed");
+        assert_eq!(neg_signed.try_as_slice::<i32>().unwrap(), &[-1, 2]);
+
+        let unsigned = MatrixBuffer::from_vec(vec![1u8, 2u8], 1, 2).unwrap();
+        let err = neg(&unsigned).expect_err("neg unsigned should error");
+        assert!(err.contains("unsigned dtypes"));
+
+        let fixed = MatrixBuffer::from_fixed_i64_vec(vec![150, -20], 1, 2, 1).unwrap();
+        let neg_fixed = neg(&fixed).expect("neg fixed");
+        assert_eq!(neg_fixed.fixed_scale(), Some(1));
+        assert_eq!(neg_fixed.to_f64_vec(), vec![-15.0, 2.0]);
     }
 }

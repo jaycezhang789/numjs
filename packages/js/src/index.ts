@@ -67,6 +67,10 @@ type BackendMatrixConstructor = {
 type BackendModule = {
   Matrix: BackendMatrixConstructor;
   add(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
+  sub(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
+  mul(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
+  div(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
+  neg(matrix: BackendMatrixHandle): BackendMatrixHandle;
   matmul(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
   sum_pairwise?(matrix: BackendMatrixHandle): number;
   dot_pairwise?(a: BackendMatrixHandle, b: BackendMatrixHandle): number;
@@ -1278,6 +1282,41 @@ export function add(a: Matrix, b: Matrix): Matrix {
   return Matrix.fromHandleWithDType(result, dtype);
 }
 
+export function sub(a: Matrix, b: Matrix): Matrix {
+  const dtype = promoteBinaryDType(a.dtype, b.dtype);
+  const left = castToDType(a, dtype);
+  const right = castToDType(b, dtype);
+  const backend = ensureBackend();
+  const result = backend.sub(getHandle(left), getHandle(right));
+  return Matrix.fromHandleWithDType(result, dtype);
+}
+
+export function mul(a: Matrix, b: Matrix): Matrix {
+  const dtype = promoteBinaryDType(a.dtype, b.dtype);
+  const left = castToDType(a, dtype);
+  const right = castToDType(b, dtype);
+  const backend = ensureBackend();
+  const result = backend.mul(getHandle(left), getHandle(right));
+  return Matrix.fromHandleWithDType(result, dtype);
+}
+
+export function div(a: Matrix, b: Matrix): Matrix {
+  const dtype = promoteBinaryDType(a.dtype, b.dtype);
+  const left = castToDType(a, dtype);
+  const right = castToDType(b, dtype);
+  const backend = ensureBackend();
+  const result = backend.div(getHandle(left), getHandle(right));
+  return Matrix.fromHandleWithDType(result, dtype);
+}
+
+export function neg(matrix: Matrix): Matrix {
+  const backend = ensureBackend();
+  const result = backend.neg(getHandle(matrix));
+  return Matrix.fromHandleWithDType(result, matrix.dtype, {
+    fixedScale: matrix.dtype === "fixed64" ? matrix.fixedScale : undefined,
+  });
+}
+
 export function matmul(a: Matrix, b: Matrix): Matrix {
   if (a.dtype === "fixed64" || b.dtype === "fixed64") {
     throw new Error("matmul does not support fixed64 matrices; cast operands to float64 first");
@@ -2212,6 +2251,12 @@ function isNapiBackendSufficient(candidate: BackendModule): boolean {
     typeof ctorWithStatic.fromFixedI64 === "function";
   if (!hasFixed64Factory) {
     return false;
+  }
+  const requiredOps: Array<keyof BackendModule> = ["sub", "mul", "div", "neg"];
+  for (const op of requiredOps) {
+    if (typeof (candidate as Record<string, unknown>)[op] !== "function") {
+      return false;
+    }
   }
   if (typeof (candidate as { gather_pairs?: unknown }).gather_pairs !== "function") {
     return false;

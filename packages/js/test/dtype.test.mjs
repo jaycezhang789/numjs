@@ -25,6 +25,10 @@ import {
   init,
   Matrix,
   add,
+  sub,
+  mul,
+  div,
+  neg,
   stack,
   concat,
   matmul,
@@ -140,6 +144,99 @@ test("Binary ops promote dtypes using promotion table", () => {
   const stackedAxis = stack(lhs, rhs, 0);
   assert.equal(stackedAxis.dtype, "int32");
   assert.deepEqual(Array.from(stackedAxis.toArray()), [1, 2, 3, 4]);
+});
+
+test("sub handles dtype promotion, bool logic, and fixed64 scales", () => {
+  const lhs = new Matrix([5, 10], 1, 2).astype("int16");
+  const rhs = new Matrix([2, 20], 1, 2).astype("uint8");
+  const diff = sub(lhs, rhs);
+  assert.equal(diff.dtype, "int32");
+  assert.deepEqual(Array.from(diff.toArray()), [3, -10]);
+
+  const boolA = new Matrix([true, true, false], 1, 3).astype("bool");
+  const boolB = new Matrix([false, true, true], 1, 3).astype("bool");
+  const boolDiff = sub(boolA, boolB);
+  assert.equal(boolDiff.dtype, "bool");
+  assert.deepEqual(Array.from(boolDiff.toArray()).map(Boolean), [true, false, false]);
+
+  const fixedA = Matrix.fromFixed(new BigInt64Array([150n, 350n]), 1, 2, 2);
+  const fixedB = Matrix.fromFixed(new BigInt64Array([50n, 125n]), 1, 2, 2);
+  const fixedDiff = sub(fixedA, fixedB);
+  assert.equal(fixedDiff.dtype, "fixed64");
+  assert.equal(fixedDiff.fixedScale, 2);
+  assert.deepEqual(Array.from(fixedDiff.toArray()), [100n, 225n]);
+
+  const scaledA = Matrix.fromFixed(new BigInt64Array([10n]), 1, 1, 1);
+  const scaledB = Matrix.fromFixed(new BigInt64Array([10n]), 1, 1, 2);
+  assert.throws(() => sub(scaledA, scaledB), /scale mismatch/);
+});
+
+test("mul saturates integer overflow and applies boolean AND", () => {
+  const lhs = new Matrix([2, -3], 1, 2).astype("int16");
+  const rhs = new Matrix([3, 4], 1, 2).astype("int16");
+  const prod = mul(lhs, rhs);
+  assert.equal(prod.dtype, "int16");
+  assert.deepEqual(Array.from(prod.toArray()), [6, -12]);
+
+  const u8 = new Matrix([200, 255], 1, 2).astype("uint8");
+  const factors = new Matrix([2, 2], 1, 2).astype("uint8");
+  const saturated = mul(u8, factors);
+  assert.equal(saturated.dtype, "uint8");
+  assert.deepEqual(Array.from(saturated.toArray()), [255, 255]);
+
+  const boolA = new Matrix([true, false, true], 1, 3).astype("bool");
+  const boolB = new Matrix([true, true, false], 1, 3).astype("bool");
+  const boolAnd = mul(boolA, boolB);
+  assert.equal(boolAnd.dtype, "bool");
+  assert.deepEqual(Array.from(boolAnd.toArray()).map(Boolean), [true, false, false]);
+
+  const fixed = Matrix.fromFixed(new BigInt64Array([100n]), 1, 1, 1);
+  assert.throws(() => mul(fixed, fixed), /mul\(Fixed64\)/);
+});
+
+test("div truncates integer quotients and validates divisors", () => {
+  const lhs = new Matrix([7, -9], 1, 2).astype("int32");
+  const rhs = new Matrix([2, 4], 1, 2).astype("int16");
+  const quotient = div(lhs, rhs);
+  assert.equal(quotient.dtype, "int32");
+  assert.deepEqual(Array.from(quotient.toArray()), [3, -2]);
+
+  const boolDividend = new Matrix([true, false], 1, 2).astype("bool");
+  const boolDivisor = new Matrix([true, true], 1, 2).astype("bool");
+  const boolResult = div(boolDividend, boolDivisor);
+  assert.equal(boolResult.dtype, "bool");
+  assert.deepEqual(Array.from(boolResult.toArray()).map(Boolean), [true, false]);
+
+  const boolFalse = new Matrix([false, true], 1, 2).astype("bool");
+  assert.throws(() => div(boolDividend, boolFalse), /division by false/);
+
+  const zeroDivisor = new Matrix([0, 0], 1, 2).astype("int32");
+  assert.throws(() => div(lhs, zeroDivisor), /division by zero/);
+
+  const fixedA = Matrix.fromFixed(new BigInt64Array([100n]), 1, 1, 1);
+  const fixedB = Matrix.fromFixed(new BigInt64Array([200n]), 1, 1, 1);
+  assert.throws(() => div(fixedA, fixedB), /div\(Fixed64\)/);
+});
+
+test("neg negates supported dtypes and preserves fixed64 metadata", () => {
+  const signed = new Matrix([1, -2], 1, 2).astype("int32");
+  const negSigned = neg(signed);
+  assert.equal(negSigned.dtype, "int32");
+  assert.deepEqual(Array.from(negSigned.toArray()), [-1, 2]);
+
+  const boolMatrix = new Matrix([true, false], 1, 2).astype("bool");
+  const negBool = neg(boolMatrix);
+  assert.equal(negBool.dtype, "bool");
+  assert.deepEqual(Array.from(negBool.toArray()).map(Boolean), [false, true]);
+
+  const fixed = Matrix.fromFixed(new BigInt64Array([150n, -20n]), 1, 2, 1);
+  const negFixed = neg(fixed);
+  assert.equal(negFixed.dtype, "fixed64");
+  assert.equal(negFixed.fixedScale, 1);
+  assert.deepEqual(Array.from(negFixed.toArray()), [-150n, 20n]);
+
+  const unsigned = new Matrix([1, 2], 1, 2).astype("uint8");
+  assert.throws(() => neg(unsigned), /unsigned dtypes/);
 });
 
 test("transpose reorders elements without changing dtype", () => {

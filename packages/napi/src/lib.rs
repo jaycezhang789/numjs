@@ -6,11 +6,12 @@ use num_rs_core::buffer::MatrixBuffer;
 use num_rs_core::dtype::DType;
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
-    dot_pairwise as core_dot_pairwise, gather as core_gather, gather_pairs as core_gather_pairs,
-    matmul as core_matmul, put as core_put, read_npy_matrix, scatter as core_scatter,
-    scatter_pairs as core_scatter_pairs, stack as core_stack, sum_pairwise as core_sum_pairwise,
-    take as core_take, transpose as core_transpose, where_select as core_where,
-    where_select_multi as core_where_multi, write_npy_matrix,
+    div as core_div, dot_pairwise as core_dot_pairwise, gather as core_gather,
+    gather_pairs as core_gather_pairs, matmul as core_matmul, mul as core_mul, neg as core_neg,
+    put as core_put, read_npy_matrix, scatter as core_scatter,
+    scatter_pairs as core_scatter_pairs, stack as core_stack, sub as core_sub,
+    sum_pairwise as core_sum_pairwise, take as core_take, transpose as core_transpose,
+    where_select as core_where, where_select_multi as core_where_multi, write_npy_matrix,
 };
 #[cfg(feature = "linalg")]
 use num_rs_core::{eigen as core_eigen, qr as core_qr, solve as core_solve, svd as core_svd};
@@ -124,6 +125,26 @@ fn map_matrix(res: num_rs_core::CoreResult<MatrixBuffer>) -> Result<Matrix> {
 #[napi]
 pub fn add(a: &Matrix, b: &Matrix) -> Result<Matrix> {
     map_matrix(core_add(a.buffer(), b.buffer()))
+}
+
+#[napi]
+pub fn sub(a: &Matrix, b: &Matrix) -> Result<Matrix> {
+    map_matrix(core_sub(a.buffer(), b.buffer()))
+}
+
+#[napi]
+pub fn mul(a: &Matrix, b: &Matrix) -> Result<Matrix> {
+    map_matrix(core_mul(a.buffer(), b.buffer()))
+}
+
+#[napi]
+pub fn div(a: &Matrix, b: &Matrix) -> Result<Matrix> {
+    map_matrix(core_div(a.buffer(), b.buffer()))
+}
+
+#[napi]
+pub fn neg(matrix: &Matrix) -> Result<Matrix> {
+    map_matrix(core_neg(matrix.buffer()))
 }
 
 #[napi]

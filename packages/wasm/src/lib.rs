@@ -2,10 +2,11 @@ use num_rs_core::buffer::MatrixBuffer;
 use num_rs_core::dtype::DType;
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
-    dot_pairwise as core_dot_pairwise, gather as core_gather, gather_pairs as core_gather_pairs,
-    matmul as core_matmul, put as core_put, scatter as core_scatter,
-    scatter_pairs as core_scatter_pairs, stack as core_stack, sum_pairwise as core_sum_pairwise,
-    take as core_take, transpose as core_transpose, where_select as core_where,
+    div as core_div, dot_pairwise as core_dot_pairwise, gather as core_gather,
+    gather_pairs as core_gather_pairs, matmul as core_matmul, mul as core_mul, neg as core_neg,
+    put as core_put, scatter as core_scatter, scatter_pairs as core_scatter_pairs,
+    stack as core_stack, sub as core_sub, sum_pairwise as core_sum_pairwise, take as core_take,
+    transpose as core_transpose, where_select as core_where,
 };
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -142,6 +143,26 @@ fn convert_indices(indices: &[i32]) -> Result<Vec<isize>, JsValue> {
 #[wasm_bindgen]
 pub fn add(a: &Matrix, b: &Matrix) -> Result<Matrix, JsValue> {
     map_matrix(core_add(a.buffer(), b.buffer()))
+}
+
+#[wasm_bindgen]
+pub fn sub(a: &Matrix, b: &Matrix) -> Result<Matrix, JsValue> {
+    map_matrix(core_sub(a.buffer(), b.buffer()))
+}
+
+#[wasm_bindgen]
+pub fn mul(a: &Matrix, b: &Matrix) -> Result<Matrix, JsValue> {
+    map_matrix(core_mul(a.buffer(), b.buffer()))
+}
+
+#[wasm_bindgen]
+pub fn div(a: &Matrix, b: &Matrix) -> Result<Matrix, JsValue> {
+    map_matrix(core_div(a.buffer(), b.buffer()))
+}
+
+#[wasm_bindgen]
+pub fn neg(matrix: &Matrix) -> Result<Matrix, JsValue> {
+    map_matrix(core_neg(matrix.buffer()))
 }
 
 #[wasm_bindgen]
