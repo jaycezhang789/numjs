@@ -6,11 +6,10 @@ use num_rs_core::buffer::MatrixBuffer;
 use num_rs_core::dtype::DType;
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
-    div as core_div, dot_pairwise as core_dot_pairwise, gather as core_gather,
-    gather_pairs as core_gather_pairs, matmul as core_matmul, mul as core_mul, neg as core_neg,
-    put as core_put, read_npy_matrix, scatter as core_scatter,
-    scatter_pairs as core_scatter_pairs, stack as core_stack, sub as core_sub,
-    sum_pairwise as core_sum_pairwise, take as core_take, transpose as core_transpose,
+    div as core_div, dot as core_dot, gather as core_gather, gather_pairs as core_gather_pairs,
+    matmul as core_matmul, mul as core_mul, neg as core_neg, put as core_put, read_npy_matrix,
+    scatter as core_scatter, scatter_pairs as core_scatter_pairs, stack as core_stack,
+    sub as core_sub, sum as core_sum, take as core_take, transpose as core_transpose,
     where_select as core_where, where_select_multi as core_where_multi, write_npy_matrix,
 };
 #[cfg(feature = "linalg")]
@@ -345,13 +344,21 @@ pub fn reset_copy_bytes() {
 // ---------------------------------------------------------------------
 
 #[napi]
-pub fn sum_pairwise(matrix: &Matrix) -> f64 {
-    core_sum_pairwise(matrix.buffer())
+pub fn sum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
+    let target = match dtype {
+        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        None => None,
+    };
+    map_matrix(core_sum(matrix.buffer(), target))
 }
 
 #[napi]
-pub fn dot_pairwise(a: &Matrix, b: &Matrix) -> Result<f64> {
-    core_dot_pairwise(a.buffer(), b.buffer()).map_err(|e| Error::from_reason(e))
+pub fn dot(a: &Matrix, b: &Matrix, dtype: Option<String>) -> Result<Matrix> {
+    let target = match dtype {
+        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        None => None,
+    };
+    map_matrix(core_dot(a.buffer(), b.buffer(), target))
 }
 
 fn convert_indices(indices: &[i64]) -> Result<Vec<isize>> {
@@ -373,7 +380,8 @@ mod tests {
         let base = MatrixBuffer::from_fixed_i64_vec(vec![1200, 2200], 1, 2, 2).unwrap();
         let matrix = Matrix::from_buffer(base.clone());
         assert_eq!(matrix.fixed_scale(), Some(2));
-        let total = sum_pairwise(&matrix);
+        let reduced = sum(&matrix, None).expect("sum fixed64");
+        let total = reduced.buffer().to_f64_vec()[0];
         assert!((total - 34.0).abs() < 1e-9);
 
         let merged = concat(&matrix, &Matrix::from_buffer(base.clone()), 0).unwrap();

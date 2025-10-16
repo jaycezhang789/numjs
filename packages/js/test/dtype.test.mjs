@@ -267,19 +267,23 @@ test("broadcastTo expands singleton dimensions", () => {
 
 test("sum defaults to a numerically stable reduction", () => {
   const matrix = new Matrix([1e16, 1, 1, -1e16, 1], 1, 5);
-  const stable = sum(matrix);
+  const stableMatrix = sum(matrix);
+  assert.equal(stableMatrix.dtype, "float64");
+  const stable = stableMatrix.toArray()[0];
   const naive = sumUnsafe(matrix);
-  assert.ok(Math.abs(stable - 3) < 1e-6);
-  assert.notStrictEqual(stable, naive, "stable sum should differ from naive accumulation");
+  assert.ok(Math.abs(Number(stable) - 3) < 1e-6);
+  assert.notStrictEqual(Number(stable), naive, "stable sum should differ from naive accumulation");
 });
 
 test("dot defaults to pairwise accumulation", () => {
   const a = new Matrix([1e16, 1, 1, -1e16, 1], 1, 5);
   const b = new Matrix([1, 1, 1, 1, 1], 1, 5);
-  const stable = dot(a, b);
+  const stableMatrix = dot(a, b);
+  assert.equal(stableMatrix.dtype, "float64");
+  const stable = stableMatrix.toArray()[0];
   const naive = dotUnsafe(a, b);
-  assert.ok(Math.abs(stable - 3) < 1e-6);
-  assert.notStrictEqual(stable, naive, "stable dot should differ from naive accumulation");
+  assert.ok(Math.abs(Number(stable) - 3) < 1e-6);
+  assert.notStrictEqual(Number(stable), naive, "stable dot should differ from naive accumulation");
 });
 
 test("dtype metadata exposes size and kind information", () => {

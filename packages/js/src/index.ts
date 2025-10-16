@@ -72,8 +72,12 @@ type BackendModule = {
   div(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
   neg(matrix: BackendMatrixHandle): BackendMatrixHandle;
   matmul(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
-  sum_pairwise?(matrix: BackendMatrixHandle): number;
-  dot_pairwise?(a: BackendMatrixHandle, b: BackendMatrixHandle): number;
+  sum?(matrix: BackendMatrixHandle, dtype?: DType | null): BackendMatrixHandle;
+  dot?(
+    a: BackendMatrixHandle,
+    b: BackendMatrixHandle,
+    dtype?: DType | null
+  ): BackendMatrixHandle;
   from_fixed_i64?(
     data: BigInt64Array,
     rows: number,
@@ -1619,51 +1623,294 @@ export function qr(matrix: Matrix): { q: Matrix; r: Matrix } {
   };
 }
 
-export function sumStable(matrix: Matrix): number {
-  const backend = ensureBackend();
-  const kind = backendKind();
-  if (kind === "napi" && typeof backend.sum_pairwise === "function") {
-    return backend.sum_pairwise(getHandle(matrix)) as number;
+export const INT64_MIN = -9223372036854775808n;
+export const INT64_MAX = 9223372036854775807n;
+export const UINT64_MAX = 0xffffffffffffffffn;
+
+export type ReduceOptions = {
+  dtype?: DType;
+};
+
+function reductionAccumulatorDType(dtype: DType): DType {
+  switch (dtype) {
+    case "bool":
+    case "int8":
+    case "int16":
+    case "int32":
+    case "int64":
+      return "int64";
+    case "uint8":
+    case "uint16":
+    case "uint32":
+    case "uint64":
+      return "uint64";
+    case "float32":
+      return "float32";
+    case "float64":
+      return "float64";
+    case "fixed64":
+      return "fixed64";
+    default:
+      return dtype;
   }
-  // Fallback: Kahan summation to mitigate catastrophic cancellation
-  const arr = matrix.astype("float64", { copy: false }).toArray() as Float64Array;
-  let sum = 0;
-  let compensation = 0;
-  for (let i = 0; i < arr.length; i += 1) {
-    const y = arr[i] - compensation;
-    const t = sum + y;
-    compensation = (t - sum) - y;
-    sum = t;
-  }
-  return sum;
 }
 
-export function dotStable(a: Matrix, b: Matrix): number {
+function ensureInt64Range(value: bigint, context: string): void {
+  if (value < INT64_MIN || value > INT64_MAX) {
+    throw new Error(`${context}: signed accumulator overflow`);
+  }
+}
+
+function ensureUint64Range(value: bigint, context: string): void {
+  if (value < 0n || value > UINT64_MAX) {
+    throw new Error(`${context}: unsigned accumulator overflow`);
+  }
+}
+
+function createScalarMatrix(
+  value: number | bigint,
+  dtype: DType,
+  metadata?: { fixedScale?: number | null }
+): Matrix {
+  if (dtype === "fixed64") {
+    const scale = metadata?.fixedScale ?? 0;
+    const data = new BigInt64Array([BigInt(value)]);
+    return Matrix.fromFixed(data, 1, 1, scale);
+  }
+  const data = allocateArrayForDType(dtype, 1);
+  writeMatrixValue(data, 0, value, dtype);
+  return new Matrix(data, 1, 1, { dtype });
+}
+
+function castReduceResult(result: Matrix, target?: DType): Matrix {
+  if (!target || target === result.dtype) {
+    return result;
+  }
+  return result.astype(target, { copy: false });
+}
+
+function sumInJs(matrix: Matrix, options: ReduceOptions): Matrix {
+  const accumulatorDType = reductionAccumulatorDType(matrix.dtype);
+  const working =
+    matrix.dtype === accumulatorDType
+      ? matrix
+      : matrix.astype(accumulatorDType, { copy: true });
+  const array = working.toArray();
+  switch (accumulatorDType) {
+    case "int64": {
+      const data = array as BigInt64Array;
+      let total = 0n;
+      for (let index = 0; index < data.length; index += 1) {
+        total += data[index];
+      }
+      ensureInt64Range(total, "sum");
+      const scalar = createScalarMatrix(total, "int64");
+      return castReduceResult(scalar, options.dtype);
+    }
+    case "uint64": {
+      const data = array as BigUint64Array;
+      let total = 0n;
+      for (let index = 0; index < data.length; index += 1) {
+        total += data[index];
+      }
+      ensureUint64Range(total, "sum");
+      const scalar = createScalarMatrix(total, "uint64");
+      return castReduceResult(scalar, options.dtype);
+    }
+    case "float32": {
+      const data = array as Float32Array;
+      let sum = 0;
+      let compensation = 0;
+      for (let i = 0; i < data.length; i += 1) {
+        const y = data[i] - compensation;
+        const t = sum + y;
+        compensation = (t - sum) - y;
+        sum = t;
+      }
+      const scalar = createScalarMatrix(Math.fround(sum), "float32");
+      return castReduceResult(scalar, options.dtype);
+    }
+    case "float64": {
+      const data = array as Float64Array;
+      let sum = 0;
+      let compensation = 0;
+      for (let i = 0; i < data.length; i += 1) {
+        const y = data[i] - compensation;
+        const t = sum + y;
+        compensation = (t - sum) - y;
+        sum = t;
+      }
+      const scalar = createScalarMatrix(sum, "float64");
+      return castReduceResult(scalar, options.dtype);
+    }
+    case "fixed64": {
+      const data = array as BigInt64Array;
+      let total = 0n;
+      for (let index = 0; index < data.length; index += 1) {
+        total += data[index];
+      }
+      ensureInt64Range(total, "sum(Fixed64)");
+      const scale = working.fixedScale ?? matrix.fixedScale ?? 0;
+      const scalar = Matrix.fromFixed(new BigInt64Array([total]), 1, 1, scale);
+      return castReduceResult(scalar, options.dtype);
+    }
+    default:
+      throw new Error(`sum: unsupported accumulator dtype ${accumulatorDType}`);
+  }
+}
+
+function dotSignedArray(left: ArrayLike<number>, right: ArrayLike<number>): bigint {
+  let total = 0n;
+  for (let index = 0; index < left.length; index += 1) {
+    total += BigInt(left[index]) * BigInt(right[index]);
+  }
+  return total;
+}
+
+function dotUnsignedArray(left: ArrayLike<number>, right: ArrayLike<number>): bigint {
+  let total = 0n;
+  for (let index = 0; index < left.length; index += 1) {
+    total += BigInt(left[index]) * BigInt(right[index]);
+  }
+  return total;
+}
+
+function dotBigIntArray(left: BigInt64Array | BigUint64Array, right: BigInt64Array | BigUint64Array): bigint {
+  let total = 0n;
+  for (let index = 0; index < left.length; index += 1) {
+    total += left[index] * right[index];
+  }
+  return total;
+}
+
+function dotInJs(a: Matrix, b: Matrix, options: ReduceOptions): Matrix {
   if (a.rows !== b.rows || a.cols !== b.cols) {
-    throw new Error("dotStable: shape mismatch");
+    throw new Error("dot: shape mismatch");
   }
-  const backend = ensureBackend();
-  const kind = backendKind();
-  if (kind === "napi" && typeof backend.dot_pairwise === "function") {
-    return backend.dot_pairwise(getHandle(a), getHandle(b)) as number;
+  if (a.dtype === "fixed64" || b.dtype === "fixed64") {
+    throw new Error("dot(Fixed64): convert operands to float64 before reducing");
   }
-  const av = a.astype("float64", { copy: false }).toArray() as Float64Array;
-  const bv = b.astype("float64", { copy: false }).toArray() as Float64Array;
-  const n = av.length;
-  let sum = 0;
-  let compensation = 0;
-  for (let i = 0; i < n; i += 1) {
-    const product = av[i] * bv[i];
-    const y = product - compensation;
-    const t = sum + y;
-    compensation = (t - sum) - y;
-    sum = t;
+  const mulDType = promoteBinaryDType(a.dtype, b.dtype);
+  const left = a.dtype === mulDType ? a : a.astype(mulDType, { copy: true });
+  const right = b.dtype === mulDType ? b : b.astype(mulDType, { copy: true });
+  const accumulatorDType = reductionAccumulatorDType(mulDType);
+  const leftArray = left.toArray();
+  const rightArray = right.toArray();
+
+  switch (mulDType) {
+    case "bool": {
+      const lhs = leftArray as Uint8Array;
+      const rhs = rightArray as Uint8Array;
+      let total = 0n;
+      for (let index = 0; index < lhs.length; index += 1) {
+        if (lhs[index] !== 0 && rhs[index] !== 0) {
+          total += 1n;
+        }
+      }
+      ensureInt64Range(total, "dot(bool, bool)");
+      const scalar = createScalarMatrix(total, "int64");
+      return castReduceResult(scalar, options.dtype);
+    }
+    case "int8":
+    case "int16":
+    case "int32": {
+      const lhs = leftArray as Int16Array | Int32Array | Int8Array;
+      const rhs = rightArray as Int16Array | Int32Array | Int8Array;
+      const total = dotSignedArray(lhs, rhs);
+      ensureInt64Range(total, "dot(signed)");
+      const scalar = createScalarMatrix(total, "int64");
+      return castReduceResult(scalar, options.dtype);
+    }
+    case "int64": {
+      const lhs = leftArray as BigInt64Array;
+      const rhs = rightArray as BigInt64Array;
+      const total = dotBigIntArray(lhs, rhs);
+      ensureInt64Range(total, "dot(int64)");
+      const scalar = createScalarMatrix(total, "int64");
+      return castReduceResult(scalar, options.dtype);
+    }
+    case "uint8":
+    case "uint16":
+    case "uint32": {
+      const lhs = leftArray as Uint16Array | Uint32Array | Uint8Array;
+      const rhs = rightArray as Uint16Array | Uint32Array | Uint8Array;
+      const total = dotUnsignedArray(lhs, rhs);
+      ensureUint64Range(total, "dot(unsigned)");
+      const scalar = createScalarMatrix(total, "uint64");
+      return castReduceResult(scalar, options.dtype);
+    }
+    case "uint64": {
+      const lhs = leftArray as BigUint64Array;
+      const rhs = rightArray as BigUint64Array;
+      const total = dotBigIntArray(lhs, rhs);
+      ensureUint64Range(total, "dot(uint64)");
+      const scalar = createScalarMatrix(total, "uint64");
+      return castReduceResult(scalar, options.dtype);
+    }
+    case "float32": {
+      const lhs = leftArray as Float32Array;
+      const rhs = rightArray as Float32Array;
+      let sum = 0;
+      let compensation = 0;
+      for (let index = 0; index < lhs.length; index += 1) {
+        const product = lhs[index] * rhs[index];
+        const y = product - compensation;
+        const t = sum + y;
+        compensation = (t - sum) - y;
+        sum = t;
+      }
+      const scalar = createScalarMatrix(Math.fround(sum), "float32");
+      return castReduceResult(scalar, options.dtype);
+    }
+    case "float64": {
+      const lhs = leftArray as Float64Array;
+      const rhs = rightArray as Float64Array;
+      let sum = 0;
+      let compensation = 0;
+      for (let index = 0; index < lhs.length; index += 1) {
+        const product = lhs[index] * rhs[index];
+        const y = product - compensation;
+        const t = sum + y;
+        compensation = (t - sum) - y;
+        sum = t;
+      }
+      const scalar = createScalarMatrix(sum, "float64");
+      return castReduceResult(scalar, options.dtype);
+    }
+    case "fixed64":
+      throw new Error("dot(Fixed64): convert operands to float64 before reducing");
+    default:
+      throw new Error(`dot: unsupported multiplicative dtype ${mulDType}`);
   }
-  return sum;
 }
 
-export const sum = sumStable;
-export const dot = dotStable;
+export function sum(matrix: Matrix, options: ReduceOptions = {}): Matrix {
+  const backend = ensureBackend();
+  const target = options.dtype ?? null;
+  if (backend.sum) {
+    const handle = backend.sum(getHandle(matrix), target);
+    const dtype = getMatrixDTypeFromHandle(handle);
+    const fixedScale = dtype === "fixed64" ? getMatrixFixedScaleFromHandle(handle) : undefined;
+    return Matrix.fromHandleWithDType(handle, dtype, { fixedScale });
+  }
+  return sumInJs(matrix, options);
+}
+
+export function dot(a: Matrix, b: Matrix, options: ReduceOptions = {}): Matrix {
+  if (a.rows !== b.rows || a.cols !== b.cols) {
+    throw new Error("dot: shape mismatch");
+  }
+  const backend = ensureBackend();
+  const target = options.dtype ?? null;
+  if (backend.dot) {
+    const handle = backend.dot(getHandle(a), getHandle(b), target);
+    const dtype = getMatrixDTypeFromHandle(handle);
+    const fixedScale = dtype === "fixed64" ? getMatrixFixedScaleFromHandle(handle) : undefined;
+    return Matrix.fromHandleWithDType(handle, dtype, { fixedScale });
+  }
+  return dotInJs(a, b, options);
+}
+
 export function sumUnsafe(matrix: Matrix): number {
   const arr = matrix.astype("float64", { copy: false }).toArray() as Float64Array;
   let total = 0;
@@ -2252,7 +2499,7 @@ function isNapiBackendSufficient(candidate: BackendModule): boolean {
   if (!hasFixed64Factory) {
     return false;
   }
-  const requiredOps: Array<keyof BackendModule> = ["sub", "mul", "div", "neg"];
+  const requiredOps: Array<keyof BackendModule> = ["sub", "mul", "div", "neg", "sum", "dot"];
   for (const op of requiredOps) {
     if (typeof (candidate as Record<string, unknown>)[op] !== "function") {
       return false;

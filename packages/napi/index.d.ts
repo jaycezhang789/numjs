@@ -31,8 +31,8 @@ export declare function writeNpy(matrix: Matrix): Buffer
 export declare function copyBytesTotal(): number
 export declare function takeCopyBytes(): number
 export declare function resetCopyBytes(): void
-export declare function sumPairwise(matrix: Matrix): number
-export declare function dotPairwise(a: Matrix, b: Matrix): number
+export declare function sum(matrix: Matrix, dtype?: string | undefined | null): Matrix
+export declare function dot(a: Matrix, b: Matrix, dtype?: string | undefined | null): Matrix
 export class Matrix {
   constructor(data: Float64Array, rows: number, cols: number)
   static fromBytes(data: Buffer, rows: number, cols: number, dtype: string): Matrix

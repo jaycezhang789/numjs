@@ -27,40 +27,268 @@ pub type CoreResult<T> = Result<T, String>;
 // ---------------------------------------------------------------------
 // Numerically stable reductions (pairwise sum/dot, Welford mean/variance)
 // ---------------------------------------------------------------------
+fn reduction_accumulator_dtype(dtype: DType) -> DType {
+    match dtype {
+        DType::Bool => DType::Int64,
+        DType::Int8 | DType::Int16 | DType::Int32 | DType::Int64 => DType::Int64,
+        DType::UInt8 | DType::UInt16 | DType::UInt32 | DType::UInt64 => DType::UInt64,
+        DType::Float32 => DType::Float32,
+        DType::Float64 => DType::Float64,
+        DType::Fixed64 => DType::Fixed64,
+    }
+}
 
-fn pairwise_sum_slice(data: &[f64]) -> f64 {
-    match data.len() {
-        0 => 0.0,
-        1 => data[0],
-        2 => data[0] + data[1],
-        _ => {
-            let mid = data.len() / 2;
-            pairwise_sum_slice(&data[..mid]) + pairwise_sum_slice(&data[mid..])
+fn apply_reduce_output_dtype(
+    result: MatrixBuffer,
+    target: Option<DType>,
+) -> CoreResult<MatrixBuffer> {
+    if let Some(target_dtype) = target {
+        if target_dtype == result.dtype() {
+            Ok(result)
+        } else {
+            result.cast(target_dtype)
+        }
+    } else {
+        Ok(result)
+    }
+}
+
+fn sum_bool(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    let contiguous = matrix.to_contiguous()?;
+    let slice = contiguous.try_as_slice::<bool>()?;
+    let mut total: i128 = 0;
+    for &value in slice {
+        if value {
+            total += 1;
         }
     }
+    if total > i64::MAX as i128 {
+        return Err("sum(bool): overflow while counting true values".into());
+    }
+    MatrixBuffer::from_vec(vec![total as i64], 1, 1).map_err(Into::into)
 }
 
-pub fn sum_pairwise(buffer: &MatrixBuffer) -> f64 {
-    let mut v = buffer.to_f64_vec();
-    v.sort_by(|a, b| {
-        a.abs()
-            .partial_cmp(&b.abs())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    pairwise_sum_slice(&v)
+fn sum_signed_numeric<T>(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: PrimInt + Signed + ToPrimitive + ElementTrait,
+{
+    let contiguous = matrix.to_contiguous()?;
+    let slice = contiguous.try_as_slice::<T>()?;
+    let mut total: i128 = 0;
+    for &value in slice {
+        let v = value
+            .to_i64()
+            .ok_or_else(|| "sum: failed to convert signed value to i64".to_string())?;
+        total = total
+            .checked_add(v as i128)
+            .ok_or_else(|| "sum: signed accumulator overflow".to_string())?;
+    }
+    if total < i64::MIN as i128 || total > i64::MAX as i128 {
+        return Err("sum: signed result exceeds int64 range".into());
+    }
+    MatrixBuffer::from_vec(vec![total as i64], 1, 1).map_err(Into::into)
 }
 
-pub fn dot_pairwise(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<f64> {
+fn sum_unsigned_numeric<T>(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: PrimInt + Unsigned + ToPrimitive + ElementTrait,
+{
+    let contiguous = matrix.to_contiguous()?;
+    let slice = contiguous.try_as_slice::<T>()?;
+    let mut total: u128 = 0;
+    for &value in slice {
+        let v = value
+            .to_u64()
+            .ok_or_else(|| "sum: failed to convert unsigned value to u64".to_string())?;
+        total = total
+            .checked_add(v as u128)
+            .ok_or_else(|| "sum: unsigned accumulator overflow".to_string())?;
+    }
+    if total > u64::MAX as u128 {
+        return Err("sum: unsigned result exceeds uint64 range".into());
+    }
+    MatrixBuffer::from_vec(vec![total as u64], 1, 1).map_err(Into::into)
+}
+
+fn sum_float_numeric<T>(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: Float + ElementTrait,
+{
+    let contiguous = matrix.to_contiguous()?;
+    let slice = contiguous.try_as_slice::<T>()?;
+    let mut sum = T::zero();
+    let mut compensation = T::zero();
+    for &value in slice {
+        let y = value - compensation;
+        let t = sum + y;
+        compensation = (t - sum) - y;
+        sum = t;
+    }
+    MatrixBuffer::from_vec(vec![sum], 1, 1).map_err(Into::into)
+}
+
+fn sum_fixed64(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    let scale = ensure_fixed64(matrix)?;
+    let data = matrix_to_fixed_vec(matrix)?;
+    let mut total: i128 = 0;
+    for value in data {
+        total = total
+            .checked_add(value as i128)
+            .ok_or_else(|| "sum(Fixed64): overflow".to_string())?;
+    }
+    if total < i64::MIN as i128 || total > i64::MAX as i128 {
+        return Err("sum(Fixed64): overflow".into());
+    }
+    MatrixBuffer::from_fixed_i64_vec(vec![total as i64], 1, 1, scale)
+}
+
+pub fn sum(matrix: &MatrixBuffer, target_dtype: Option<DType>) -> CoreResult<MatrixBuffer> {
+    let result = match matrix.dtype() {
+        DType::Bool => sum_bool(matrix),
+        DType::Int8 => sum_signed_numeric::<i8>(matrix),
+        DType::Int16 => sum_signed_numeric::<i16>(matrix),
+        DType::Int32 => sum_signed_numeric::<i32>(matrix),
+        DType::Int64 => sum_signed_numeric::<i64>(matrix),
+        DType::UInt8 => sum_unsigned_numeric::<u8>(matrix),
+        DType::UInt16 => sum_unsigned_numeric::<u16>(matrix),
+        DType::UInt32 => sum_unsigned_numeric::<u32>(matrix),
+        DType::UInt64 => sum_unsigned_numeric::<u64>(matrix),
+        DType::Float32 => sum_float_numeric::<f32>(matrix),
+        DType::Float64 => sum_float_numeric::<f64>(matrix),
+        DType::Fixed64 => sum_fixed64(matrix),
+    }?;
+    apply_reduce_output_dtype(result, target_dtype)
+}
+
+fn dot_bool(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    let lhs = a.try_as_slice::<bool>()?;
+    let rhs = b.try_as_slice::<bool>()?;
+    let mut total: i128 = 0;
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        if x && y {
+            total = total
+                .checked_add(1)
+                .ok_or_else(|| "dot(bool, bool): overflow".to_string())?;
+        }
+    }
+    MatrixBuffer::from_vec(vec![total as i64], 1, 1).map_err(Into::into)
+}
+
+fn dot_signed_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: PrimInt + Signed + ToPrimitive + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let mut total: i128 = 0;
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        let xi = x
+            .to_i64()
+            .ok_or_else(|| "dot: failed to convert signed multiplicand".to_string())?;
+        let yi = y
+            .to_i64()
+            .ok_or_else(|| "dot: failed to convert signed multiplicand".to_string())?;
+        total = total
+            .checked_add((xi as i128) * (yi as i128))
+            .ok_or_else(|| "dot: signed accumulator overflow".to_string())?;
+    }
+    if total < i64::MIN as i128 || total > i64::MAX as i128 {
+        return Err("dot: signed result exceeds int64 range".into());
+    }
+    MatrixBuffer::from_vec(vec![total as i64], 1, 1).map_err(Into::into)
+}
+
+fn dot_unsigned_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: PrimInt + Unsigned + ToPrimitive + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let mut total: u128 = 0;
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        let xi = x
+            .to_u64()
+            .ok_or_else(|| "dot: failed to convert unsigned multiplicand".to_string())?;
+        let yi = y
+            .to_u64()
+            .ok_or_else(|| "dot: failed to convert unsigned multiplicand".to_string())?;
+        total = total
+            .checked_add((xi as u128) * (yi as u128))
+            .ok_or_else(|| "dot: unsigned accumulator overflow".to_string())?;
+    }
+    if total > u64::MAX as u128 {
+        return Err("dot: unsigned result exceeds uint64 range".into());
+    }
+    MatrixBuffer::from_vec(vec![total as u64], 1, 1).map_err(Into::into)
+}
+
+fn dot_float_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: Float + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let mut sum = T::zero();
+    let mut compensation = T::zero();
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        let product = x * y;
+        let y_comp = product - compensation;
+        let t = sum + y_comp;
+        compensation = (t - sum) - y_comp;
+        sum = t;
+    }
+    MatrixBuffer::from_vec(vec![sum], 1, 1).map_err(Into::into)
+}
+
+pub fn dot(
+    a: &MatrixBuffer,
+    b: &MatrixBuffer,
+    target_dtype: Option<DType>,
+) -> CoreResult<MatrixBuffer> {
     if a.rows() != b.rows() || a.cols() != b.cols() {
-        return Err("dot_pairwise: shape mismatch".into());
+        return Err("dot: shape mismatch".into());
     }
-    let av = a.to_f64_vec();
-    let bv = b.to_f64_vec();
-    let mut prod: Vec<f64> = Vec::with_capacity(av.len());
-    for i in 0..av.len() {
-        prod.push(av[i] * bv[i]);
+    if a.dtype() == DType::Fixed64 || b.dtype() == DType::Fixed64 {
+        return Err("dot(Fixed64): convert operands to float64 before reducing".into());
     }
-    Ok(pairwise_sum_slice(&prod))
+    let mul_dtype = promote_pair(a.dtype(), b.dtype());
+    let acc_dtype = reduction_accumulator_dtype(mul_dtype);
+
+    let left_cast = if a.dtype() == mul_dtype {
+        a.to_contiguous()?
+    } else {
+        a.cast(mul_dtype)?
+            .to_contiguous()?
+    };
+    let right_cast = if b.dtype() == mul_dtype {
+        b.to_contiguous()?
+    } else {
+        b.cast(mul_dtype)?
+            .to_contiguous()?
+    };
+
+    let result = match mul_dtype {
+        DType::Bool => dot_bool(&left_cast, &right_cast),
+        DType::Int8 => dot_signed_numeric::<i8>(&left_cast, &right_cast),
+        DType::Int16 => dot_signed_numeric::<i16>(&left_cast, &right_cast),
+        DType::Int32 => dot_signed_numeric::<i32>(&left_cast, &right_cast),
+        DType::Int64 => dot_signed_numeric::<i64>(&left_cast, &right_cast),
+        DType::UInt8 => dot_unsigned_numeric::<u8>(&left_cast, &right_cast),
+        DType::UInt16 => dot_unsigned_numeric::<u16>(&left_cast, &right_cast),
+        DType::UInt32 => dot_unsigned_numeric::<u32>(&left_cast, &right_cast),
+        DType::UInt64 => dot_unsigned_numeric::<u64>(&left_cast, &right_cast),
+        DType::Float32 => dot_float_numeric::<f32>(&left_cast, &right_cast),
+        DType::Float64 => dot_float_numeric::<f64>(&left_cast, &right_cast),
+        DType::Fixed64 => unreachable!(),
+    }?;
+
+    let normalized = if acc_dtype == result.dtype() {
+        result
+    } else {
+        result.cast(acc_dtype)?
+    };
+
+    apply_reduce_output_dtype(normalized, target_dtype)
 }
 
 pub fn welford_mean_variance(buffer: &MatrixBuffer, sample: bool) -> (f64, f64) {
@@ -1270,74 +1498,6 @@ fn apply_mask<T: Copy>(dest: &mut [T], src: &[T], mask: &[bool]) {
 }
 
 // ---------------------------------------------------------------------
-// Compatibility helpers (legacy f64 API)
-// ---------------------------------------------------------------------
-
-use ndarray::{concatenate, Array1, ArrayView2, ArrayViewMut2, Axis};
-
-pub fn add_inplace(
-    a: ArrayView2<'_, f64>,
-    b: ArrayView2<'_, f64>,
-    mut out: ArrayViewMut2<'_, f64>,
-) {
-    assert_eq!(a.dim(), b.dim());
-    assert_eq!(a.dim(), out.dim());
-    out.assign(&(&a + &b));
-}
-
-pub fn matmul_legacy(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
-    a.dot(&b)
-}
-
-pub fn clip_legacy(a: ArrayView2<'_, f64>, min: f64, max: f64) -> Array2<f64> {
-    a.map(|value| value.clamp(min, max))
-}
-
-pub fn where_select_legacy(
-    condition: ArrayView2<'_, f64>,
-    a: ArrayView2<'_, f64>,
-    b: ArrayView2<'_, f64>,
-) -> CoreResult<Array2<f64>> {
-    if condition.dim() != a.dim() || condition.dim() != b.dim() {
-        return Err("Shape mismatch in where operation".into());
-    }
-    let mut out = Array2::<f64>::zeros(a.dim());
-    for ((cond, (lhs, rhs)), out_cell) in condition
-        .iter()
-        .zip(a.iter().zip(b.iter()))
-        .zip(out.iter_mut())
-    {
-        *out_cell = if *cond != 0.0 { *lhs } else { *rhs };
-    }
-    Ok(out)
-}
-
-pub fn concat_legacy(axis: usize, matrices: &[ArrayView2<'_, f64>]) -> CoreResult<Array2<f64>> {
-    if matrices.is_empty() {
-        return Err("concat expects at least one matrix".into());
-    }
-    let axis = Axis(axis);
-    concatenate(axis, matrices).map_err(|e| e.to_string())
-}
-
-#[cfg(feature = "linalg")]
-pub fn svd_legacy(a: ArrayView2<'_, f64>) -> CoreResult<(Array2<f64>, Array1<f64>, Array2<f64>)> {
-    let matrix = DMatrix::from_row_slice(a.nrows(), a.ncols(), a.as_slice().unwrap());
-    let svd = matrix.svd(true, true);
-    let u = svd
-        .u
-        .ok_or_else(|| "SVD did not return U matrix".to_string())?;
-    let vt = svd
-        .v_t
-        .ok_or_else(|| "SVD did not return V^T matrix".to_string())?;
-    let singular = Array1::from_vec(svd.singular_values.iter().copied().collect());
-    let u_array = Array2::from_shape_vec((u.nrows(), u.ncols()), u.as_slice().to_vec()).unwrap();
-    let vt_array =
-        Array2::from_shape_vec((vt.nrows(), vt.ncols()), vt.as_slice().to_vec()).unwrap();
-    Ok((u_array, singular, vt_array))
-}
-
-// ---------------------------------------------------------------------
 // Tests for stable reductions
 // ---------------------------------------------------------------------
 
@@ -1356,7 +1516,9 @@ mod tests {
         )
         .unwrap();
         let naive: f64 = buf.to_f64_vec().iter().sum();
-        let stable = sum_pairwise(&buf);
+        let stable_buf = sum(&buf, None).expect("sum");
+        assert_eq!(stable_buf.dtype(), DType::Float64);
+        let stable = stable_buf.try_as_slice::<f64>().unwrap()[0];
         // naive may be 1.0 or 0.0 depending on accumulation; stable should be 3.0 or close
         assert!(
             stable > 0.5,
@@ -1481,5 +1643,33 @@ mod tests {
         let neg_fixed = neg(&fixed).expect("neg fixed");
         assert_eq!(neg_fixed.fixed_scale(), Some(1));
         assert_eq!(neg_fixed.to_f64_vec(), vec![-15.0, 2.0]);
+    }
+
+    #[test]
+    fn test_sum_int32_accumulates_to_int64() {
+        let buf = MatrixBuffer::from_vec(vec![1i32, 2, 3, 4], 2, 2).unwrap();
+        let reduced = sum(&buf, None).expect("sum int32");
+        assert_eq!(reduced.dtype(), DType::Int64);
+        let values = reduced.try_as_slice::<i64>().unwrap();
+        assert_eq!(values, &[10]);
+    }
+
+    #[test]
+    fn test_sum_with_target_dtype() {
+        let buf = MatrixBuffer::from_vec(vec![1u16, 2u16, 3u16], 1, 3).unwrap();
+        let reduced = sum(&buf, Some(DType::UInt32)).expect("sum u16 -> u32");
+        assert_eq!(reduced.dtype(), DType::UInt32);
+        let values = reduced.try_as_slice::<u32>().unwrap();
+        assert_eq!(values, &[6]);
+    }
+
+    #[test]
+    fn test_dot_accumulates_to_int64() {
+        let lhs = MatrixBuffer::from_vec(vec![1i16, 2i16, 3i16], 1, 3).unwrap();
+        let rhs = MatrixBuffer::from_vec(vec![4i16, 5i16, 6i16], 1, 3).unwrap();
+        let reduced = dot(&lhs, &rhs, None).expect("dot i16");
+        assert_eq!(reduced.dtype(), DType::Int64);
+        let values = reduced.try_as_slice::<i64>().unwrap();
+        assert_eq!(values, &[32]);
     }
 }
