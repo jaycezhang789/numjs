@@ -1073,10 +1073,8 @@ where
     } else {
         options.rounding().unwrap_or(RoundingMode::Trunc)
     };
-    let min: f64 = NumCast::from(T::min_value())
-        .expect("signed minimum convertible to f64");
-    let max: f64 = NumCast::from(T::max_value())
-        .expect("signed maximum convertible to f64");
+    let min: f64 = NumCast::from(T::min_value()).expect("signed minimum convertible to f64");
+    let max: f64 = NumCast::from(T::max_value()).expect("signed maximum convertible to f64");
     let span = (max - min) + 1.0;
     for (idx, mut value) in values.into_iter().enumerate() {
         if value.is_nan() {
@@ -1130,8 +1128,7 @@ where
         options.rounding().unwrap_or(RoundingMode::Trunc)
     };
     let min = 0.0;
-    let max: f64 = NumCast::from(T::max_value())
-        .expect("unsigned maximum convertible to f64");
+    let max: f64 = NumCast::from(T::max_value()).expect("unsigned maximum convertible to f64");
     let span = max + 1.0;
     for (idx, mut value) in values.into_iter().enumerate() {
         if value.is_nan() {

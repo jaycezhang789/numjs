@@ -249,9 +249,12 @@ pub fn dot(
         return Err("dot: shape mismatch".into());
     }
     if a.dtype() == DType::Fixed64 || b.dtype() == DType::Fixed64 {
-        return Err("dot(Fixed64): convert operands to float64 before reducing".into());
+        return Err(
+            "dot(Fixed64): convert operands to float64 via astype(\"float64\") before reducing"
+                .into(),
+        );
     }
-    let mul_dtype = promote_pair(a.dtype(), b.dtype());
+    let mul_dtype = promote_pair(a.dtype(), b.dtype()).map_err(|err| format!("dot: {err}"))?;
     let acc_dtype = reduction_accumulator_dtype(mul_dtype);
 
     let left_cast = if a.dtype() == mul_dtype {
@@ -462,7 +465,7 @@ pub fn add(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
         return MatrixBuffer::from_fixed_i64_vec(out, a.rows(), a.cols(), scale);
     }
     ensure_same_shape(a, b)?;
-    let dtype = promote_pair(a.dtype(), b.dtype());
+    let dtype = promote_pair(a.dtype(), b.dtype()).map_err(|err| format!("add: {err}"))?;
 
     if dtype == DType::Bool {
         if a.dtype() != DType::Bool || b.dtype() != DType::Bool {
@@ -505,7 +508,7 @@ pub fn sub(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
         return sub_fixed64(a, b);
     }
     ensure_same_shape(a, b)?;
-    let dtype = promote_pair(a.dtype(), b.dtype());
+    let dtype = promote_pair(a.dtype(), b.dtype()).map_err(|err| format!("sub: {err}"))?;
 
     if dtype == DType::Bool {
         if a.dtype() != DType::Bool || b.dtype() != DType::Bool {
@@ -547,7 +550,7 @@ pub fn mul(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
         return Err("mul(Fixed64): convert operands to float64 before multiplying".into());
     }
     ensure_same_shape(a, b)?;
-    let dtype = promote_pair(a.dtype(), b.dtype());
+    let dtype = promote_pair(a.dtype(), b.dtype()).map_err(|err| format!("mul: {err}"))?;
 
     if dtype == DType::Bool {
         if a.dtype() != DType::Bool || b.dtype() != DType::Bool {
@@ -589,7 +592,7 @@ pub fn div(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
         return Err("div(Fixed64): convert operands to float64 before dividing".into());
     }
     ensure_same_shape(a, b)?;
-    let dtype = promote_pair(a.dtype(), b.dtype());
+    let dtype = promote_pair(a.dtype(), b.dtype()).map_err(|err| format!("div: {err}"))?;
 
     if dtype == DType::Bool {
         if a.dtype() != DType::Bool || b.dtype() != DType::Bool {
@@ -972,7 +975,7 @@ pub fn matmul(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
     if a.dtype() == DType::Fixed64 || b.dtype() == DType::Fixed64 {
         return Err("matmul(Fixed64): convert operands to float64 before multiplying".into());
     }
-    let dtype = promote_pair(a.dtype(), b.dtype());
+    let dtype = promote_pair(a.dtype(), b.dtype()).map_err(|err| format!("where_select: {err}"))?;
 
     let a_matrix = Array2::from_shape_vec((a.rows(), a.cols()), a.to_f64_vec())
         .map_err(|_| "failed to reshape left matrix")?;
@@ -1044,8 +1047,9 @@ pub fn where_select_multi(
     if let Some(default_matrix) = default {
         dtype_candidates.push(default_matrix.dtype());
     }
-    let dtype =
-        promote_many(&dtype_candidates).ok_or("where_select_multi: unable to determine dtype")?;
+    let dtype = promote_many(&dtype_candidates)
+        .map_err(|err| format!("where_select_multi: {err}"))?
+        .ok_or("where_select_multi: unable to determine dtype")?;
 
     if dtype == DType::Fixed64 {
         return where_select_multi_fixed64(conditions, choices, default, rows, cols);
@@ -1090,6 +1094,7 @@ pub fn concat(axis: usize, matrices: &[MatrixBuffer]) -> CoreResult<MatrixBuffer
     }
 
     let dtype = promote_many(&matrices.iter().map(|m| m.dtype()).collect::<Vec<_>>())
+        .map_err(|err| format!("concat: {err}"))?
         .ok_or("concat: unable to determine dtype")?;
     let casted: Vec<MatrixBuffer> = matrices
         .iter()
@@ -1669,5 +1674,21 @@ mod tests {
         assert_eq!(reduced.dtype(), DType::Int64);
         let values = reduced.try_as_slice::<i64>().unwrap();
         assert_eq!(values, &[32]);
+    }
+
+    #[test]
+    fn add_fixed64_float_requires_explicit_cast() {
+        let fixed = MatrixBuffer::from_fixed_i64_vec(vec![150], 1, 1, 2).unwrap();
+        let float = MatrixBuffer::from_vec(vec![1.5f64], 1, 1).unwrap();
+        let err = add(&fixed, &float).expect_err("add should reject fixed64 + float");
+        assert!(err.contains("fixed64") && err.contains("astype"));
+    }
+
+    #[test]
+    fn dot_fixed64_float_errors() {
+        let fixed = MatrixBuffer::from_fixed_i64_vec(vec![150, 250], 1, 2, 2).unwrap();
+        let float = MatrixBuffer::from_vec(vec![1.0f64, 2.0], 1, 2).unwrap();
+        let err = dot(&fixed, &float, None).expect_err("dot should reject fixed64 + float");
+        assert!(err.contains("astype") && err.contains("dot"));
     }
 }

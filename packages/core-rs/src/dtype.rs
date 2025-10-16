@@ -106,12 +106,19 @@ impl core::str::FromStr for DType {
     }
 }
 
-pub fn promote_pair(a: DType, b: DType) -> DType {
+pub fn promote_pair(a: DType, b: DType) -> Result<DType, String> {
+    if (a == DType::Fixed64 && b.is_float()) || (b == DType::Fixed64 && a.is_float()) {
+        return Err(format!(
+            "dtype promotion between '{}' and '{}' is not supported; cast explicitly with astype()",
+            a.as_str(),
+            b.as_str()
+        ));
+    }
     if a == b {
-        return a;
+        return Ok(a);
     }
     match (a, b) {
-        (DType::Bool, other) | (other, DType::Bool) => return other,
+        (DType::Bool, other) | (other, DType::Bool) => return Ok(other),
         _ => {}
     }
 
@@ -119,10 +126,10 @@ pub fn promote_pair(a: DType, b: DType) -> DType {
     let kind_b = b.kind();
 
     if matches!(kind_a, TypeKind::Float) || matches!(kind_b, TypeKind::Float) {
-        return promote_float(a, b);
+        return Ok(promote_float(a, b));
     }
 
-    match (kind_a, kind_b) {
+    let result = match (kind_a, kind_b) {
         (TypeKind::Signed, TypeKind::Signed) => promote_signed(a.width().max(b.width())),
         (TypeKind::Unsigned, TypeKind::Unsigned) => promote_unsigned(a.width().max(b.width())),
         (TypeKind::Signed, TypeKind::Unsigned) | (TypeKind::Unsigned, TypeKind::Signed) => {
@@ -144,13 +151,21 @@ pub fn promote_pair(a: DType, b: DType) -> DType {
         }
         (TypeKind::Bool, _) | (_, TypeKind::Bool) => unreachable!(),
         _ => DType::Float64,
-    }
+    };
+    Ok(result)
 }
 
-pub fn promote_many(dtypes: &[DType]) -> Option<DType> {
+pub fn promote_many(dtypes: &[DType]) -> Result<Option<DType>, String> {
     let mut iter = dtypes.iter().copied();
-    let first = iter.next()?;
-    Some(iter.fold(first, |acc, item| promote_pair(acc, item)))
+    let first = match iter.next() {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let mut acc = first;
+    for item in iter {
+        acc = promote_pair(acc, item)?;
+    }
+    Ok(Some(acc))
 }
 
 fn promote_float(a: DType, b: DType) -> DType {
@@ -190,5 +205,26 @@ fn promote_unsigned(width: u8) -> DType {
         2 => DType::UInt16,
         3 | 4 => DType::UInt32,
         _ => DType::UInt64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn promote_pair_rejects_fixed64_float_mix() {
+        let err = promote_pair(DType::Fixed64, DType::Float64).unwrap_err();
+        assert!(
+            err.contains("fixed64") && err.contains("float64"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn promote_many_propagates_fixed64_float_error() {
+        let err = promote_many(&[DType::Float32, DType::Fixed64])
+            .expect_err("expected promotion to fail");
+        assert!(err.contains("float32") && err.contains("fixed64"));
     }
 }
