@@ -1,4 +1,4 @@
-import { access, cp, mkdir, readdir, rm } from "node:fs/promises";
+import { access, cp, mkdir, readdir, rm, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -42,6 +42,18 @@ if (await exists(wasmSource)) {
   const wasmGitignore = resolve(wasmTarget, ".gitignore");
   if (await exists(wasmGitignore)) {
     await rm(wasmGitignore, { force: true });
+  }
+  const wasmPackageJson = resolve(wasmTarget, "package.json");
+  if (await exists(wasmPackageJson)) {
+    try {
+      const contents = JSON.parse(await readFile(wasmPackageJson, "utf8"));
+      if (!contents.type) {
+        contents.type = "module";
+        await writeFile(wasmPackageJson, `${JSON.stringify(contents, null, 2)}\n`, "utf8");
+      }
+    } catch (error) {
+      console.warn("[copy-artifacts] Unable to update wasm package.json", error);
+    }
   }
 } else {
   console.warn(

@@ -62,7 +62,7 @@ impl MatrixBuffer {
             bytes.extend_from_slice(std::slice::from_raw_parts(ptr, byte_len));
         }
         std::mem::forget(data);
-        MatrixBuffer::new_internal(dtype, rows, cols, Arc::new(bytes), 0, cols as isize, 1)
+        MatrixBuffer::new_internal_with_scale(dtype, rows, cols, Arc::new(bytes), 0, cols as isize, 1, None)
     }
 
     pub fn from_bytes(
@@ -81,7 +81,26 @@ impl MatrixBuffer {
         if expected != data.len() {
             return Err("byte length does not match shape".into());
         }
-        MatrixBuffer::new_internal(dtype, rows, cols, Arc::new(data), 0, cols as isize, 1)
+        MatrixBuffer::new_internal_with_scale(dtype, rows, cols, Arc::new(data), 0, cols as isize, 1, None)
+    }
+
+    pub fn from_bytes_with_scale(
+        dtype: DType,
+        rows: usize,
+        cols: usize,
+        data: Vec<u8>,
+        fixed_scale: Option<i32>,
+    ) -> Result<Self, String> {
+        MatrixBuffer::new_internal_with_scale(
+            dtype,
+            rows,
+            cols,
+            Arc::new(data),
+            0,
+            cols as isize,
+            1,
+            fixed_scale,
+        )
     }
 
     fn new_internal(
@@ -119,6 +138,20 @@ impl MatrixBuffer {
         })
     }
 
+    fn new_internal_with_scale(
+        dtype: DType,
+        rows: usize,
+        cols: usize,
+        data: Arc<Vec<u8>>,
+        offset: isize,
+        row_stride: isize,
+        col_stride: isize,
+        fixed_scale: Option<i32>,
+    ) -> Result<Self, String> {
+        let mut buffer = MatrixBuffer::new_internal(dtype, rows, cols, data, offset, row_stride, col_stride)?;
+        buffer.fixed_scale = fixed_scale;
+        Ok(buffer)
+    }
     pub fn from_fixed_i64_vec(
         data: Vec<i64>,
         rows: usize,
@@ -139,9 +172,7 @@ impl MatrixBuffer {
             bytes.extend_from_slice(std::slice::from_raw_parts(ptr, byte_len));
         }
         std::mem::forget(data);
-        let mut buf = MatrixBuffer::new_internal(dtype, rows, cols, Arc::new(bytes), 0, cols as isize, 1)?;
-        buf.fixed_scale = Some(scale);
-        Ok(buf)
+        MatrixBuffer::new_internal_with_scale(dtype, rows, cols, Arc::new(bytes), 0, cols as isize, 1, Some(scale))
     }
 
     pub fn fixed_scale(&self) -> Option<i32> {
@@ -226,7 +257,7 @@ impl MatrixBuffer {
         let mut bytes = vec![0u8; self.len() * self.element_size()];
         self.copy_into_bytes(&mut bytes);
         record_copy_bytes(bytes.len());
-        MatrixBuffer::from_bytes(self.dtype, self.rows, self.cols, bytes)
+        MatrixBuffer::from_bytes_with_scale(self.dtype, self.rows, self.cols, bytes, self.fixed_scale)
     }
 
     pub fn to_contiguous_bytes_vec(&self) -> Vec<u8> {
@@ -234,6 +265,14 @@ impl MatrixBuffer {
         self.copy_into_bytes(&mut bytes);
         record_copy_bytes(bytes.len());
         bytes
+    }
+
+    fn from_bytes_like(&self, rows: usize, cols: usize, data: Vec<u8>) -> Result<Self, String> {
+        if self.dtype == DType::Fixed64 {
+            MatrixBuffer::from_bytes_with_scale(self.dtype, rows, cols, data, self.fixed_scale)
+        } else {
+            MatrixBuffer::from_bytes(self.dtype, rows, cols, data)
+        }
     }
 
     pub fn append_into(&self, dst: &mut Vec<u8>) {
@@ -246,14 +285,18 @@ impl MatrixBuffer {
     pub fn clone_with_dtype(&self, dtype: DType) -> Result<Self, String> {
         record_copy_bytes(self.len() * dtype.size_of());
         let bytes = self.to_contiguous_bytes_vec();
-        MatrixBuffer::from_bytes(dtype, self.rows, self.cols, bytes)
+        if dtype == DType::Fixed64 {
+            MatrixBuffer::from_bytes_with_scale(dtype, self.rows, self.cols, bytes, self.fixed_scale)
+        } else {
+            MatrixBuffer::from_bytes(dtype, self.rows, self.cols, bytes)
+        }
     }
 
     pub fn reinterpret(&self, target: DType) -> Result<Self, String> {
         if target.size_of() != self.dtype.size_of() {
             return Err("reinterpret: dtype width mismatch".into());
         }
-        MatrixBuffer::new_internal(
+        MatrixBuffer::new_internal_with_scale(
             target,
             self.rows,
             self.cols,
@@ -261,6 +304,7 @@ impl MatrixBuffer {
             self.offset,
             self.row_stride,
             self.col_stride,
+            if self.dtype == DType::Fixed64 { self.fixed_scale } else { None },
         )
     }
 
@@ -445,7 +489,7 @@ impl MatrixBuffer {
             + self.col_stride * col_start as isize;
         let row_stride = self.row_stride * row_step;
         let col_stride = self.col_stride * col_step;
-        MatrixBuffer::new_internal(
+        MatrixBuffer::new_internal_with_scale(
             self.dtype,
             row_len,
             col_len,
@@ -453,12 +497,13 @@ impl MatrixBuffer {
             offset,
             row_stride,
             col_stride,
+            if self.dtype == DType::Fixed64 { self.fixed_scale } else { None },
         )
     }
 
     pub fn row(&self, index: isize) -> Result<Self, String> {
         let idx = normalize_index(index, self.rows)? as isize;
-        MatrixBuffer::new_internal(
+        MatrixBuffer::new_internal_with_scale(
             self.dtype,
             1,
             self.cols,
@@ -466,12 +511,13 @@ impl MatrixBuffer {
             self.offset + idx * self.row_stride,
             self.row_stride,
             self.col_stride,
+            if self.dtype == DType::Fixed64 { self.fixed_scale } else { None },
         )
     }
 
     pub fn column(&self, index: isize) -> Result<Self, String> {
         let idx = normalize_index(index, self.cols)? as isize;
-        MatrixBuffer::new_internal(
+        MatrixBuffer::new_internal_with_scale(
             self.dtype,
             self.rows,
             1,
@@ -479,6 +525,7 @@ impl MatrixBuffer {
             self.offset + idx * self.col_stride,
             self.row_stride,
             self.col_stride,
+            if self.dtype == DType::Fixed64 { self.fixed_scale } else { None },
         )
     }
 
@@ -519,7 +566,7 @@ impl MatrixBuffer {
                     );
                 }
             }
-            MatrixBuffer::from_bytes(self.dtype, row_indices.len(), 1, data)
+            self.from_bytes_like(row_indices.len(), 1, data)
         } else {
             let cols_out = if col_indices.is_empty() {
                 return Err("gather: column indices must not be empty for outer mode".into());
@@ -538,7 +585,7 @@ impl MatrixBuffer {
                     }
                 }
             }
-            MatrixBuffer::from_bytes(self.dtype, row_indices.len(), cols_out, data)
+            self.from_bytes_like(row_indices.len(), cols_out, data)
         }
     }
 
@@ -618,7 +665,7 @@ impl MatrixBuffer {
                 &mut data[row_out * self.cols * elem_size..(row_out + 1) * self.cols * elem_size];
             self.copy_row_into(idx, dst_slice);
         }
-        MatrixBuffer::from_bytes(self.dtype, indices.len(), self.cols, data)
+        self.from_bytes_like(indices.len(), self.cols, data)
     }
 
     pub fn take_cols(&self, indices: &[isize]) -> Result<Self, String> {
@@ -634,7 +681,7 @@ impl MatrixBuffer {
                 }
             }
         }
-        MatrixBuffer::from_bytes(self.dtype, self.rows, indices.len(), data)
+        self.from_bytes_like(self.rows, indices.len(), data)
     }
 
     fn ensure_contiguous_mut(&mut self) {

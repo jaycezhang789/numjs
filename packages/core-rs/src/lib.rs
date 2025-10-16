@@ -7,6 +7,7 @@ use buffer::MatrixBuffer;
 use dtype::{promote_many, promote_pair, DType};
 
 use ndarray::Array2;
+use std::convert::TryInto;
 
 #[cfg(feature = "npy")]
 use ndarray_npy::{NpzReader, NpzWriter, ReadNpyExt, WriteNpyExt};
@@ -25,16 +26,15 @@ pub type CoreResult<T> = Result<T, String>;
 // ---------------------------------------------------------------------
 
 fn pairwise_sum_slice(data: &[f64]) -> f64 {
-    const THRESHOLD: usize = 1024;
-    if data.len() <= THRESHOLD {
-        let mut s = 0.0f64;
-        for &x in data {
-            s += x;
+    match data.len() {
+        0 => 0.0,
+        1 => data[0],
+        2 => data[0] + data[1],
+        _ => {
+            let mid = data.len() / 2;
+            pairwise_sum_slice(&data[..mid]) + pairwise_sum_slice(&data[mid..])
         }
-        return s;
     }
-    let mid = data.len() / 2;
-    pairwise_sum_slice(&data[..mid]) + pairwise_sum_slice(&data[mid..])
 }
 
 pub fn sum_pairwise(buffer: &MatrixBuffer) -> f64 {
@@ -73,26 +73,153 @@ pub fn welford_mean_variance(buffer: &MatrixBuffer, sample: bool) -> (f64, f64) 
     (mean, var)
 }
 
+fn bytes_to_i64_vec(bytes: &[u8]) -> Vec<i64> {
+    bytes
+        .chunks_exact(8)
+        .map(|chunk| i64::from_ne_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
+fn ensure_fixed64(matrix: &MatrixBuffer) -> CoreResult<i32> {
+    if matrix.dtype() != DType::Fixed64 {
+        return Err("expected fixed64 matrix".into());
+    }
+    matrix
+        .fixed_scale()
+        .ok_or_else(|| "fixed64 matrix missing scale metadata".into())
+}
+
+fn matrix_to_fixed_vec(matrix: &MatrixBuffer) -> CoreResult<Vec<i64>> {
+    if matrix.dtype() != DType::Fixed64 {
+        return Err("expected fixed64 matrix".into());
+    }
+    let contiguous = matrix
+        .to_contiguous()
+        .map_err(|e| format!("fixed64 contiguous: {e}"))?;
+    let bytes = contiguous
+        .as_byte_slice()
+        .ok_or_else(|| "fixed64 contiguous bytes unavailable".to_string())?;
+    Ok(bytes_to_i64_vec(bytes))
+}
+
+fn concat_fixed64(axis: usize, matrices: &[MatrixBuffer]) -> CoreResult<MatrixBuffer> {
+    let first = matrices
+        .first()
+        .ok_or_else(|| "concat: expected at least one matrix".to_string())?;
+    let scale = ensure_fixed64(first)?;
+    match axis {
+        0 => {
+            let cols = first.cols();
+            let mut total_rows = 0usize;
+            let mut data: Vec<i64> = Vec::new();
+            for m in matrices {
+                ensure_fixed64(m)?;
+                if m.fixed_scale() != Some(scale) {
+                    return Err("concat axis 0: fixed64 scale mismatch".into());
+                }
+                if m.cols() != cols {
+                    return Err("concat axis 0: column sizes differ".into());
+                }
+                let vec = matrix_to_fixed_vec(m)?;
+                total_rows += m.rows();
+                data.extend_from_slice(&vec);
+            }
+            MatrixBuffer::from_fixed_i64_vec(data, total_rows, cols, scale)
+        }
+        1 => {
+            let rows = first.rows();
+            let mut total_cols = 0usize;
+            let mut parts: Vec<(usize, Vec<i64>)> = Vec::with_capacity(matrices.len());
+            for m in matrices {
+                ensure_fixed64(m)?;
+                if m.fixed_scale() != Some(scale) {
+                    return Err("concat axis 1: fixed64 scale mismatch".into());
+                }
+                if m.rows() != rows {
+                    return Err("concat axis 1: row sizes differ".into());
+                }
+                let cols = m.cols();
+                total_cols += cols;
+                parts.push((cols, matrix_to_fixed_vec(m)?));
+            }
+            let mut data: Vec<i64> = Vec::with_capacity(rows * total_cols);
+            for row in 0..rows {
+                for (cols, vec) in parts.iter() {
+                    let start = row * cols;
+                    let end = start + cols;
+                    data.extend_from_slice(&vec[start..end]);
+                }
+            }
+            MatrixBuffer::from_fixed_i64_vec(data, rows, total_cols, scale)
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn where_select_multi_fixed64(
+    conditions: &[&MatrixBuffer],
+    choices: &[&MatrixBuffer],
+    default: Option<&MatrixBuffer>,
+    rows: usize,
+    cols: usize,
+) -> CoreResult<MatrixBuffer> {
+    if choices.is_empty() {
+        return Err("where_select_multi: requires at least one choice".into());
+    }
+    let scale = ensure_fixed64(choices[0])?;
+    let mut result_data: Vec<i64> = if let Some(default_matrix) = default {
+        ensure_fixed64(default_matrix)?;
+        if default_matrix.fixed_scale() != Some(scale) {
+            return Err("where_select_multi: fixed64 scale mismatch".into());
+        }
+        let broadcast = default_matrix
+            .broadcast_to(rows, cols)
+            .map_err(|e| format!("where_select_multi: {e}"))?;
+        matrix_to_fixed_vec(&broadcast)?
+    } else {
+        vec![0; rows * cols]
+    };
+
+    for (cond, choice) in conditions.iter().zip(choices.iter()) {
+        ensure_fixed64(choice)?;
+        if choice.fixed_scale() != Some(scale) {
+            return Err("where_select_multi: fixed64 scale mismatch".into());
+        }
+        let mask = cond
+            .broadcast_to(rows, cols)
+            .map_err(|e| format!("where_select_multi: {e}"))?
+            .to_bool_vec();
+        let choice_view = choice
+            .broadcast_to(rows, cols)
+            .map_err(|e| format!("where_select_multi: {e}"))?;
+        let values = matrix_to_fixed_vec(&choice_view)?;
+        for (idx, flag) in mask.iter().enumerate() {
+            if *flag {
+                result_data[idx] = values[idx];
+            }
+        }
+    }
+
+    MatrixBuffer::from_fixed_i64_vec(result_data, rows, cols, scale)
+}
+
 pub fn add(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
     // Draft: integer add for Fixed64 when scales match
     if a.dtype() == DType::Fixed64 && b.dtype() == DType::Fixed64 {
+        ensure_same_shape(a, b)?;
         if a.fixed_scale() != b.fixed_scale() {
             return Err("add(Fixed64): scale mismatch".into());
         }
         let scale = a.fixed_scale().unwrap_or(0);
-        let mut out: Vec<i64> = Vec::with_capacity(a.rows() * a.cols());
-        let ac = a.to_contiguous()?;
-        let bc = b.to_contiguous()?;
-        let abytes = ac.as_byte_slice().ok_or_else(|| "add(Fixed64): non-contiguous".to_string())?;
-        let bbytes = bc.as_byte_slice().ok_or_else(|| "add(Fixed64): non-contiguous".to_string())?;
-        let mut i: usize = 0;
-        while i + 8 <= abytes.len() {
-            let lhs = i64::from_ne_bytes(abytes[i..i+8].try_into().unwrap());
-            let rhs = i64::from_ne_bytes(bbytes[i..i+8].try_into().unwrap());
+        let vec_a = matrix_to_fixed_vec(a)?;
+        let vec_b = matrix_to_fixed_vec(b)?;
+        let mut out: Vec<i64> = Vec::with_capacity(vec_a.len());
+        for (lhs, rhs) in vec_a.into_iter().zip(vec_b.into_iter()) {
             let (sum, overflow) = lhs.overflowing_add(rhs);
-            if overflow { return Err("add(Fixed64): overflow".into()); }
+            if overflow {
+                return Err("add(Fixed64): overflow".into());
+            }
             out.push(sum);
-            i += 8;
         }
         return MatrixBuffer::from_fixed_i64_vec(out, a.rows(), a.cols(), scale);
     }
@@ -111,6 +238,9 @@ pub fn add(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
 pub fn matmul(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
     if a.cols() != b.rows() {
         return Err("matmul: inner dimensions do not match".into());
+    }
+    if a.dtype() == DType::Fixed64 || b.dtype() == DType::Fixed64 {
+        return Err("matmul(Fixed64): convert operands to float64 before multiplying".into());
     }
     let dtype = promote_pair(a.dtype(), b.dtype());
 
@@ -132,6 +262,9 @@ pub fn matmul(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
 pub fn clip(buffer: &MatrixBuffer, min: f64, max: f64) -> CoreResult<MatrixBuffer> {
     if min > max {
         return Err("clip: min must be <= max".into());
+    }
+    if buffer.dtype() == DType::Fixed64 {
+        return Err("clip(Fixed64): convert to float64 before clipping".into());
     }
     let dtype = buffer.dtype();
     let clipped: Vec<f64> = buffer
@@ -184,6 +317,10 @@ pub fn where_select_multi(
     let dtype =
         promote_many(&dtype_candidates).ok_or("where_select_multi: unable to determine dtype")?;
 
+    if dtype == DType::Fixed64 {
+        return where_select_multi_fixed64(conditions, choices, default, rows, cols);
+    }
+
     let mut result = if let Some(default_matrix) = default {
         default_matrix
             .broadcast_to(rows, cols)
@@ -208,7 +345,7 @@ pub fn where_select_multi(
         DType::UInt64 => assign_where::<u64>(&mut result, dtype, conditions, choices, rows, cols)?,
         DType::Float32 => assign_where::<f32>(&mut result, dtype, conditions, choices, rows, cols)?,
         DType::Float64 => assign_where::<f64>(&mut result, dtype, conditions, choices, rows, cols)?,
-        DType::Fixed64 => return Err("where_select_multi: fixed64 not supported".into()),
+        DType::Fixed64 => unreachable!("fixed64 handled earlier"),
     }
 
     Ok(result)
@@ -228,6 +365,10 @@ pub fn concat(axis: usize, matrices: &[MatrixBuffer]) -> CoreResult<MatrixBuffer
         .iter()
         .map(|m| m.cast(dtype))
         .collect::<Result<_, _>>()?;
+
+    if dtype == DType::Fixed64 {
+        return concat_fixed64(axis, &casted);
+    }
 
     let rows = casted[0].rows();
     let cols = casted[0].cols();
@@ -283,6 +424,18 @@ pub fn concat(axis: usize, matrices: &[MatrixBuffer]) -> CoreResult<MatrixBuffer
 
 pub fn stack(axis: usize, matrices: &[MatrixBuffer]) -> CoreResult<MatrixBuffer> {
     concat(axis, matrices)
+}
+
+pub fn transpose(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    matrix
+        .transpose()
+        .map_err(|err| format!("transpose: {err}"))
+}
+
+pub fn broadcast_to(matrix: &MatrixBuffer, rows: usize, cols: usize) -> CoreResult<MatrixBuffer> {
+    matrix
+        .broadcast_to(rows, cols)
+        .map_err(|err| format!("broadcast_to: {err}"))
 }
 
 pub fn take(matrix: &MatrixBuffer, axis: usize, indices: &[isize]) -> CoreResult<MatrixBuffer> {
@@ -469,6 +622,9 @@ pub fn read_npy_matrix(data: &[u8]) -> CoreResult<MatrixBuffer> {
 
 #[cfg(feature = "npy")]
 pub fn write_npy_matrix(buffer: &MatrixBuffer) -> CoreResult<Vec<u8>> {
+    if buffer.dtype() == DType::Fixed64 {
+        return Err("write_npy(Fixed64): convert to float64 or serialise bigint payload manually".into());
+    }
     let array = Array2::from_shape_vec((buffer.rows(), buffer.cols()), buffer.to_f64_vec())
         .map_err(|_| "write_npy: failed to reshape matrix")?;
     let mut cursor = Cursor::new(Vec::new());
@@ -506,6 +662,11 @@ pub fn write_npz_matrices(entries: &[(&str, MatrixBuffer)]) -> CoreResult<Vec<u8
     let cursor = Cursor::new(Vec::new());
     let mut writer = NpzWriter::new(cursor);
     for (name, buffer) in entries {
+        if buffer.dtype() == DType::Fixed64 {
+            return Err(format!(
+                "write_npz(Fixed64): entry '{name}' cannot be written; convert to float64 first"
+            ));
+        }
         let array = Array2::from_shape_vec((buffer.rows(), buffer.cols()), buffer.to_f64_vec())
             .map_err(|_| "write_npz: failed to reshape matrix")?;
         writer
@@ -701,6 +862,68 @@ mod tests {
         let (mean, var) = welford_mean_variance(&buf, false);
         assert!((mean - 49.95).abs() < 1e-9);
         assert!(var > 0.0);
+    }
+
+    #[test]
+    fn test_fixed64_concat_preserves_scale() {
+        let a = MatrixBuffer::from_fixed_i64_vec(vec![150, 250], 1, 2, 2).unwrap();
+        let b = MatrixBuffer::from_fixed_i64_vec(vec![350, 450], 1, 2, 2).unwrap();
+        let stacked = concat(0, &[a.clone(), b.clone()]).expect("concat axis 0");
+        assert_eq!(stacked.fixed_scale(), Some(2));
+        assert_eq!(stacked.rows(), 2);
+        assert_eq!(stacked.cols(), 2);
+        assert_eq!(stacked.to_f64_vec(), vec![1.5, 2.5, 3.5, 4.5]);
+
+        let wide = concat(1, &[a.clone(), b.clone()]).expect("concat axis 1");
+        assert_eq!(wide.fixed_scale(), Some(2));
+        assert_eq!(wide.rows(), 1);
+        assert_eq!(wide.cols(), 4);
+        assert_eq!(wide.to_f64_vec(), vec![1.5, 2.5, 3.5, 4.5]);
+    }
+
+    #[test]
+    fn test_fixed64_take_and_gather_preserve_scale() {
+        let base = MatrixBuffer::from_fixed_i64_vec(vec![100, 200, 300, 400], 2, 2, 1).unwrap();
+        let take_row = take(&base, 0, &[1]).expect("take row");
+        assert_eq!(take_row.fixed_scale(), Some(1));
+        assert_eq!(take_row.rows(), 1);
+        assert_eq!(take_row.to_f64_vec(), vec![30.0, 40.0]);
+
+        let gather_pairs = gather(&base, &[0, 1], &[1]).expect("gather outer");
+        assert_eq!(gather_pairs.fixed_scale(), Some(1));
+        assert_eq!(gather_pairs.to_f64_vec(), vec![20.0, 40.0]);
+    }
+
+    #[test]
+    fn test_fixed64_where_select() {
+        let condition =
+            MatrixBuffer::from_vec(vec![true, false, true, false], 2, 2).expect("condition");
+        let a = MatrixBuffer::from_fixed_i64_vec(vec![1234, 2234, 3234, 4234], 2, 2, 2).unwrap();
+        let b = MatrixBuffer::from_fixed_i64_vec(vec![1000, 2000, 3000, 4000], 2, 2, 2).unwrap();
+        let result = where_select(&condition, &a, &b).expect("where select");
+        assert_eq!(result.fixed_scale(), Some(2));
+        assert_eq!(result.to_f64_vec(), vec![12.34, 20.00, 32.34, 40.00]);
+    }
+
+    #[test]
+    fn test_fixed64_transpose_preserves_scale() {
+        let base =
+            MatrixBuffer::from_fixed_i64_vec(vec![100, 200, 300, 400], 2, 2, 1).unwrap();
+        let transposed = transpose(&base).expect("transpose");
+        assert_eq!(transposed.fixed_scale(), Some(1));
+        assert_eq!(transposed.rows(), 2);
+        assert_eq!(transposed.cols(), 2);
+        assert_eq!(transposed.to_f64_vec(), vec![10.0, 30.0, 20.0, 40.0]);
+    }
+
+    #[test]
+    fn test_fixed64_broadcast_preserves_scale() {
+        let base = MatrixBuffer::from_fixed_i64_vec(vec![1050, 2050], 1, 2, 2).unwrap();
+        let expanded = broadcast_to(&base, 3, 2).expect("broadcast");
+        assert_eq!(expanded.fixed_scale(), Some(2));
+        assert_eq!(expanded.rows(), 3);
+        assert_eq!(expanded.cols(), 2);
+        assert_eq!(expanded.to_f64_vec(), vec![10.5, 20.5, 10.5, 20.5, 10.5, 20.5]);
     }
 }
 

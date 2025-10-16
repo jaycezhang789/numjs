@@ -1,11 +1,11 @@
 use num_rs_core::buffer::MatrixBuffer;
 use num_rs_core::dtype::DType;
 use num_rs_core::{
-    add as core_add, clip as core_clip, concat as core_concat, gather as core_gather,
-    gather_pairs as core_gather_pairs, matmul as core_matmul, put as core_put,
-    scatter as core_scatter, scatter_pairs as core_scatter_pairs, stack as core_stack,
-    take as core_take, where_select as core_where, dot_pairwise as core_dot_pairwise,
-    sum_pairwise as core_sum_pairwise,
+    add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
+    dot_pairwise as core_dot_pairwise, gather as core_gather, gather_pairs as core_gather_pairs,
+    matmul as core_matmul, put as core_put, scatter as core_scatter,
+    scatter_pairs as core_scatter_pairs, stack as core_stack, sum_pairwise as core_sum_pairwise,
+    take as core_take, transpose as core_transpose, where_select as core_where,
 };
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -33,6 +33,11 @@ impl Matrix {
         dtype: String,
     ) -> Result<Matrix, JsValue> {
         let dtype = DType::from_str(&dtype).map_err(|err| JsValue::from_str(&err))?;
+        if dtype == DType::Fixed64 {
+            return Err(JsValue::from_str(
+                "from_bytes(Fixed64): supply scaled bigint data via Matrix.fromFixedI64",
+            ));
+        }
         MatrixBuffer::from_bytes(dtype, rows, cols, data)
             .map(Matrix::from_buffer)
             .map_err(|err| JsValue::from_str(&err))
@@ -51,6 +56,11 @@ impl Matrix {
     #[wasm_bindgen(getter)]
     pub fn dtype(&self) -> String {
         self.buffer.dtype().as_str().to_string()
+    }
+
+    #[wasm_bindgen(getter, js_name = fixedScale)]
+    pub fn fixed_scale(&self) -> Option<i32> {
+        self.buffer.fixed_scale()
     }
 
     #[wasm_bindgen]
@@ -89,6 +99,18 @@ impl Matrix {
     #[wasm_bindgen(js_name = "to_bytes")]
     pub fn to_bytes(&self) -> Vec<u8> {
         self.buffer.to_contiguous_bytes_vec()
+    }
+
+    #[wasm_bindgen(js_name = "fromFixedI64")]
+    pub fn from_fixed_i64(
+        data: Vec<i64>,
+        rows: usize,
+        cols: usize,
+        scale: i32,
+    ) -> Result<Matrix, JsValue> {
+        MatrixBuffer::from_fixed_i64_vec(data, rows, cols, scale)
+            .map(Matrix::from_buffer)
+            .map_err(|err| JsValue::from_str(&err))
     }
 }
 
@@ -155,6 +177,16 @@ pub fn concat(a: &Matrix, b: &Matrix, axis: usize) -> Result<Matrix, JsValue> {
 pub fn stack(a: &Matrix, b: &Matrix, axis: usize) -> Result<Matrix, JsValue> {
     let buffers = vec![a.buffer.clone(), b.buffer.clone()];
     map_matrix(core_stack(axis, &buffers))
+}
+
+#[wasm_bindgen]
+pub fn transpose(matrix: &Matrix) -> Result<Matrix, JsValue> {
+    map_matrix(core_transpose(matrix.buffer()))
+}
+
+#[wasm_bindgen(js_name = "broadcast_to")]
+pub fn broadcast_to(matrix: &Matrix, rows: usize, cols: usize) -> Result<Matrix, JsValue> {
+    map_matrix(core_broadcast_to(matrix.buffer(), rows, cols))
 }
 
 #[wasm_bindgen]
@@ -253,4 +285,21 @@ pub fn sum_pairwise(matrix: &Matrix) -> f64 {
 pub fn dot_pairwise(a: &Matrix, b: &Matrix) -> Result<f64, JsValue> {
     core_dot_pairwise(a.buffer(), b.buffer())
         .map_err(|e| JsValue::from_str(&e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed64_getter_exposes_scale() {
+        let buffer = MatrixBuffer::from_fixed_i64_vec(vec![500, 600], 1, 2, 2).unwrap();
+        let matrix = Matrix::from_buffer(buffer.clone());
+        assert_eq!(matrix.fixed_scale(), Some(2));
+        assert!((sum_pairwise(&matrix) - 11.0).abs() < 1e-9);
+
+        let combined = concat(&matrix, &Matrix::from_buffer(buffer), 0).unwrap();
+        assert_eq!(combined.fixed_scale(), Some(2));
+    }
+
 }

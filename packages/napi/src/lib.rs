@@ -1,14 +1,15 @@
-use napi::bindgen_prelude::*;
+use napi::bindgen_prelude::{BigInt64Array, Buffer, Env, Error, Float64Array, Result};
 use napi::JsObject;
 use napi_derive::napi;
 
 use num_rs_core::buffer::MatrixBuffer;
 use num_rs_core::dtype::DType;
 use num_rs_core::{
-    add as core_add, clip as core_clip, concat as core_concat, gather as core_gather,
-    gather_pairs as core_gather_pairs, matmul as core_matmul, put as core_put, read_npy_matrix,
-    scatter as core_scatter, scatter_pairs as core_scatter_pairs, stack as core_stack,
-    take as core_take, where_select as core_where, where_select_multi as core_where_multi,
+    add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
+    gather as core_gather, gather_pairs as core_gather_pairs, matmul as core_matmul,
+    put as core_put, read_npy_matrix, scatter as core_scatter,
+    scatter_pairs as core_scatter_pairs, stack as core_stack, take as core_take,
+    transpose as core_transpose, where_select as core_where, where_select_multi as core_where_multi,
     write_npy_matrix, dot_pairwise as core_dot_pairwise, sum_pairwise as core_sum_pairwise,
 };
 #[cfg(feature = "linalg")]
@@ -34,9 +35,22 @@ impl Matrix {
     #[napi(factory)]
     pub fn from_bytes(data: Buffer, rows: u32, cols: u32, dtype: String) -> Result<Self> {
         let dtype: DType = dtype.parse().map_err(Error::from_reason)?;
+        if dtype == DType::Fixed64 {
+            return Err(Error::from_reason(
+                "from_bytes(Fixed64): supply scaled bigint data via Matrix.from_fixed_i64",
+            ));
+        }
         MatrixBuffer::from_bytes(dtype, rows as usize, cols as usize, data.to_vec())
             .map(Matrix::from_buffer)
             .map_err(|e| Error::from_reason(e))
+    }
+
+    #[napi(factory)]
+    pub fn from_fixed_i64(data: BigInt64Array, rows: u32, cols: u32, scale: i32) -> Result<Self> {
+        let vec = data.to_vec();
+        MatrixBuffer::from_fixed_i64_vec(vec, rows as usize, cols as usize, scale)
+            .map(Matrix::from_buffer)
+            .map_err(Error::from_reason)
     }
 
     #[napi(getter)]
@@ -52,6 +66,11 @@ impl Matrix {
     #[napi(getter)]
     pub fn dtype(&self) -> String {
         self.buffer.dtype().as_str().to_string()
+    }
+
+    #[napi(getter)]
+    pub fn fixed_scale(&self) -> Option<i32> {
+        self.buffer.fixed_scale()
     }
 
     #[napi]
@@ -152,6 +171,16 @@ pub fn concat(a: &Matrix, b: &Matrix, axis: u32) -> Result<Matrix> {
 pub fn stack(a: &Matrix, b: &Matrix, axis: u32) -> Result<Matrix> {
     let buffers = vec![a.buffer.clone(), b.buffer.clone()];
     map_matrix(core_stack(axis as usize, &buffers))
+}
+
+#[napi]
+pub fn transpose(matrix: &Matrix) -> Result<Matrix> {
+    map_matrix(core_transpose(matrix.buffer()))
+}
+
+#[napi(js_name = "broadcast_to")]
+pub fn broadcast_to(matrix: &Matrix, rows: u32, cols: u32) -> Result<Matrix> {
+    map_matrix(core_broadcast_to(matrix.buffer(), rows as usize, cols as usize))
 }
 
 #[napi]
@@ -309,4 +338,29 @@ fn convert_indices(indices: &[i64]) -> Result<Vec<isize>> {
                 .map_err(|_| Error::from_reason(format!("index {value} exceeds platform limits")))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed64_matrix_reports_scale_and_concat_preserves_it() {
+        let base = MatrixBuffer::from_fixed_i64_vec(vec![1200, 2200], 1, 2, 2).unwrap();
+        let matrix = Matrix::from_buffer(base.clone());
+        assert_eq!(matrix.fixed_scale(), Some(2));
+        let total = sum_pairwise(&matrix);
+        assert!((total - 34.0).abs() < 1e-9);
+
+        let merged = concat(&matrix, &Matrix::from_buffer(base.clone()), 0).unwrap();
+        assert_eq!(merged.fixed_scale(), Some(2));
+        assert_eq!(merged.buffer().rows(), 2);
+    }
+
+    #[test]
+    fn fixed64_from_bytes_rejected() {
+        let raw = Buffer::from(vec![0u8; 16]);
+        let result = Matrix::from_bytes(raw, 2, 1, "fixed64".to_string());
+        assert!(result.is_err());
+    }
 }

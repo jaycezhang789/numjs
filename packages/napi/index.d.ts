@@ -10,6 +10,8 @@ export declare function whereSelect(condition: Matrix, truthy: Matrix, falsy: Ma
 export declare function whereSelectMulti(conditions: Array<Matrix>, choices: Array<Matrix>, defaultValue?: Matrix | undefined | null): Matrix
 export declare function concat(a: Matrix, b: Matrix, axis: number): Matrix
 export declare function stack(a: Matrix, b: Matrix, axis: number): Matrix
+export declare function transpose(matrix: Matrix): Matrix
+export declare function broadcast_to(matrix: Matrix, rows: number, cols: number): Matrix
 export declare function take(matrix: Matrix, axis: number, indices: Array<number>): Matrix
 export declare function put(matrix: Matrix, axis: number, indices: Array<number>, values: Matrix): Matrix
 export declare function gather(matrix: Matrix, rowIndices: Array<number>, colIndices: Array<number>): Matrix
@@ -30,9 +32,11 @@ export declare function dotPairwise(a: Matrix, b: Matrix): number
 export class Matrix {
   constructor(data: Float64Array, rows: number, cols: number)
   static fromBytes(data: Buffer, rows: number, cols: number, dtype: string): Matrix
+  static fromFixedI64(data: BigInt64Array, rows: number, cols: number, scale: number): Matrix
   get rows(): number
   get cols(): number
   get dtype(): string
+  get fixedScale(): number | null
   astype(dtype: string, copy?: boolean | undefined | null): Matrix
   toVec(): Float64Array
   toBytes(): Buffer

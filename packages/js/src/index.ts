@@ -13,18 +13,23 @@ export type DType =
   | "uint32"
   | "uint64"
   | "float32"
-  | "float64";
+  | "float64"
+  | "fixed64";
 
 type BackendMatrixHandle = {
   readonly rows: number;
   readonly cols: number;
   // dtype may be missing on some backends; we cache it separately when needed
   readonly dtype?: DType;
+
+
   to_vec?(): Float64Array | number[];
   toVec?(): Float64Array | number[];
   astype(dtype: DType, copy?: boolean): BackendMatrixHandle;
   to_bytes?(): Uint8Array;
   toBytes?(): Uint8Array;
+
+
 };
 
 type BackendMatrixConstructor = {
@@ -45,6 +50,18 @@ type BackendMatrixConstructor = {
     cols: number,
     dtype: DType
   ): BackendMatrixHandle;
+  from_fixed_i64?(
+    data: BigInt64Array,
+    rows: number,
+    cols: number,
+    scale: number
+  ): BackendMatrixHandle;
+  fromFixedI64?(
+    data: BigInt64Array,
+    rows: number,
+    cols: number,
+    scale: number
+  ): BackendMatrixHandle;
 };
 
 type BackendModule = {
@@ -53,6 +70,18 @@ type BackendModule = {
   matmul(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
   sum_pairwise?(matrix: BackendMatrixHandle): number;
   dot_pairwise?(a: BackendMatrixHandle, b: BackendMatrixHandle): number;
+  from_fixed_i64?(
+    data: BigInt64Array,
+    rows: number,
+    cols: number,
+    scale: number
+  ): BackendMatrixHandle;
+  fromFixedI64?(
+    data: BigInt64Array,
+    rows: number,
+    cols: number,
+    scale: number
+  ): BackendMatrixHandle;
   clip?(
     matrix: BackendMatrixHandle,
     min: number,
@@ -77,6 +106,17 @@ type BackendModule = {
     a: BackendMatrixHandle,
     b: BackendMatrixHandle,
     axis: number
+  ): BackendMatrixHandle;
+  transpose?(matrix: BackendMatrixHandle): BackendMatrixHandle;
+  broadcast_to?(
+    matrix: BackendMatrixHandle,
+    rows: number,
+    cols: number
+  ): BackendMatrixHandle;
+  broadcastTo?(
+    matrix: BackendMatrixHandle,
+    rows: number,
+    cols: number
   ): BackendMatrixHandle;
   svd?(
     matrix: BackendMatrixHandle
@@ -207,6 +247,7 @@ export const DTYPE_INFO: Record<DType, DTypeInfo> = {
   uint64: { size: 8, kind: "unsigned", isFloat: false, isSigned: false },
   float32: { size: 4, kind: "float", isFloat: true, isSigned: true },
   float64: { size: 8, kind: "float", isFloat: true, isSigned: true },
+  fixed64: { size: 8, kind: "signed", isFloat: false, isSigned: true },
 };
 
 export type BackendCapabilities = {
@@ -218,138 +259,162 @@ export type BackendCapabilities = {
   supportedDTypes: readonly DType[];
 };
 
-const PROMOTION_TABLE: Record<DType, Record<DType, DType>> = {
+const PROMOTION_TABLE: Partial<Record<DType, Partial<Record<DType, DType>>>> = {
   bool: {
-    bool: "bool",
-    int8: "int8",
-    int16: "int16",
-    int32: "int32",
-    int64: "int64",
-    uint8: "uint8",
-    uint16: "uint16",
-    uint32: "uint32",
-    uint64: "uint64",
-    float32: "float32",
-    float64: "float64",
-  },
+      bool: "bool",
+      int8: "int8",
+      int16: "int16",
+      int32: "int32",
+      int64: "int64",
+      uint8: "uint8",
+      uint16: "uint16",
+      uint32: "uint32",
+      uint64: "uint64",
+      float32: "float32",
+      float64: "float64",
+      fixed64: "float64",
+    },
   int8: {
-    bool: "int8",
-    int8: "int8",
-    int16: "int16",
-    int32: "int32",
-    int64: "int64",
-    uint8: "int16",
-    uint16: "int32",
-    uint32: "float64",
-    uint64: "float64",
-    float32: "float32",
-    float64: "float64",
-  },
+      bool: "int8",
+      int8: "int8",
+      int16: "int16",
+      int32: "int32",
+      int64: "int64",
+      uint8: "int16",
+      uint16: "int32",
+      uint32: "float64",
+      uint64: "float64",
+      float32: "float32",
+      float64: "float64",
+      fixed64: "float64",
+    },
   int16: {
-    bool: "int16",
-    int8: "int16",
-    int16: "int16",
-    int32: "int32",
-    int64: "int64",
-    uint8: "int32",
-    uint16: "int32",
-    uint32: "float64",
-    uint64: "float64",
-    float32: "float32",
-    float64: "float64",
-  },
+      bool: "int16",
+      int8: "int16",
+      int16: "int16",
+      int32: "int32",
+      int64: "int64",
+      uint8: "int32",
+      uint16: "int32",
+      uint32: "float64",
+      uint64: "float64",
+      float32: "float32",
+      float64: "float64",
+      fixed64: "float64",
+    },
   int32: {
-    bool: "int32",
-    int8: "int32",
-    int16: "int32",
-    int32: "int32",
-    int64: "int64",
-    uint8: "int32",
-    uint16: "int32",
-    uint32: "int64",
-    uint64: "float64",
-    float32: "float32",
-    float64: "float64",
-  },
+      bool: "int32",
+      int8: "int32",
+      int16: "int32",
+      int32: "int32",
+      int64: "int64",
+      uint8: "int32",
+      uint16: "int32",
+      uint32: "int64",
+      uint64: "float64",
+      float32: "float32",
+      float64: "float64",
+      fixed64: "float64",
+    },
   int64: {
-    bool: "int64",
-    int8: "int64",
-    int16: "int64",
-    int32: "int64",
-    int64: "int64",
-    uint8: "int64",
-    uint16: "int64",
-    uint32: "int64",
-    uint64: "float64",
-    float32: "float64",
-    float64: "float64",
-  },
+      bool: "int64",
+      int8: "int64",
+      int16: "int64",
+      int32: "int64",
+      int64: "int64",
+      uint8: "int64",
+      uint16: "int64",
+      uint32: "int64",
+      uint64: "float64",
+      float32: "float64",
+      float64: "float64",
+      fixed64: "float64",
+    },
   uint8: {
-    bool: "uint8",
-    int8: "int16",
-    int16: "int32",
-    int32: "int32",
-    int64: "int64",
-    uint8: "uint8",
-    uint16: "uint16",
-    uint32: "uint32",
-    uint64: "uint64",
-    float32: "float32",
-    float64: "float64",
-  },
+      bool: "uint8",
+      int8: "int16",
+      int16: "int32",
+      int32: "int32",
+      int64: "int64",
+      uint8: "uint8",
+      uint16: "uint16",
+      uint32: "uint32",
+      uint64: "uint64",
+      float32: "float32",
+      float64: "float64",
+      fixed64: "float64",
+    },
   uint16: {
-    bool: "uint16",
-    int8: "int32",
-    int16: "int32",
-    int32: "int32",
-    int64: "int64",
-    uint8: "uint16",
-    uint16: "uint16",
-    uint32: "uint32",
-    uint64: "uint64",
-    float32: "float32",
-    float64: "float64",
-  },
+      bool: "uint16",
+      int8: "int32",
+      int16: "int32",
+      int32: "int32",
+      int64: "int64",
+      uint8: "uint16",
+      uint16: "uint16",
+      uint32: "uint32",
+      uint64: "uint64",
+      float32: "float32",
+      float64: "float64",
+      fixed64: "float64",
+    },
   uint32: {
-    bool: "uint32",
-    int8: "float64",
-    int16: "float64",
-    int32: "int64",
-    int64: "int64",
-    uint8: "uint32",
-    uint16: "uint32",
-    uint32: "uint32",
-    uint64: "uint64",
-    float32: "float32",
-    float64: "float64",
-  },
+      bool: "uint32",
+      int8: "float64",
+      int16: "float64",
+      int32: "int64",
+      int64: "int64",
+      uint8: "uint32",
+      uint16: "uint32",
+      uint32: "uint32",
+      uint64: "uint64",
+      float32: "float32",
+      float64: "float64",
+      fixed64: "float64",
+    },
   uint64: {
-    bool: "uint64",
-    int8: "float64",
-    int16: "float64",
-    int32: "float64",
-    int64: "float64",
-    uint8: "uint64",
-    uint16: "uint64",
-    uint32: "uint64",
-    uint64: "uint64",
-    float32: "float64",
-    float64: "float64",
-  },
+      bool: "uint64",
+      int8: "float64",
+      int16: "float64",
+      int32: "float64",
+      int64: "float64",
+      uint8: "uint64",
+      uint16: "uint64",
+      uint32: "uint64",
+      uint64: "uint64",
+      float32: "float64",
+      float64: "float64",
+      fixed64: "float64",
+    },
   float32: {
-    bool: "float32",
-    int8: "float32",
-    int16: "float32",
-    int32: "float32",
-    int64: "float64",
-    uint8: "float32",
-    uint16: "float32",
-    uint32: "float32",
-    uint64: "float64",
-    float32: "float32",
-    float64: "float64",
-  },
+      bool: "float32",
+      int8: "float32",
+      int16: "float32",
+      int32: "float32",
+      int64: "float64",
+      uint8: "float32",
+      uint16: "float32",
+      uint32: "float32",
+      uint64: "float64",
+      float32: "float32",
+      float64: "float64",
+      fixed64: "float64",
+    },
   float64: {
+      bool: "float64",
+      int8: "float64",
+      int16: "float64",
+      int32: "float64",
+      int64: "float64",
+      uint8: "float64",
+      uint16: "float64",
+      uint32: "float64",
+      uint64: "float64",
+      float32: "float64",
+      float64: "float64",
+      fixed64: "float64",
+    },
+  fixed64: {
     bool: "float64",
     int8: "float64",
     int16: "float64",
@@ -361,6 +426,7 @@ const PROMOTION_TABLE: Record<DType, Record<DType, DType>> = {
     uint64: "float64",
     float32: "float64",
     float64: "float64",
+    fixed64: "fixed64",
   },
 };
 
@@ -412,6 +478,9 @@ async function loadNapiBackend(): Promise<BackendModule | null> {
   for (const specifier of candidates) {
     try {
       const required = (await getRequire())(specifier) as BackendModule;
+      if (!isNapiBackendSufficient(required)) {
+        continue;
+      }
       return required;
     } catch (error) {
       if (!isModuleNotFound(error)) {
@@ -467,6 +536,48 @@ function getMatrixDType(matrix: Matrix): DType {
   const dtype = getMatrixDTypeFromHandle(getHandle(matrix));
   (matrix as any)._dtypeCache = dtype;
   return dtype;
+}
+
+function getMatrixFixedScaleFromHandle(handle: BackendMatrixHandle): number | null {
+  const candidate = (handle as any).fixedScale ?? (handle as any).fixed_scale;
+  if (typeof candidate === "number") {
+    return candidate;
+  }
+  if (candidate === null) {
+    return null;
+  }
+  const methodNames = ["fixedScale", "fixed_scale", "getFixedScale"];
+  for (const name of methodNames) {
+    const fn = (handle as any)[name];
+    if (typeof fn === "function") {
+      try {
+        const value = fn.call(handle);
+        if (typeof value === "number") {
+          return value;
+        }
+        if (value === null || value === undefined) {
+          return null;
+        }
+      } catch {
+        // ignore backend getter failures and fall through
+      }
+    }
+  }
+  return null;
+}
+
+function getMatrixFixedScale(matrix: Matrix): number | null {
+  const cache = (matrix as any)._fixedScaleCache as number | null | undefined;
+  if (cache !== undefined) {
+    return cache;
+  }
+  if (matrix.dtype !== "fixed64") {
+    (matrix as any)._fixedScaleCache = null;
+    return null;
+  }
+  const scale = getMatrixFixedScaleFromHandle(getHandle(matrix));
+  (matrix as any)._fixedScaleCache = scale ?? null;
+  return scale ?? null;
 }
 
 function toBackendBytes(data: ArrayBuffer | Uint8Array): Uint8Array {
@@ -594,6 +705,8 @@ function typedArrayFromBytes(bytes: Uint8Array, dtype: DType): TypedArray {
       return new Uint32Array(buffer);
     case "uint64":
       return new BigUint64Array(buffer);
+    case "fixed64":
+      return new BigInt64Array(buffer);
     case "bool":
       return Uint8Array.from(view, (value) => (value !== 0 ? 1 : 0));
     default:
@@ -625,6 +738,7 @@ export async function init(): Promise<void> {
 export class Matrix {
   private _handle: BackendMatrixHandle;
   private _dtypeCache?: DType;
+  private _fixedScaleCache?: number | null;
 
   constructor(
     data: MatrixInputData,
@@ -656,25 +770,46 @@ export class Matrix {
         cols,
         inferred
       );
-      this._handle =
-        targetDType === inferred ? baseHandle : baseHandle.astype(targetDType);
-      this._dtypeCache = targetDType;
-      return;
-    }
+        this._handle =
+          targetDType === inferred ? baseHandle : baseHandle.astype(targetDType);
+        this._dtypeCache = targetDType;
+        this._fixedScaleCache =
+          targetDType === "fixed64"
+            ? getMatrixFixedScaleFromHandle(this._handle)
+            : null;
+        return;
+      }
 
-    const base = new MatrixCtor(toFloat64Array(data), rows, cols);
-    this._handle =
-      targetDType === "float64" ? base : base.astype(targetDType);
-    this._dtypeCache = targetDType;
+      const base = new MatrixCtor(toFloat64Array(data), rows, cols);
+      this._handle =
+        targetDType === "float64" ? base : base.astype(targetDType);
+      this._dtypeCache = targetDType;
+      this._fixedScaleCache =
+        targetDType === "fixed64"
+          ? getMatrixFixedScaleFromHandle(this._handle)
+          : null;
   }
 
   static fromHandle(handle: BackendMatrixHandle): Matrix {
     return wrapMatrix(handle);
   }
 
-  static fromHandleWithDType(handle: BackendMatrixHandle, dtype: DType): Matrix {
+  static fromHandleWithDType(
+    handle: BackendMatrixHandle,
+    dtype: DType,
+    metadata?: { fixedScale?: number | null }
+  ): Matrix {
     const m = wrapMatrix(handle);
     (m as any)._dtypeCache = dtype;
+    if (dtype === "fixed64") {
+      const scale =
+        metadata && "fixedScale" in metadata
+          ? metadata.fixedScale ?? null
+          : getMatrixFixedScaleFromHandle(handle);
+      (m as any)._fixedScaleCache = scale ?? null;
+    } else {
+      (m as any)._fixedScaleCache = null;
+    }
     return m;
   }
 
@@ -687,6 +822,53 @@ export class Matrix {
     return matrixFromBytes(data, rows, cols, dtype);
   }
 
+  static fromFixed(
+    data: BigInt64Array | readonly bigint[] | Iterable<bigint>,
+    rows: number,
+    cols: number,
+    scale: number
+  ): Matrix {
+    const expectedLength = rows * cols;
+    const typed =
+      data instanceof BigInt64Array
+        ? new BigInt64Array(data)
+        : BigInt64Array.from(data as Iterable<bigint>);
+    if (typed.length !== expectedLength) {
+      throw new Error(
+        `Matrix.fromFixed: data length (${typed.length}) does not match shape (${rows} x ${cols})`
+      );
+    }
+    const backend = ensureBackend();
+    const MatrixCtor = backend.Matrix as BackendMatrixConstructor & {
+      from_fixed_i64?: (
+        data: BigInt64Array,
+        rows: number,
+        cols: number,
+        scale: number
+      ) => BackendMatrixHandle;
+      fromFixedI64?: (
+        data: BigInt64Array,
+        rows: number,
+        cols: number,
+        scale: number
+      ) => BackendMatrixHandle;
+    };
+    let handle: BackendMatrixHandle | undefined;
+    if (typeof MatrixCtor.from_fixed_i64 === "function") {
+      handle = MatrixCtor.from_fixed_i64(typed, rows, cols, scale);
+    } else if (typeof MatrixCtor.fromFixedI64 === "function") {
+      handle = MatrixCtor.fromFixedI64(typed, rows, cols, scale);
+    } else if (typeof (backend as any).from_fixed_i64 === "function") {
+      handle = (backend as any).from_fixed_i64(typed, rows, cols, scale) as BackendMatrixHandle;
+    } else if (typeof (backend as any).fromFixedI64 === "function") {
+      handle = (backend as any).fromFixedI64(typed, rows, cols, scale) as BackendMatrixHandle;
+    }
+    if (!handle) {
+      throw new Error("Matrix.fromFixed: current backend does not support fixed64 matrices");
+    }
+    return Matrix.fromHandleWithDType(handle, "fixed64", { fixedScale: scale });
+  }
+
   get rows(): number {
     return this._handle.rows;
   }
@@ -697,6 +879,10 @@ export class Matrix {
 
   get dtype(): DType {
     return getMatrixDType(this);
+  }
+
+  get fixedScale(): number | null {
+    return getMatrixFixedScale(this);
   }
 
   toArray(): TypedArray {
@@ -721,6 +907,14 @@ export class Matrix {
 
   stack(other: Matrix, axis = 0): Matrix {
     return stack(this, other, axis);
+  }
+
+  transpose(): Matrix {
+    return transpose(this);
+  }
+
+  broadcastTo(rows: number, cols: number): Matrix {
+    return broadcastTo(this, rows, cols);
   }
 
   take(axis: number, indices: IndexCollection): Matrix {
@@ -907,6 +1101,8 @@ function allocateArrayForDType(dtype: DType, length: number): MatrixInputData {
       return new Float32Array(length);
     case "float64":
       return new Float64Array(length);
+    case "fixed64":
+      return new BigInt64Array(length);
     default:
       throw new Error(`Unsupported dtype "${dtype}"`);
   }
@@ -946,6 +1142,10 @@ function writeMatrixValue(
       (target as BigInt64Array)[index] =
         typeof value === "bigint" ? value : BigInt(value as number);
       return;
+    case "fixed64":
+      (target as BigInt64Array)[index] =
+        typeof value === "bigint" ? value : BigInt(value as number);
+      return;
     case "uint64":
       (target as BigUint64Array)[index] =
         typeof value === "bigint" ? value : BigInt(value as number);
@@ -980,7 +1180,7 @@ function applyMaskToData(
   }
 }
 
-function broadcastMatrixTo(matrix: Matrix, rows: number, cols: number): Matrix {
+function broadcastMatrixInJs(matrix: Matrix, rows: number, cols: number): Matrix {
   if (matrix.rows === rows && matrix.cols === cols) {
     return matrix;
   }
@@ -1006,6 +1206,34 @@ function broadcastMatrixTo(matrix: Matrix, rows: number, cols: number): Matrix {
       writeMatrixValue(target, dstIndex, source[srcIndex], dtype);
     }
   }
+  if (dtype === "fixed64") {
+    const scale = matrix.fixedScale ?? 0;
+    return Matrix.fromFixed(target as BigInt64Array, rows, cols, scale);
+  }
+  return new Matrix(target, rows, cols, { dtype });
+}
+
+function transposeMatrixInJs(matrix: Matrix): Matrix {
+  const dtype = matrix.dtype;
+  const srcRows = matrix.rows;
+  const srcCols = matrix.cols;
+  const rows = srcCols;
+  const cols = srcRows;
+  const source = matrix.toArray();
+  const target = allocateArrayForDType(dtype, rows * cols);
+  for (let destRow = 0; destRow < rows; destRow += 1) {
+    for (let destCol = 0; destCol < cols; destCol += 1) {
+      const srcRow = destCol;
+      const srcCol = destRow;
+      const srcIndex = srcRow * srcCols + srcCol;
+      const dstIndex = destRow * cols + destCol;
+      writeMatrixValue(target, dstIndex, source[srcIndex], dtype);
+    }
+  }
+  if (dtype === "fixed64") {
+    const scale = matrix.fixedScale ?? 0;
+    return Matrix.fromFixed(target as BigInt64Array, rows, cols, scale);
+  }
   return new Matrix(target, rows, cols, { dtype });
 }
 
@@ -1016,6 +1244,11 @@ export function matrixFromBytes(
   cols: number,
   dtype: DType
 ): Matrix {
+  if (dtype === "fixed64") {
+    throw new Error(
+      "matrixFromBytes: fixed64 requires an explicit scale; use matrixFromFixed instead"
+    );
+  }
   const backend = ensureBackend();
   const MatrixCtor = backend.Matrix as BackendMatrixConstructor;
   const fromBytes = (MatrixCtor as BackendMatrixConstructor).from_bytes ??
@@ -1025,6 +1258,15 @@ export function matrixFromBytes(
   }
   const handle = fromBytes.call(MatrixCtor, toBackendBytes(data), rows, cols, dtype);
   return Matrix.fromHandleWithDType(handle, dtype);
+}
+
+export function matrixFromFixed(
+  data: BigInt64Array | readonly bigint[] | Iterable<bigint>,
+  rows: number,
+  cols: number,
+  scale: number
+): Matrix {
+  return Matrix.fromFixed(data, rows, cols, scale);
 }
 
 export function add(a: Matrix, b: Matrix): Matrix {
@@ -1037,6 +1279,9 @@ export function add(a: Matrix, b: Matrix): Matrix {
 }
 
 export function matmul(a: Matrix, b: Matrix): Matrix {
+  if (a.dtype === "fixed64" || b.dtype === "fixed64") {
+    throw new Error("matmul does not support fixed64 matrices; cast operands to float64 first");
+  }
   const dtype = promoteBinaryDType(a.dtype, b.dtype);
   const left = castToDType(a, dtype);
   const right = castToDType(b, dtype);
@@ -1046,6 +1291,9 @@ export function matmul(a: Matrix, b: Matrix): Matrix {
 }
 
 export function clip(matrix: Matrix, min: number, max: number): Matrix {
+  if (matrix.dtype === "fixed64") {
+    throw new Error("clip does not support fixed64 matrices; cast to float64 before clipping");
+  }
   const backend = ensureBackend();
   if (!backend.clip) {
     throw new Error("clip is not supported by current backend");
@@ -1106,15 +1354,15 @@ export function where(
   );
 
   const boolConditions = conditionList.map((cond) =>
-    broadcastMatrixTo(cond.astype("bool", { copy: false }), targetShape.rows, targetShape.cols)
+    broadcastMatrixInJs(cond.astype("bool", { copy: false }), targetShape.rows, targetShape.cols)
   );
   const broadcastChoices = choiceList.map((choice) =>
-    broadcastMatrixTo(choice, targetShape.rows, targetShape.cols)
+    broadcastMatrixInJs(choice, targetShape.rows, targetShape.cols)
   );
   const castChoices = castAllToDType(broadcastChoices, dtype);
   const defaultCast = defaultMatrix
     ? castToDType(
-        broadcastMatrixTo(defaultMatrix, targetShape.rows, targetShape.cols),
+        broadcastMatrixInJs(defaultMatrix, targetShape.rows, targetShape.cols),
         dtype
       )
     : undefined;
@@ -1273,6 +1521,36 @@ export function stack(a: Matrix, b: Matrix, axis = 0): Matrix {
   return Matrix.fromHandleWithDType(result, dtype);
 }
 
+export function transpose(matrix: Matrix): Matrix {
+  const backend = ensureBackend();
+  const fn =
+    backend.transpose ??
+    (backend as { transpose_matrix?: (m: BackendMatrixHandle) => BackendMatrixHandle }).transpose_matrix ??
+    (backend as { transposeMatrix?: (m: BackendMatrixHandle) => BackendMatrixHandle }).transposeMatrix;
+  if (typeof fn === "function") {
+    const result = fn(getHandle(matrix));
+    return Matrix.fromHandleWithDType(result, matrix.dtype, {
+      fixedScale: matrix.fixedScale,
+    });
+  }
+  return transposeMatrixInJs(matrix);
+}
+
+export function broadcastTo(matrix: Matrix, rows: number, cols: number): Matrix {
+  const backend = ensureBackend();
+  const fn =
+    backend.broadcast_to ??
+    backend.broadcastTo ??
+    (backend as { broadcast?: (m: BackendMatrixHandle, r: number, c: number) => BackendMatrixHandle }).broadcast;
+  if (typeof fn === "function") {
+    const result = fn(getHandle(matrix), rows, cols);
+    return Matrix.fromHandleWithDType(result, matrix.dtype, {
+      fixedScale: matrix.fixedScale,
+    });
+  }
+  return broadcastMatrixInJs(matrix, rows, cols);
+}
+
 export function svd(matrix: Matrix): {
   u: Matrix;
   s: Float64Array;
@@ -1304,22 +1582,21 @@ export function qr(matrix: Matrix): { q: Matrix; r: Matrix } {
 
 export function sumStable(matrix: Matrix): number {
   const backend = ensureBackend();
-  if (typeof backend.sum_pairwise === "function") {
+  const kind = backendKind();
+  if (kind === "napi" && typeof backend.sum_pairwise === "function") {
     return backend.sum_pairwise(getHandle(matrix)) as number;
   }
-  // Fallback: pairwise sum in JS
-  const arr = (matrix.astype("float64", { copy: false }).toArray() as Float64Array).slice();
-  function pairwiseSum(a: Float64Array): number {
-    const n = a.length;
-    if (n <= 1024) {
-      let s = 0;
-      for (let i = 0; i < n; i += 1) s += a[i];
-      return s;
-    }
-    const mid = n >>> 1;
-    return pairwiseSum(a.subarray(0, mid)) + pairwiseSum(a.subarray(mid));
+  // Fallback: Kahan summation to mitigate catastrophic cancellation
+  const arr = matrix.astype("float64", { copy: false }).toArray() as Float64Array;
+  let sum = 0;
+  let compensation = 0;
+  for (let i = 0; i < arr.length; i += 1) {
+    const y = arr[i] - compensation;
+    const t = sum + y;
+    compensation = (t - sum) - y;
+    sum = t;
   }
-  return pairwiseSum(arr);
+  return sum;
 }
 
 export function dotStable(a: Matrix, b: Matrix): number {
@@ -1327,26 +1604,49 @@ export function dotStable(a: Matrix, b: Matrix): number {
     throw new Error("dotStable: shape mismatch");
   }
   const backend = ensureBackend();
-  if (typeof backend.dot_pairwise === "function") {
+  const kind = backendKind();
+  if (kind === "napi" && typeof backend.dot_pairwise === "function") {
     return backend.dot_pairwise(getHandle(a), getHandle(b)) as number;
   }
   const av = a.astype("float64", { copy: false }).toArray() as Float64Array;
   const bv = b.astype("float64", { copy: false }).toArray() as Float64Array;
   const n = av.length;
-  const tmp = new Float64Array(n);
-  for (let i = 0; i < n; i += 1) tmp[i] = av[i] * bv[i];
-  function pairwiseSum(a: Float64Array): number {
-    const n = a.length;
-    if (n <= 1024) {
-      let s = 0;
-      for (let i = 0; i < n; i += 1) s += a[i];
-      return s;
-    }
-    const mid = n >>> 1;
-    return pairwiseSum(a.subarray(0, mid)) + pairwiseSum(a.subarray(mid));
+  let sum = 0;
+  let compensation = 0;
+  for (let i = 0; i < n; i += 1) {
+    const product = av[i] * bv[i];
+    const y = product - compensation;
+    const t = sum + y;
+    compensation = (t - sum) - y;
+    sum = t;
   }
-  return pairwiseSum(tmp);
+  return sum;
 }
+
+export const sum = sumStable;
+export const dot = dotStable;
+export function sumUnsafe(matrix: Matrix): number {
+  const arr = matrix.astype("float64", { copy: false }).toArray() as Float64Array;
+  let total = 0;
+  for (let i = 0; i < arr.length; i += 1) {
+    total += arr[i];
+  }
+  return total;
+}
+
+export function dotUnsafe(a: Matrix, b: Matrix): number {
+  if (a.rows !== b.rows || a.cols !== b.cols) {
+    throw new Error("dotUnsafe: shape mismatch");
+  }
+  const av = a.astype("float64", { copy: false }).toArray() as Float64Array;
+  const bv = b.astype("float64", { copy: false }).toArray() as Float64Array;
+  let total = 0;
+  for (let i = 0; i < av.length; i += 1) {
+    total += av[i] * bv[i];
+  }
+  return total;
+}
+
 
 export function solve(a: Matrix, b: Matrix): Matrix {
   const backend = ensureBackend();
@@ -1385,6 +1685,9 @@ export function readNpy(data: ArrayBuffer | Uint8Array): Matrix {
 }
 
 export function writeNpy(matrix: Matrix): Uint8Array {
+  if (matrix.dtype === "fixed64") {
+    throw new Error("writeNpy does not support fixed64 matrices; export bigint data manually");
+  }
   const backend = ensureBackend();
   if (!backend.write_npy) {
     throw new Error("write_npy is not supported by current backend");
@@ -1444,8 +1747,17 @@ export function backendCapabilities(): BackendCapabilities {
 }
 
 async function getRequire(): Promise<(id: string) => unknown> {
-  if (typeof require === "function") {
-    return require;
+  if ((globalThis as any).__numjsCachedRequire) {
+    return (globalThis as any).__numjsCachedRequire;
+  }
+  try {
+    const nodeRequire = Function("return typeof require !== 'undefined' ? require : undefined;")();
+    if (typeof nodeRequire === "function") {
+      (globalThis as any).__numjsCachedRequire = nodeRequire;
+      return nodeRequire;
+    }
+  } catch {
+    // ignore environments that disallow Function evaluation
   }
   const { createRequire } = await import("node:module");
   const moduleFile = getCurrentModuleFile();
@@ -1453,10 +1765,14 @@ async function getRequire(): Promise<(id: string) => unknown> {
     throw new Error("Unable to determine current module path");
   }
   if (moduleFile.startsWith("file://")) {
-    return createRequire(moduleFile);
+    const req = createRequire(moduleFile);
+    (globalThis as any).__numjsCachedRequire = req;
+    return req;
   }
   const { pathToFileURL } = await import("node:url");
-  return createRequire(pathToFileURL(moduleFile).href);
+  const req = createRequire(pathToFileURL(moduleFile).href);
+  (globalThis as any).__numjsCachedRequire = req;
+  return req;
 }
 
 function roundNumber(value: number, decimals: number): number {
@@ -1866,6 +2182,7 @@ function resolveNapiCandidates(): string[] {
   const platformKey = `${process.platform}-${process.arch}`;
   const distribution = NAPI_DISTRIBUTIONS[platformKey];
   const candidates = new Set<string>();
+  candidates.add(NAPI_ENTRY);
   if (distribution) {
     for (const pkg of distribution.packages) {
       candidates.add(pkg);
@@ -1874,8 +2191,35 @@ function resolveNapiCandidates(): string[] {
       candidates.add(`${NAPI_BINDING_PREFIX}.${suffix}.node`);
     }
   }
-  candidates.add(NAPI_ENTRY);
   return Array.from(candidates);
+}
+
+function isNapiBackendSufficient(candidate: BackendModule): boolean {
+  const matrixExport = (candidate as { Matrix?: unknown }).Matrix;
+  if (typeof matrixExport !== "function") {
+    return false;
+  }
+  const proto = (matrixExport as { prototype?: unknown }).prototype as Record<string, unknown> | undefined;
+  if (!proto || typeof proto.astype !== "function") {
+    return false;
+  }
+  const ctorWithStatic = matrixExport as {
+    from_fixed_i64?: (...args: unknown[]) => unknown;
+    fromFixedI64?: (...args: unknown[]) => unknown;
+  };
+  const hasFixed64Factory =
+    typeof ctorWithStatic.from_fixed_i64 === "function" ||
+    typeof ctorWithStatic.fromFixedI64 === "function";
+  if (!hasFixed64Factory) {
+    return false;
+  }
+  if (typeof (candidate as { gather_pairs?: unknown }).gather_pairs !== "function") {
+    return false;
+  }
+  if (typeof (candidate as { scatter_pairs?: unknown }).scatter_pairs !== "function") {
+    return false;
+  }
+  return true;
 }
 
 function isModuleNotFound(error: unknown): boolean {

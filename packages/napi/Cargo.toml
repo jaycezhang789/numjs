@@ -11,7 +11,7 @@ linalg = ["num_rs_core/linalg"]
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = { version = "2", features = ["napi4"] }
+napi = { version = "2", features = ["napi6"] }
 napi-derive = "2"
 ndarray = "0.15"
 num_rs_core = { path = "../core-rs" }

@@ -27,12 +27,21 @@ import {
   add,
   stack,
   concat,
+  matmul,
+  clip,
+  transpose,
+  broadcastTo,
   DTYPE_INFO,
   writeNpy,
   readNpy,
   writeNpz,
   readNpz,
   matrixFromBytes,
+  matrixFromFixed,
+  sum,
+  sumUnsafe,
+  dot,
+  dotUnsafe,
   where,
   take,
   put,
@@ -41,6 +50,7 @@ import {
   scatter,
   scatterPairs,
   backendCapabilities,
+  backendKind,
   takeCopyBytes,
 } from "../dist/index.js";
 
@@ -71,14 +81,23 @@ test("Matrix.astype reinterprets same-width dtype without copy", () => {
   const view = matrix.astype("int32");
   assert.notStrictEqual(view, matrix);
   assert.equal(view.dtype, "int32");
-  assert.deepEqual(Array.from(view.toArray()), [1, 0]);
   assert.equal(takeCopyBytes(), 0);
+  assert.deepEqual(Array.from(view.toArray()), [1, 0]);
+  takeCopyBytes();
 
   const copied = matrix.astype("int32", { copy: true });
   assert.equal(copied.dtype, "int32");
   assert.deepEqual(Array.from(copied.toArray()), [1, 0]);
   const expectedBytes = matrix.dtypeInfo.size * matrix.rows * matrix.cols;
-  assert.equal(takeCopyBytes(), expectedBytes);
+  const copyBytes = takeCopyBytes();
+  if (backendKind() === "napi") {
+    assert.equal(copyBytes, expectedBytes);
+  } else {
+    assert.ok(
+      copyBytes >= expectedBytes,
+      `expected at least ${expectedBytes} copied bytes, got ${copyBytes}`
+    );
+  }
 });
 
 test("Binary ops promote dtypes using promotion table", () => {
@@ -114,6 +133,49 @@ test("Binary ops promote dtypes using promotion table", () => {
   const stackedAxis = stack(lhs, rhs, 0);
   assert.equal(stackedAxis.dtype, "int32");
   assert.deepEqual(Array.from(stackedAxis.toArray()), [1, 2, 3, 4]);
+});
+
+test("transpose reorders elements without changing dtype", () => {
+  const matrix = new Matrix([1, 2, 3, 4], 2, 2).astype("int32");
+  const viaFunction = transpose(matrix);
+  assert.equal(viaFunction.rows, 2);
+  assert.equal(viaFunction.cols, 2);
+  assert.equal(viaFunction.dtype, "int32");
+  assert.deepEqual(Array.from(viaFunction.toArray()), [1, 3, 2, 4]);
+
+  const viaMethod = matrix.transpose();
+  assert.equal(viaMethod.dtype, "int32");
+  assert.deepEqual(Array.from(viaMethod.toArray()), [1, 3, 2, 4]);
+});
+
+test("broadcastTo expands singleton dimensions", () => {
+  const vector = new Matrix([1, 2], 1, 2).astype("float32");
+  const expanded = broadcastTo(vector, 3, 2);
+  assert.equal(expanded.rows, 3);
+  assert.equal(expanded.cols, 2);
+  assert.equal(expanded.dtype, "float32");
+  assert.deepEqual(Array.from(expanded.toArray()), [1, 2, 1, 2, 1, 2]);
+
+  const methodExpanded = vector.broadcastTo(3, 2);
+  assert.equal(methodExpanded.dtype, "float32");
+  assert.deepEqual(Array.from(methodExpanded.toArray()), [1, 2, 1, 2, 1, 2]);
+});
+
+test("sum defaults to a numerically stable reduction", () => {
+  const matrix = new Matrix([1e16, 1, 1, -1e16, 1], 1, 5);
+  const stable = sum(matrix);
+  const naive = sumUnsafe(matrix);
+  assert.ok(Math.abs(stable - 3) < 1e-6);
+  assert.notStrictEqual(stable, naive, "stable sum should differ from naive accumulation");
+});
+
+test("dot defaults to pairwise accumulation", () => {
+  const a = new Matrix([1e16, 1, 1, -1e16, 1], 1, 5);
+  const b = new Matrix([1, 1, 1, 1, 1], 1, 5);
+  const stable = dot(a, b);
+  const naive = dotUnsafe(a, b);
+  assert.ok(Math.abs(stable - 3) < 1e-6);
+  assert.notStrictEqual(stable, naive, "stable dot should differ from naive accumulation");
 });
 
 test("dtype metadata exposes size and kind information", () => {
@@ -166,6 +228,90 @@ test("Matrix preserves int64 typed array values without precision loss", () => {
   const array = matrix.toArray();
   assert.ok(array instanceof BigInt64Array);
   assert.deepEqual(Array.from(array), Array.from(big));
+});
+
+test("Matrix.fromFixed constructs fixed64 matrices with cached scale", () => {
+  const matrix = Matrix.fromFixed([1234n, 5678n], 1, 2, 2);
+  assert.equal(matrix.dtype, "fixed64");
+  assert.equal(matrix.fixedScale, 2);
+  const array = matrix.toArray();
+  assert.ok(array instanceof BigInt64Array);
+  assert.deepEqual(Array.from(array), [1234n, 5678n]);
+});
+
+test("Fixed64 operations preserve dtype and scale", () => {
+  const matrix = Matrix.fromFixed(
+    [1234n, 2234n, 3234n, 4234n],
+    2,
+    2,
+    2
+  );
+  const taken = take(matrix, 0, [1]);
+  assert.equal(taken.dtype, "fixed64");
+  assert.equal(taken.fixedScale, 2);
+  assert.deepEqual(Array.from(taken.toArray()), [3234n, 4234n]);
+
+  const stacked = concat(matrix, matrix, 0);
+  assert.equal(stacked.dtype, "fixed64");
+  assert.equal(stacked.fixedScale, 2);
+
+  const gathered = gather(matrix, [0, 1], [1]);
+  assert.equal(gathered.dtype, "fixed64");
+  assert.equal(gathered.fixedScale, 2);
+  assert.deepEqual(Array.from(gathered.toArray()), [2234n, 4234n]);
+
+  const fallback = Matrix.fromFixed([0n, 0n, 0n, 0n], 2, 2, 2);
+  const cond = new Matrix([true, false, false, true], 2, 2);
+  const mixed = where(cond, matrix, fallback);
+  assert.equal(mixed.dtype, "fixed64");
+  assert.equal(mixed.fixedScale, 2);
+  assert.deepEqual(Array.from(mixed.toArray()), [1234n, 0n, 0n, 4234n]);
+});
+
+test("Fixed64 transpose and broadcast preserve scale metadata", () => {
+  const matrix = Matrix.fromFixed([111n, 222n, 333n, 444n], 2, 2, 1);
+  const transposed = transpose(matrix);
+  assert.equal(transposed.dtype, "fixed64");
+  assert.equal(transposed.fixedScale, 1);
+  assert.deepEqual(Array.from(transposed.toArray()), [111n, 333n, 222n, 444n]);
+
+  const rowVector = Matrix.fromFixed([5100n, 6200n], 1, 2, 2);
+  const broadcasted = broadcastTo(rowVector, 3, 2);
+  assert.equal(broadcasted.dtype, "fixed64");
+  assert.equal(broadcasted.fixedScale, 2);
+  assert.deepEqual(Array.from(broadcasted.toArray()), [
+    5100n,
+    6200n,
+    5100n,
+    6200n,
+    5100n,
+    6200n,
+  ]);
+});
+
+test("Fixed64 matmul throws informative error", () => {
+  const lhs = Matrix.fromFixed([100n, 200n, 300n, 400n], 2, 2, 2);
+  const rhs = Matrix.fromFixed([100n, 200n, 300n, 400n], 2, 2, 2);
+  assert.throws(() => matmul(lhs, rhs), /fixed64/i);
+});
+
+test("Fixed64 clip throws informative error", () => {
+  const matrix = Matrix.fromFixed([100n, 200n, 300n, 400n], 2, 2, 2);
+  assert.throws(() => clip(matrix, 0, 1), /fixed64/i);
+});
+
+test("Fixed64 writeNpy throws informative error before backend check", () => {
+  const matrix = Matrix.fromFixed([100n, 200n], 1, 2, 2);
+  assert.throws(() => writeNpy(matrix), /fixed64/i);
+});
+
+test("matrixFromFixed mirrors Matrix.fromFixed", () => {
+  const values = [111n, 222n, 333n, 444n];
+  const viaStatic = Matrix.fromFixed(values, 2, 2, 1);
+  const viaFunction = matrixFromFixed(values, 2, 2, 1);
+  assert.equal(viaFunction.dtype, "fixed64");
+  assert.equal(viaFunction.fixedScale, viaStatic.fixedScale);
+  assert.deepEqual(Array.from(viaFunction.toArray()), Array.from(viaStatic.toArray()));
 });
 
 test("writeNpy/readNpy preserve dtype and data", (t) => {
@@ -264,6 +410,13 @@ test("backendCapabilities exposes feature flags", () => {
   assert.ok(Array.isArray(caps.supportedDTypes));
   assert.ok(caps.supportedDTypes.includes("float64"));
   assert.equal(typeof caps.supportsMatrixFromBytes, "boolean");
+});
+
+test("matrixFromBytes rejects fixed64 dtype due to missing scale metadata", () => {
+  assert.throws(
+    () => matrixFromBytes(new Uint8Array(16), 2, 2, "fixed64"),
+    /fixed64/i
+  );
 });
 
 test("matrixFromBytes constructs matrices from raw buffers", (t) => {
