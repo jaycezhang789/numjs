@@ -13,10 +13,13 @@ use ndarray::Array2;
 use std::convert::TryInto;
 
 #[cfg(feature = "npy")]
-use ndarray_npy::{NpzReader, NpzWriter, ReadNpyExt, WriteNpyExt};
+use py_literal::Value as PyValue;
 
 #[cfg(feature = "npy")]
-use std::io::Cursor;
+use std::io::{Cursor, Read, Write};
+
+#[cfg(feature = "npy")]
+use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 #[cfg(feature = "linalg")]
 use nalgebra::{DMatrix, SymmetricEigen};
@@ -1342,54 +1345,540 @@ pub fn eigen(buffer: &MatrixBuffer) -> CoreResult<(MatrixBuffer, MatrixBuffer)> 
 }
 
 #[cfg(feature = "npy")]
+const NPY_MAGIC: &[u8] = b"\x93NUMPY";
+#[cfg(feature = "npy")]
+const NPY_HEADER_ALIGNMENT: usize = 64;
+
+#[cfg(feature = "npy")]
+fn dtype_to_numpy_descr(dtype: DType) -> &'static str {
+    match dtype {
+        DType::Bool => "|b1",
+        DType::Int8 => "|i1",
+        DType::UInt8 => "|u1",
+        DType::Int16 => "<i2",
+        DType::UInt16 => "<u2",
+        DType::Int32 => "<i4",
+        DType::UInt32 => "<u4",
+        DType::Int64 | DType::Fixed64 => "<i8",
+        DType::UInt64 => "<u8",
+        DType::Float32 => "<f4",
+        DType::Float64 => "<f8",
+    }
+}
+
+#[cfg(feature = "npy")]
+fn numpy_descr_to_dtype(descr: &str, override_dtype: Option<&str>) -> CoreResult<DType> {
+    if let Some(explicit) = override_dtype {
+        return match explicit {
+            "bool" => Ok(DType::Bool),
+            "int8" => Ok(DType::Int8),
+            "uint8" => Ok(DType::UInt8),
+            "int16" => Ok(DType::Int16),
+            "uint16" => Ok(DType::UInt16),
+            "int32" => Ok(DType::Int32),
+            "uint32" => Ok(DType::UInt32),
+            "int64" => Ok(DType::Int64),
+            "uint64" => Ok(DType::UInt64),
+            "float32" => Ok(DType::Float32),
+            "float64" => Ok(DType::Float64),
+            "fixed64" => Ok(DType::Fixed64),
+            other => Err(format!("read_npy: unrecognised dtype override '{other}'")),
+        };
+    }
+    match descr {
+        "|b1" => Ok(DType::Bool),
+        "|i1" | "i1" | "b" => Ok(DType::Int8),
+        "|u1" | "u1" | "B" => Ok(DType::UInt8),
+        "<i2" => Ok(DType::Int16),
+        "<u2" => Ok(DType::UInt16),
+        "<i4" => Ok(DType::Int32),
+        "<u4" => Ok(DType::UInt32),
+        "<i8" => Ok(DType::Int64),
+        "<u8" => Ok(DType::UInt64),
+        "<f4" => Ok(DType::Float32),
+        "<f8" => Ok(DType::Float64),
+        other => Err(format!(
+            "read_npy: unsupported descriptor '{other}'; ensure data is little-endian"
+        )),
+    }
+}
+
+#[cfg(feature = "npy")]
+fn assemble_npy_header(dict_repr: &str) -> CoreResult<Vec<u8>> {
+    for &(major, minor, len_bytes) in &[(1u8, 0u8, 2usize), (2u8, 0u8, 4usize)] {
+        let base = NPY_MAGIC.len() + 2 + len_bytes;
+        let mut body = dict_repr.as_bytes().to_vec();
+        let padding_target = base + body.len() + 1;
+        let padding =
+            (NPY_HEADER_ALIGNMENT - (padding_target % NPY_HEADER_ALIGNMENT)) % NPY_HEADER_ALIGNMENT;
+        body.extend(std::iter::repeat(b' ').take(padding));
+        body.push(b'\n');
+        let header_len = body.len();
+        if len_bytes == 2 && header_len > u16::MAX as usize {
+            continue;
+        }
+
+        let mut header = Vec::with_capacity(base + header_len);
+        header.extend_from_slice(NPY_MAGIC);
+        header.push(major);
+        header.push(minor);
+        if len_bytes == 2 {
+            header.extend_from_slice(&(header_len as u16).to_le_bytes());
+        } else {
+            header.extend_from_slice(&(header_len as u32).to_le_bytes());
+        }
+        header.extend_from_slice(&body);
+        return Ok(header);
+    }
+    Err("write_npy: header too long to encode".into())
+}
+
+#[cfg(feature = "npy")]
+fn make_npy_header(dtype: DType, rows: usize, cols: usize, fixed_scale: Option<i32>) -> CoreResult<Vec<u8>> {
+    let descr = dtype_to_numpy_descr(dtype);
+    let mut dict = format!(
+        "{{'descr': '{}', 'fortran_order': False, 'shape': ({}, {})",
+        descr, rows, cols
+    );
+    dict.push_str(&format!(", 'numjs_dtype': '{}'", dtype.as_str()));
+    if let Some(scale) = fixed_scale {
+        dict.push_str(&format!(", 'numjs_fixed_scale': {}", scale));
+    }
+    dict.push('}');
+    assemble_npy_header(&dict)
+}
+
+#[cfg(feature = "npy")]
+fn encode_npy_data(buffer: &MatrixBuffer) -> CoreResult<Vec<u8>> {
+    let len = buffer.len();
+    match buffer.dtype() {
+        DType::Bool => {
+            let slice = buffer.try_as_slice::<bool>()?;
+            let mut bytes = Vec::with_capacity(len);
+            for &value in slice {
+                bytes.push(if value { 1u8 } else { 0u8 });
+            }
+            Ok(bytes)
+        }
+        DType::Int8 => {
+            let slice = buffer.try_as_slice::<i8>()?;
+            Ok(slice.iter().map(|&value| value.to_le_bytes()[0]).collect())
+        }
+        DType::UInt8 => {
+            let slice = buffer.try_as_slice::<u8>()?;
+            Ok(slice.to_vec())
+        }
+        DType::Int16 => {
+            let slice = buffer.try_as_slice::<i16>()?;
+            let mut bytes = Vec::with_capacity(len * 2);
+            for &value in slice {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok(bytes)
+        }
+        DType::UInt16 => {
+            let slice = buffer.try_as_slice::<u16>()?;
+            let mut bytes = Vec::with_capacity(len * 2);
+            for &value in slice {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok(bytes)
+        }
+        DType::Int32 => {
+            let slice = buffer.try_as_slice::<i32>()?;
+            let mut bytes = Vec::with_capacity(len * 4);
+            for &value in slice {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok(bytes)
+        }
+        DType::UInt32 => {
+            let slice = buffer.try_as_slice::<u32>()?;
+            let mut bytes = Vec::with_capacity(len * 4);
+            for &value in slice {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok(bytes)
+        }
+        DType::Int64 => {
+            let slice = buffer.try_as_slice::<i64>()?;
+            let mut bytes = Vec::with_capacity(len * 8);
+            for &value in slice {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok(bytes)
+        }
+        DType::UInt64 => {
+            let slice = buffer.try_as_slice::<u64>()?;
+            let mut bytes = Vec::with_capacity(len * 8);
+            for &value in slice {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok(bytes)
+        }
+        DType::Float32 => {
+            let slice = buffer.try_as_slice::<f32>()?;
+            let mut bytes = Vec::with_capacity(len * 4);
+            for &value in slice {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok(bytes)
+        }
+        DType::Float64 => {
+            let slice = buffer.try_as_slice::<f64>()?;
+            let mut bytes = Vec::with_capacity(len * 8);
+            for &value in slice {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok(bytes)
+        }
+        DType::Fixed64 => {
+            let values = matrix_to_fixed_vec(buffer)?;
+            let mut bytes = Vec::with_capacity(values.len() * 8);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+#[cfg(feature = "npy")]
+fn encode_matrix_to_npy_bytes(buffer: &MatrixBuffer) -> CoreResult<Vec<u8>> {
+    let contiguous = buffer.to_contiguous()?;
+    let dtype = contiguous.dtype();
+    let fixed_scale = if dtype == DType::Fixed64 {
+        Some(ensure_fixed64(&contiguous)?)
+    } else {
+        None
+    };
+    let mut header = make_npy_header(dtype, contiguous.rows(), contiguous.cols(), fixed_scale)?;
+    let mut data = encode_npy_data(&contiguous)?;
+    header.append(&mut data);
+    Ok(header)
+}
+
+#[cfg(feature = "npy")]
+fn reorder_from_fortran<T: Copy>(values: &[T], rows: usize, cols: usize) -> Vec<T> {
+    let mut out = Vec::with_capacity(rows * cols);
+    for r in 0..rows {
+        for c in 0..cols {
+            out.push(values[c * rows + r]);
+        }
+    }
+    out
+}
+
+#[cfg(feature = "npy")]
+fn parse_npy_header(bytes: &[u8]) -> CoreResult<(usize, DType, usize, usize, bool, Option<i32>)> {
+    if bytes.len() < NPY_MAGIC.len() + 4 {
+        return Err("read_npy: payload is too short".into());
+    }
+    if &bytes[..NPY_MAGIC.len()] != NPY_MAGIC {
+        return Err("read_npy: invalid magic string".into());
+    }
+    let major = bytes[NPY_MAGIC.len()];
+    let minor = bytes[NPY_MAGIC.len() + 1];
+    let mut offset = NPY_MAGIC.len() + 2;
+    let header_len = match (major, minor) {
+        (1, 0) => {
+            let raw = bytes
+                .get(offset..offset + 2)
+                .ok_or_else(|| "read_npy: missing header length".to_string())?;
+            offset += 2;
+            u16::from_le_bytes([raw[0], raw[1]]) as usize
+        }
+        (2, 0) | (3, 0) => {
+            let raw = bytes
+                .get(offset..offset + 4)
+                .ok_or_else(|| "read_npy: missing header length".to_string())?;
+            offset += 4;
+            u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize
+        }
+        _ => {
+            return Err(format!(
+                "read_npy: unsupported format version {major}.{minor}"
+            ))
+        }
+    };
+    let header_end = offset + header_len;
+    let header_bytes = bytes
+        .get(offset..header_end)
+        .ok_or_else(|| "read_npy: incomplete header".to_string())?;
+    if header_len == 0 || header_bytes.last() != Some(&b'\n') {
+        return Err("read_npy: malformed header".into());
+    }
+    let header_str = std::str::from_utf8(&header_bytes[..header_len - 1])
+        .map_err(|e| format!("read_npy: header is not valid UTF-8: {e}"))?;
+    let meta: PyValue = header_str
+        .parse()
+        .map_err(|e| format!("read_npy: failed to parse header dict: {e}"))?;
+    let dict = meta
+        .as_dict()
+        .ok_or_else(|| "read_npy: header metadata is not a dict".to_string())?;
+
+    let mut descr: Option<String> = None;
+    let mut fortran_order: Option<bool> = None;
+    let mut shape: Option<Vec<usize>> = None;
+    let mut dtype_override: Option<String> = None;
+    let mut fixed_scale: Option<i32> = None;
+
+    for (key, value) in dict {
+        let key_str = match key {
+            PyValue::String(s) => s.as_str(),
+            _ => continue,
+        };
+        match key_str {
+            "descr" => {
+                if let PyValue::String(s) = value {
+                    descr = Some(s.clone());
+                }
+            }
+            "fortran_order" => {
+                if let PyValue::Boolean(flag) = value {
+                    fortran_order = Some(*flag);
+                }
+            }
+            "shape" => {
+                if let Some(tuple) = value.as_tuple() {
+                    let mut dims = Vec::with_capacity(tuple.len());
+                    for elem in tuple {
+                        let int = elem
+                            .as_integer()
+                            .ok_or_else(|| "read_npy: shape contains non-integer entries".to_string())?;
+                        let dim = int
+                            .to_usize()
+                            .ok_or_else(|| "read_npy: shape dimension does not fit usize".to_string())?;
+                        dims.push(dim);
+                    }
+                    shape = Some(dims);
+                }
+            }
+            "numjs_dtype" => {
+                if let PyValue::String(s) = value {
+                    dtype_override = Some(s.clone());
+                }
+            }
+            "numjs_fixed_scale" => {
+                if let Some(int) = value.as_integer() {
+                    let scale = int
+                        .to_i32()
+                        .ok_or_else(|| "read_npy: fixed64 scale does not fit i32".to_string())?;
+                    fixed_scale = Some(scale);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let descr = descr.ok_or_else(|| "read_npy: header missing 'descr' key".to_string())?;
+    let fortran_order =
+        fortran_order.ok_or_else(|| "read_npy: header missing 'fortran_order' key".to_string())?;
+    let shape = shape.ok_or_else(|| "read_npy: header missing 'shape' key".to_string())?;
+    if shape.len() != 2 {
+        return Err(format!(
+            "read_npy: expected 2D array, but header shape is {:?}",
+            shape
+        ));
+    }
+    let rows = shape[0];
+    let cols = shape[1];
+    let dtype = numpy_descr_to_dtype(&descr, dtype_override.as_deref())?;
+    if dtype == DType::Fixed64 && fixed_scale.is_none() {
+        return Err("read_npy(fixed64): missing 'numjs_fixed_scale' metadata".into());
+    }
+    Ok((header_end, dtype, rows, cols, fortran_order, fixed_scale))
+}
+
+#[cfg(feature = "npy")]
+fn decode_matrix_from_bytes(
+    bytes: &[u8],
+    dtype: DType,
+    rows: usize,
+    cols: usize,
+    fortran: bool,
+    fixed_scale: Option<i32>,
+) -> CoreResult<MatrixBuffer> {
+    let len = rows
+        .checked_mul(cols)
+        .ok_or_else(|| "read_npy: shape would overflow".to_string())?;
+    let expected_bytes = len
+        .checked_mul(dtype.size_of())
+        .ok_or_else(|| "read_npy: expected byte count overflowed".to_string())?;
+    if bytes.len() != expected_bytes {
+        return Err(format!(
+            "read_npy: expected {expected_bytes} data bytes, found {}",
+            bytes.len()
+        ));
+    }
+    match dtype {
+        DType::Bool => {
+            let mut raw = bytes.to_vec();
+            if fortran {
+                raw = reorder_from_fortran(&raw, rows, cols);
+            }
+            let mut values = Vec::with_capacity(len);
+            for (index, byte) in raw.into_iter().enumerate() {
+                match byte {
+                    0 => values.push(false),
+                    1 => values.push(true),
+                    other => {
+                        return Err(format!(
+                            "read_npy(bool): invalid byte value {other} at index {index}"
+                        ))
+                    }
+                }
+            }
+            MatrixBuffer::from_vec(values, rows, cols).map_err(Into::into)
+        }
+        DType::Int8 => {
+            let mut values = bytes.iter().map(|&b| i8::from_le_bytes([b])).collect::<Vec<_>>();
+            if fortran {
+                values = reorder_from_fortran(&values, rows, cols);
+            }
+            MatrixBuffer::from_vec(values, rows, cols).map_err(Into::into)
+        }
+        DType::UInt8 => {
+            let mut values = bytes.to_vec();
+            if fortran {
+                values = reorder_from_fortran(&values, rows, cols);
+            }
+            MatrixBuffer::from_vec(values, rows, cols).map_err(Into::into)
+        }
+        DType::Int16 => {
+            let mut values = Vec::with_capacity(len);
+            for chunk in bytes.chunks_exact(2) {
+                values.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+            }
+            if fortran {
+                values = reorder_from_fortran(&values, rows, cols);
+            }
+            MatrixBuffer::from_vec(values, rows, cols).map_err(Into::into)
+        }
+        DType::UInt16 => {
+            let mut values = Vec::with_capacity(len);
+            for chunk in bytes.chunks_exact(2) {
+                values.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+            }
+            if fortran {
+                values = reorder_from_fortran(&values, rows, cols);
+            }
+            MatrixBuffer::from_vec(values, rows, cols).map_err(Into::into)
+        }
+        DType::Int32 => {
+            let mut values = Vec::with_capacity(len);
+            for chunk in bytes.chunks_exact(4) {
+                values.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            if fortran {
+                values = reorder_from_fortran(&values, rows, cols);
+            }
+            MatrixBuffer::from_vec(values, rows, cols).map_err(Into::into)
+        }
+        DType::UInt32 => {
+            let mut values = Vec::with_capacity(len);
+            for chunk in bytes.chunks_exact(4) {
+                values.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            if fortran {
+                values = reorder_from_fortran(&values, rows, cols);
+            }
+            MatrixBuffer::from_vec(values, rows, cols).map_err(Into::into)
+        }
+        DType::Int64 => {
+            let mut values = Vec::with_capacity(len);
+            for chunk in bytes.chunks_exact(8) {
+                values.push(i64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ]));
+            }
+            if fortran {
+                values = reorder_from_fortran(&values, rows, cols);
+            }
+            MatrixBuffer::from_vec(values, rows, cols).map_err(Into::into)
+        }
+        DType::UInt64 => {
+            let mut values = Vec::with_capacity(len);
+            for chunk in bytes.chunks_exact(8) {
+                values.push(u64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ]));
+            }
+            if fortran {
+                values = reorder_from_fortran(&values, rows, cols);
+            }
+            MatrixBuffer::from_vec(values, rows, cols).map_err(Into::into)
+        }
+        DType::Float32 => {
+            let mut values = Vec::with_capacity(len);
+            for chunk in bytes.chunks_exact(4) {
+                values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            if fortran {
+                values = reorder_from_fortran(&values, rows, cols);
+            }
+            MatrixBuffer::from_vec(values, rows, cols).map_err(Into::into)
+        }
+        DType::Float64 => {
+            let mut values = Vec::with_capacity(len);
+            for chunk in bytes.chunks_exact(8) {
+                values.push(f64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ]));
+            }
+            if fortran {
+                values = reorder_from_fortran(&values, rows, cols);
+            }
+            MatrixBuffer::from_vec(values, rows, cols).map_err(Into::into)
+        }
+        DType::Fixed64 => {
+            let mut values = Vec::with_capacity(len);
+            for chunk in bytes.chunks_exact(8) {
+                values.push(i64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ]));
+            }
+            if fortran {
+                values = reorder_from_fortran(&values, rows, cols);
+            }
+            MatrixBuffer::from_fixed_i64_vec(values, rows, cols, fixed_scale.unwrap())
+                .map_err(Into::into)
+        }
+    }
+}
+
+#[cfg(feature = "npy")]
 pub fn read_npy_matrix(data: &[u8]) -> CoreResult<MatrixBuffer> {
-    let mut cursor = Cursor::new(data);
-    let array: Array2<f64> =
-        Array2::read_npy(&mut cursor).map_err(|e| format!("failed to read npy: {e}"))?;
-    MatrixBuffer::from_f64_vec(
-        DType::Float64,
-        array.nrows(),
-        array.ncols(),
-        array.into_raw_vec(),
-    )
-    .map_err(Into::into)
+    let (offset, dtype, rows, cols, fortran, fixed_scale) = parse_npy_header(data)?;
+    let payload = data
+        .get(offset..)
+        .ok_or_else(|| "read_npy: missing array payload".to_string())?;
+    decode_matrix_from_bytes(payload, dtype, rows, cols, fortran, fixed_scale)
 }
 
 #[cfg(feature = "npy")]
 pub fn write_npy_matrix(buffer: &MatrixBuffer) -> CoreResult<Vec<u8>> {
-    if buffer.dtype() == DType::Fixed64 {
-        return Err(
-            "write_npy(Fixed64): convert to float64 or serialise bigint payload manually".into(),
-        );
-    }
-    let array = Array2::from_shape_vec((buffer.rows(), buffer.cols()), buffer.to_f64_vec())
-        .map_err(|_| "write_npy: failed to reshape matrix")?;
-    let mut cursor = Cursor::new(Vec::new());
-    array
-        .write_npy(&mut cursor)
-        .map_err(|e| format!("failed to write npy: {e}"))?;
-    Ok(cursor.into_inner())
+    encode_matrix_to_npy_bytes(buffer)
 }
 
 #[cfg(feature = "npy")]
 pub fn read_npz_matrices(data: &[u8]) -> CoreResult<Vec<(String, MatrixBuffer)>> {
     let cursor = Cursor::new(data);
-    let mut reader = NpzReader::new(cursor).map_err(|e| format!("failed to read npz: {e}"))?;
+    let mut archive = ZipArchive::new(cursor).map_err(|e| format!("failed to read npz: {e}"))?;
     let mut results = Vec::new();
-    let names = reader
-        .names()
-        .map_err(|e| format!("failed to list npz names: {e}"))?;
-    for name in names {
-        let array: Array2<f64> = reader
-            .by_name(&name)
-            .map_err(|e| format!("npz entry {name} failed: {e}"))?;
-        let buffer = MatrixBuffer::from_f64_vec(
-            DType::Float64,
-            array.nrows(),
-            array.ncols(),
-            array.into_raw_vec(),
-        )?;
-        results.push((name, buffer));
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|e| format!("npz entry {index} failed: {e}"))?;
+        if file.is_dir() {
+            continue;
+        }
+        let name = file.name().to_owned();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|e| format!("npz entry {name} read failed: {e}"))?;
+        let matrix = read_npy_matrix(&bytes)?;
+        results.push((name, matrix));
     }
     Ok(results)
 }
@@ -1397,23 +1886,21 @@ pub fn read_npz_matrices(data: &[u8]) -> CoreResult<Vec<(String, MatrixBuffer)>>
 #[cfg(feature = "npy")]
 pub fn write_npz_matrices(entries: &[(&str, MatrixBuffer)]) -> CoreResult<Vec<u8>> {
     let cursor = Cursor::new(Vec::new());
-    let mut writer = NpzWriter::new(cursor);
+    let mut writer = ZipWriter::new(cursor);
+    let options = FileOptions::default().compression_method(CompressionMethod::Stored);
     for (name, buffer) in entries {
-        if buffer.dtype() == DType::Fixed64 {
-            return Err(format!(
-                "write_npz(Fixed64): entry '{name}' cannot be written; convert to float64 first"
-            ));
-        }
-        let array = Array2::from_shape_vec((buffer.rows(), buffer.cols()), buffer.to_f64_vec())
-            .map_err(|_| "write_npz: failed to reshape matrix")?;
+        let bytes = write_npy_matrix(buffer)?;
         writer
-            .add_array(*name, &array)
-            .map_err(|e| format!("failed to add array {name}: {e}"))?;
+            .start_file(*name, options)
+            .map_err(|e| format!("write_npz: failed to start entry {name}: {e}"))?;
+        writer
+            .write_all(&bytes)
+            .map_err(|e| format!("write_npz: failed to write entry {name}: {e}"))?;
     }
-    writer
+    let cursor = writer
         .finish()
-        .map(|cursor| cursor.into_inner())
-        .map_err(|e| format!("failed to finish npz: {e}"))
+        .map_err(|e| format!("write_npz: failed to finish archive: {e}"))?;
+    Ok(cursor.into_inner())
 }
 
 #[cfg(not(feature = "npy"))]

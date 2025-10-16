@@ -1969,15 +1969,13 @@ export function readNpy(data: ArrayBuffer | Uint8Array): Matrix {
   }
   const readNpyFn = (backend as any).read_npy ?? (backend as any).readNpy;
   const handle = readNpyFn(toBackendBytes(data));
-  // dtype unknown from interface; rely on handle or fallback
-  const m = Matrix.fromHandle(handle);
-  return m;
+  const dtype = getMatrixDTypeFromHandle(handle);
+  const fixedScale =
+    dtype === "fixed64" ? getMatrixFixedScaleFromHandle(handle) : null;
+  return Matrix.fromHandleWithDType(handle, dtype, { fixedScale });
 }
 
 export function writeNpy(matrix: Matrix): Uint8Array {
-  if (matrix.dtype === "fixed64") {
-    throw new Error("writeNpy does not support fixed64 matrices; export bigint data manually");
-  }
   const backend = ensureBackend();
   if (!backend.write_npy) {
     throw new Error("write_npy is not supported by current backend");

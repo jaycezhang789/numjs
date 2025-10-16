@@ -438,11 +438,6 @@ test("Fixed64 clip throws informative error", () => {
   assert.throws(() => clip(matrix, 0, 1), /fixed64/i);
 });
 
-test("Fixed64 writeNpy throws informative error before backend check", () => {
-  const matrix = Matrix.fromFixed([100n, 200n], 1, 2, 2);
-  assert.throws(() => writeNpy(matrix), /fixed64/i);
-});
-
 test("matrixFromFixed mirrors Matrix.fromFixed", () => {
   const values = [111n, 222n, 333n, 444n];
   const viaStatic = Matrix.fromFixed(values, 2, 2, 1);
@@ -471,14 +466,34 @@ test("writeNpy/readNpy preserve dtype and data", (t) => {
   assert.deepEqual(Array.from(array), [1, 65535]);
 });
 
+test("writeNpy/readNpy preserve fixed64 scale metadata", (t) => {
+  const original = Matrix.fromFixed([321n, -654n, 987n, -111n], 2, 2, 2);
+  let bytes;
+  try {
+    bytes = writeNpy(original);
+  } catch (error) {
+    if (String(error).includes("not supported")) {
+      t.skip("Current backend does not support write_npy");
+      return;
+    }
+    throw error;
+  }
+  const roundtrip = readNpy(bytes);
+  assert.equal(roundtrip.dtype, "fixed64");
+  assert.equal(roundtrip.fixedScale, original.fixedScale);
+  assert.deepEqual(Array.from(roundtrip.toArray()), Array.from(original.toArray()));
+});
+
 test("writeNpz/readNpz roundtrip keeps dtype metadata", (t) => {
   const lhs = new Matrix(new Int8Array([1, -2]), 1, 2);
   const rhs = new Matrix(new Float32Array([0.1, 0.2]), 1, 2);
+  const fixed = Matrix.fromFixed([101n, 202n, -505n, -808n], 2, 2, 3);
   let archive;
   try {
     archive = writeNpz([
       { name: "lhs", matrix: lhs },
       { name: "rhs", matrix: rhs },
+      { name: "fixed", matrix: fixed },
     ]);
   } catch (error) {
     if (String(error).includes("not supported")) {
@@ -490,12 +505,17 @@ test("writeNpz/readNpz roundtrip keeps dtype metadata", (t) => {
   const entries = readNpz(archive);
   const left = entries.find((entry) => entry.name === "lhs");
   const right = entries.find((entry) => entry.name === "rhs");
+  const fx = entries.find((entry) => entry.name === "fixed");
   assert.ok(left && right);
   assert.equal(left.matrix.dtype, "int8");
   assert.equal(right.matrix.dtype, "float32");
   assert.deepEqual(Array.from(left.matrix.toArray()), [1, -2]);
   const rightArray = Array.from(right.matrix.toArray());
   assert.ok(rightArray.every((value, index) => Math.abs(value - [0.1, 0.2][index]) < 1e-6));
+  assert.ok(fx);
+  assert.equal(fx.matrix.dtype, "fixed64");
+  assert.equal(fx.matrix.fixedScale, fixed.fixedScale);
+  assert.deepEqual(Array.from(fx.matrix.toArray()), Array.from(fixed.toArray()));
 });
 
 test("where supports multiple conditions with fallback", () => {
