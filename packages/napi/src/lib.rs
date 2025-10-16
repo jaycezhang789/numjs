@@ -9,7 +9,7 @@ use num_rs_core::{
     gather_pairs as core_gather_pairs, matmul as core_matmul, put as core_put, read_npy_matrix,
     scatter as core_scatter, scatter_pairs as core_scatter_pairs, stack as core_stack,
     take as core_take, where_select as core_where, where_select_multi as core_where_multi,
-    write_npy_matrix,
+    write_npy_matrix, dot_pairwise as core_dot_pairwise, sum_pairwise as core_sum_pairwise,
 };
 #[cfg(feature = "linalg")]
 use num_rs_core::{eigen as core_eigen, qr as core_qr, solve as core_solve, svd as core_svd};
@@ -284,6 +284,21 @@ pub fn take_copy_bytes() -> f64 {
 #[napi]
 pub fn reset_copy_bytes() {
     num_rs_core::reset_copy_bytes();
+}
+
+// ---------------------------------------------------------------------
+// Stable reductions
+// ---------------------------------------------------------------------
+
+#[napi]
+pub fn sum_pairwise(matrix: &Matrix) -> f64 {
+    core_sum_pairwise(matrix.buffer())
+}
+
+#[napi]
+pub fn dot_pairwise(a: &Matrix, b: &Matrix) -> Result<f64> {
+    core_dot_pairwise(a.buffer(), b.buffer())
+        .map_err(|e| Error::from_reason(e))
 }
 
 fn convert_indices(indices: &[i64]) -> Result<Vec<isize>> {

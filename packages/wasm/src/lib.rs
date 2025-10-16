@@ -4,7 +4,8 @@ use num_rs_core::{
     add as core_add, clip as core_clip, concat as core_concat, gather as core_gather,
     gather_pairs as core_gather_pairs, matmul as core_matmul, put as core_put,
     scatter as core_scatter, scatter_pairs as core_scatter_pairs, stack as core_stack,
-    take as core_take, where_select as core_where,
+    take as core_take, where_select as core_where, dot_pairwise as core_dot_pairwise,
+    sum_pairwise as core_sum_pairwise,
 };
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -237,4 +238,19 @@ pub fn take_copy_bytes() -> f64 {
 #[wasm_bindgen]
 pub fn reset_copy_bytes() {
     num_rs_core::reset_copy_bytes();
+}
+
+// ---------------------------------------------------------------------
+// Stable reductions
+// ---------------------------------------------------------------------
+
+#[wasm_bindgen]
+pub fn sum_pairwise(matrix: &Matrix) -> f64 {
+    core_sum_pairwise(matrix.buffer())
+}
+
+#[wasm_bindgen]
+pub fn dot_pairwise(a: &Matrix, b: &Matrix) -> Result<f64, JsValue> {
+    core_dot_pairwise(a.buffer(), b.buffer())
+        .map_err(|e| JsValue::from_str(&e))
 }

@@ -74,6 +74,28 @@ pub fn welford_mean_variance(buffer: &MatrixBuffer, sample: bool) -> (f64, f64) 
 }
 
 pub fn add(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    // Draft: integer add for Fixed64 when scales match
+    if a.dtype() == DType::Fixed64 && b.dtype() == DType::Fixed64 {
+        if a.fixed_scale() != b.fixed_scale() {
+            return Err("add(Fixed64): scale mismatch".into());
+        }
+        let scale = a.fixed_scale().unwrap_or(0);
+        let mut out: Vec<i64> = Vec::with_capacity(a.rows() * a.cols());
+        let ac = a.to_contiguous()?;
+        let bc = b.to_contiguous()?;
+        let abytes = ac.as_byte_slice().ok_or_else(|| "add(Fixed64): non-contiguous".to_string())?;
+        let bbytes = bc.as_byte_slice().ok_or_else(|| "add(Fixed64): non-contiguous".to_string())?;
+        let mut i: usize = 0;
+        while i + 8 <= abytes.len() {
+            let lhs = i64::from_ne_bytes(abytes[i..i+8].try_into().unwrap());
+            let rhs = i64::from_ne_bytes(bbytes[i..i+8].try_into().unwrap());
+            let (sum, overflow) = lhs.overflowing_add(rhs);
+            if overflow { return Err("add(Fixed64): overflow".into()); }
+            out.push(sum);
+            i += 8;
+        }
+        return MatrixBuffer::from_fixed_i64_vec(out, a.rows(), a.cols(), scale);
+    }
     ensure_same_shape(a, b)?;
     let dtype = promote_pair(a.dtype(), b.dtype());
     let out_rows = a.rows();
@@ -186,6 +208,7 @@ pub fn where_select_multi(
         DType::UInt64 => assign_where::<u64>(&mut result, dtype, conditions, choices, rows, cols)?,
         DType::Float32 => assign_where::<f32>(&mut result, dtype, conditions, choices, rows, cols)?,
         DType::Float64 => assign_where::<f64>(&mut result, dtype, conditions, choices, rows, cols)?,
+        DType::Fixed64 => return Err("where_select_multi: fixed64 not supported".into()),
     }
 
     Ok(result)
@@ -680,3 +703,5 @@ mod tests {
         assert!(var > 0.0);
     }
 }
+
+

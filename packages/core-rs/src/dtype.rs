@@ -11,6 +11,8 @@ pub enum DType {
     UInt64,
     Float32,
     Float64,
+    // Draft: fixed-point signed 64-bit with per-buffer scale metadata
+    Fixed64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,7 +30,7 @@ impl DType {
             DType::Int8 | DType::UInt8 => 1,
             DType::Int16 | DType::UInt16 => 2,
             DType::Int32 | DType::UInt32 | DType::Float32 => 4,
-            DType::Int64 | DType::UInt64 | DType::Float64 => 8,
+            DType::Int64 | DType::UInt64 | DType::Float64 | DType::Fixed64 => 8,
         }
     }
 
@@ -45,6 +47,7 @@ impl DType {
                 | DType::Int64
                 | DType::Float32
                 | DType::Float64
+                | DType::Fixed64
         )
     }
 
@@ -52,7 +55,9 @@ impl DType {
         match self {
             DType::Bool => TypeKind::Bool,
             DType::UInt8 | DType::UInt16 | DType::UInt32 | DType::UInt64 => TypeKind::Unsigned,
-            DType::Int8 | DType::Int16 | DType::Int32 | DType::Int64 => TypeKind::Signed,
+            DType::Int8 | DType::Int16 | DType::Int32 | DType::Int64 | DType::Fixed64 => {
+                TypeKind::Signed
+            }
             DType::Float32 | DType::Float64 => TypeKind::Float,
         }
     }
@@ -74,6 +79,7 @@ impl DType {
             DType::UInt64 => "uint64",
             DType::Float32 => "float32",
             DType::Float64 => "float64",
+            DType::Fixed64 => "fixed64",
         }
     }
 }
@@ -94,6 +100,7 @@ impl core::str::FromStr for DType {
             "uint64" => Ok(DType::UInt64),
             "float32" => Ok(DType::Float32),
             "float64" => Ok(DType::Float64),
+            "fixed64" => Ok(DType::Fixed64),
             other => Err(format!("unknown dtype '{other}'")),
         }
     }

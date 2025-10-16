@@ -14,6 +14,8 @@ pub struct MatrixBuffer {
     offset: isize,
     row_stride: isize,
     col_stride: isize,
+    // Draft: fixed-point scale for DType::Fixed64
+    fixed_scale: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,7 +115,37 @@ impl MatrixBuffer {
             offset,
             row_stride,
             col_stride,
+            fixed_scale: None,
         })
+    }
+
+    pub fn from_fixed_i64_vec(
+        data: Vec<i64>,
+        rows: usize,
+        cols: usize,
+        scale: i32,
+    ) -> Result<Self, String> {
+        if rows == 0 || cols == 0 {
+            return Err("rows and cols must be greater than zero".into());
+        }
+        if data.len() != rows * cols {
+            return Err("data length does not match shape".into());
+        }
+        let dtype = DType::Fixed64;
+        let byte_len = data.len() * dtype.size_of();
+        let mut bytes = Vec::<u8>::with_capacity(byte_len);
+        let ptr = data.as_ptr() as *const u8;
+        unsafe {
+            bytes.extend_from_slice(std::slice::from_raw_parts(ptr, byte_len));
+        }
+        std::mem::forget(data);
+        let mut buf = MatrixBuffer::new_internal(dtype, rows, cols, Arc::new(bytes), 0, cols as isize, 1)?;
+        buf.fixed_scale = Some(scale);
+        Ok(buf)
+    }
+
+    pub fn fixed_scale(&self) -> Option<i32> {
+        self.fixed_scale
     }
 
     pub fn dtype(&self) -> DType {
@@ -261,6 +293,7 @@ impl MatrixBuffer {
                 MatrixBuffer::from_vec(vec, self.rows, self.cols)
             }
             DType::Float64 => MatrixBuffer::from_vec(self.to_f64_vec(), self.rows, self.cols),
+            DType::Fixed64 => Err("cast: casting to fixed64 not supported; construct with from_fixed_i64_vec".into()),
         }
     }
 
@@ -285,6 +318,18 @@ impl MatrixBuffer {
             DType::UInt64 => collect_numeric(&mut out, self, |v: u64| v as f64),
             DType::Float32 => collect_numeric(&mut out, self, |v: f32| v as f64),
             DType::Float64 => collect_numeric(&mut out, self, |v: f64| v),
+            DType::Fixed64 => {
+                let scale = self.fixed_scale.unwrap_or(0);
+                let factor = 10f64.powi(scale as i32);
+                let contiguous = self.to_contiguous().expect("contiguous");
+                let bytes = contiguous.as_byte_slice().expect("bytes");
+                let mut i = 0;
+                while i + 8 <= bytes.len() {
+                    let v = i64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+                    out.push((v as f64) / factor);
+                    i += 8;
+                }
+            }
         }
         out
     }
@@ -348,6 +393,7 @@ impl MatrixBuffer {
                 Self::from_vec(vec, rows, cols)
             }
             DType::Float64 => Self::from_vec(data, rows, cols),
+            DType::Fixed64 => Err("from_f64_vec(Fixed64): requires explicit scale; use from_fixed_i64_vec".into()),
         }
     }
 

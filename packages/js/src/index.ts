@@ -51,6 +51,8 @@ type BackendModule = {
   Matrix: BackendMatrixConstructor;
   add(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
   matmul(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
+  sum_pairwise?(matrix: BackendMatrixHandle): number;
+  dot_pairwise?(a: BackendMatrixHandle, b: BackendMatrixHandle): number;
   clip?(
     matrix: BackendMatrixHandle,
     min: number,
@@ -1298,6 +1300,52 @@ export function qr(matrix: Matrix): { q: Matrix; r: Matrix } {
     q: Matrix.fromHandleWithDType(result.q, matrix.dtype),
     r: Matrix.fromHandleWithDType(result.r, matrix.dtype),
   };
+}
+
+export function sumStable(matrix: Matrix): number {
+  const backend = ensureBackend();
+  if (typeof backend.sum_pairwise === "function") {
+    return backend.sum_pairwise(getHandle(matrix)) as number;
+  }
+  // Fallback: pairwise sum in JS
+  const arr = (matrix.astype("float64", { copy: false }).toArray() as Float64Array).slice();
+  function pairwiseSum(a: Float64Array): number {
+    const n = a.length;
+    if (n <= 1024) {
+      let s = 0;
+      for (let i = 0; i < n; i += 1) s += a[i];
+      return s;
+    }
+    const mid = n >>> 1;
+    return pairwiseSum(a.subarray(0, mid)) + pairwiseSum(a.subarray(mid));
+  }
+  return pairwiseSum(arr);
+}
+
+export function dotStable(a: Matrix, b: Matrix): number {
+  if (a.rows !== b.rows || a.cols !== b.cols) {
+    throw new Error("dotStable: shape mismatch");
+  }
+  const backend = ensureBackend();
+  if (typeof backend.dot_pairwise === "function") {
+    return backend.dot_pairwise(getHandle(a), getHandle(b)) as number;
+  }
+  const av = a.astype("float64", { copy: false }).toArray() as Float64Array;
+  const bv = b.astype("float64", { copy: false }).toArray() as Float64Array;
+  const n = av.length;
+  const tmp = new Float64Array(n);
+  for (let i = 0; i < n; i += 1) tmp[i] = av[i] * bv[i];
+  function pairwiseSum(a: Float64Array): number {
+    const n = a.length;
+    if (n <= 1024) {
+      let s = 0;
+      for (let i = 0; i < n; i += 1) s += a[i];
+      return s;
+    }
+    const mid = n >>> 1;
+    return pairwiseSum(a.subarray(0, mid)) + pairwiseSum(a.subarray(mid));
+  }
+  return pairwiseSum(tmp);
 }
 
 export function solve(a: Matrix, b: Matrix): Matrix {
