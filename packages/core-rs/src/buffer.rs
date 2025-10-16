@@ -62,7 +62,16 @@ impl MatrixBuffer {
             bytes.extend_from_slice(std::slice::from_raw_parts(ptr, byte_len));
         }
         std::mem::forget(data);
-        MatrixBuffer::new_internal_with_scale(dtype, rows, cols, Arc::new(bytes), 0, cols as isize, 1, None)
+        MatrixBuffer::new_internal_with_scale(
+            dtype,
+            rows,
+            cols,
+            Arc::new(bytes),
+            0,
+            cols as isize,
+            1,
+            None,
+        )
     }
 
     pub fn from_bytes(
@@ -81,7 +90,16 @@ impl MatrixBuffer {
         if expected != data.len() {
             return Err("byte length does not match shape".into());
         }
-        MatrixBuffer::new_internal_with_scale(dtype, rows, cols, Arc::new(data), 0, cols as isize, 1, None)
+        MatrixBuffer::new_internal_with_scale(
+            dtype,
+            rows,
+            cols,
+            Arc::new(data),
+            0,
+            cols as isize,
+            1,
+            None,
+        )
     }
 
     pub fn from_bytes_with_scale(
@@ -148,7 +166,8 @@ impl MatrixBuffer {
         col_stride: isize,
         fixed_scale: Option<i32>,
     ) -> Result<Self, String> {
-        let mut buffer = MatrixBuffer::new_internal(dtype, rows, cols, data, offset, row_stride, col_stride)?;
+        let mut buffer =
+            MatrixBuffer::new_internal(dtype, rows, cols, data, offset, row_stride, col_stride)?;
         buffer.fixed_scale = fixed_scale;
         Ok(buffer)
     }
@@ -172,7 +191,16 @@ impl MatrixBuffer {
             bytes.extend_from_slice(std::slice::from_raw_parts(ptr, byte_len));
         }
         std::mem::forget(data);
-        MatrixBuffer::new_internal_with_scale(dtype, rows, cols, Arc::new(bytes), 0, cols as isize, 1, Some(scale))
+        MatrixBuffer::new_internal_with_scale(
+            dtype,
+            rows,
+            cols,
+            Arc::new(bytes),
+            0,
+            cols as isize,
+            1,
+            Some(scale),
+        )
     }
 
     pub fn fixed_scale(&self) -> Option<i32> {
@@ -257,7 +285,13 @@ impl MatrixBuffer {
         let mut bytes = vec![0u8; self.len() * self.element_size()];
         self.copy_into_bytes(&mut bytes);
         record_copy_bytes(bytes.len());
-        MatrixBuffer::from_bytes_with_scale(self.dtype, self.rows, self.cols, bytes, self.fixed_scale)
+        MatrixBuffer::from_bytes_with_scale(
+            self.dtype,
+            self.rows,
+            self.cols,
+            bytes,
+            self.fixed_scale,
+        )
     }
 
     pub fn to_contiguous_bytes_vec(&self) -> Vec<u8> {
@@ -286,7 +320,13 @@ impl MatrixBuffer {
         record_copy_bytes(self.len() * dtype.size_of());
         let bytes = self.to_contiguous_bytes_vec();
         if dtype == DType::Fixed64 {
-            MatrixBuffer::from_bytes_with_scale(dtype, self.rows, self.cols, bytes, self.fixed_scale)
+            MatrixBuffer::from_bytes_with_scale(
+                dtype,
+                self.rows,
+                self.cols,
+                bytes,
+                self.fixed_scale,
+            )
         } else {
             MatrixBuffer::from_bytes(dtype, self.rows, self.cols, bytes)
         }
@@ -304,7 +344,11 @@ impl MatrixBuffer {
             self.offset,
             self.row_stride,
             self.col_stride,
-            if self.dtype == DType::Fixed64 { self.fixed_scale } else { None },
+            if self.dtype == DType::Fixed64 {
+                self.fixed_scale
+            } else {
+                None
+            },
         )
     }
 
@@ -337,7 +381,9 @@ impl MatrixBuffer {
                 MatrixBuffer::from_vec(vec, self.rows, self.cols)
             }
             DType::Float64 => MatrixBuffer::from_vec(self.to_f64_vec(), self.rows, self.cols),
-            DType::Fixed64 => Err("cast: casting to fixed64 not supported; construct with from_fixed_i64_vec".into()),
+            DType::Fixed64 => Err(
+                "cast: casting to fixed64 not supported; construct with from_fixed_i64_vec".into(),
+            ),
         }
     }
 
@@ -437,7 +483,9 @@ impl MatrixBuffer {
                 Self::from_vec(vec, rows, cols)
             }
             DType::Float64 => Self::from_vec(data, rows, cols),
-            DType::Fixed64 => Err("from_f64_vec(Fixed64): requires explicit scale; use from_fixed_i64_vec".into()),
+            DType::Fixed64 => {
+                Err("from_f64_vec(Fixed64): requires explicit scale; use from_fixed_i64_vec".into())
+            }
         }
     }
 
@@ -497,7 +545,11 @@ impl MatrixBuffer {
             offset,
             row_stride,
             col_stride,
-            if self.dtype == DType::Fixed64 { self.fixed_scale } else { None },
+            if self.dtype == DType::Fixed64 {
+                self.fixed_scale
+            } else {
+                None
+            },
         )
     }
 
@@ -511,7 +563,11 @@ impl MatrixBuffer {
             self.offset + idx * self.row_stride,
             self.row_stride,
             self.col_stride,
-            if self.dtype == DType::Fixed64 { self.fixed_scale } else { None },
+            if self.dtype == DType::Fixed64 {
+                self.fixed_scale
+            } else {
+                None
+            },
         )
     }
 
@@ -525,7 +581,11 @@ impl MatrixBuffer {
             self.offset + idx * self.col_stride,
             self.row_stride,
             self.col_stride,
-            if self.dtype == DType::Fixed64 { self.fixed_scale } else { None },
+            if self.dtype == DType::Fixed64 {
+                self.fixed_scale
+            } else {
+                None
+            },
         )
     }
 

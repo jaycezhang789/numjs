@@ -6,11 +6,11 @@ use num_rs_core::buffer::MatrixBuffer;
 use num_rs_core::dtype::DType;
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
-    gather as core_gather, gather_pairs as core_gather_pairs, matmul as core_matmul,
-    put as core_put, read_npy_matrix, scatter as core_scatter,
-    scatter_pairs as core_scatter_pairs, stack as core_stack, take as core_take,
-    transpose as core_transpose, where_select as core_where, where_select_multi as core_where_multi,
-    write_npy_matrix, dot_pairwise as core_dot_pairwise, sum_pairwise as core_sum_pairwise,
+    dot_pairwise as core_dot_pairwise, gather as core_gather, gather_pairs as core_gather_pairs,
+    matmul as core_matmul, put as core_put, read_npy_matrix, scatter as core_scatter,
+    scatter_pairs as core_scatter_pairs, stack as core_stack, sum_pairwise as core_sum_pairwise,
+    take as core_take, transpose as core_transpose, where_select as core_where,
+    where_select_multi as core_where_multi, write_npy_matrix,
 };
 #[cfg(feature = "linalg")]
 use num_rs_core::{eigen as core_eigen, qr as core_qr, solve as core_solve, svd as core_svd};
@@ -180,7 +180,11 @@ pub fn transpose(matrix: &Matrix) -> Result<Matrix> {
 
 #[napi(js_name = "broadcast_to")]
 pub fn broadcast_to(matrix: &Matrix, rows: u32, cols: u32) -> Result<Matrix> {
-    map_matrix(core_broadcast_to(matrix.buffer(), rows as usize, cols as usize))
+    map_matrix(core_broadcast_to(
+        matrix.buffer(),
+        rows as usize,
+        cols as usize,
+    ))
 }
 
 #[napi]
@@ -326,8 +330,7 @@ pub fn sum_pairwise(matrix: &Matrix) -> f64 {
 
 #[napi]
 pub fn dot_pairwise(a: &Matrix, b: &Matrix) -> Result<f64> {
-    core_dot_pairwise(a.buffer(), b.buffer())
-        .map_err(|e| Error::from_reason(e))
+    core_dot_pairwise(a.buffer(), b.buffer()).map_err(|e| Error::from_reason(e))
 }
 
 fn convert_indices(indices: &[i64]) -> Result<Vec<isize>> {

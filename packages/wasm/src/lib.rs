@@ -283,8 +283,7 @@ pub fn sum_pairwise(matrix: &Matrix) -> f64 {
 
 #[wasm_bindgen]
 pub fn dot_pairwise(a: &Matrix, b: &Matrix) -> Result<f64, JsValue> {
-    core_dot_pairwise(a.buffer(), b.buffer())
-        .map_err(|e| JsValue::from_str(&e))
+    core_dot_pairwise(a.buffer(), b.buffer()).map_err(|e| JsValue::from_str(&e))
 }
 
 #[cfg(test)]
@@ -301,5 +300,4 @@ mod tests {
         let combined = concat(&matrix, &Matrix::from_buffer(buffer), 0).unwrap();
         assert_eq!(combined.fixed_scale(), Some(2));
     }
-
 }

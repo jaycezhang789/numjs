@@ -1,6 +1,7 @@
 pub mod buffer;
 pub mod dtype;
 pub mod element;
+mod macros;
 pub mod metrics;
 
 use buffer::MatrixBuffer;
@@ -69,7 +70,11 @@ pub fn welford_mean_variance(buffer: &MatrixBuffer, sample: bool) -> (f64, f64) 
     if n < 1.0 {
         return (f64::NAN, f64::NAN);
     }
-    let var = if sample && n > 1.0 { m2 / (n - 1.0) } else { m2 / n };
+    let var = if sample && n > 1.0 {
+        m2 / (n - 1.0)
+    } else {
+        m2 / n
+    };
     (mean, var)
 }
 
@@ -623,7 +628,9 @@ pub fn read_npy_matrix(data: &[u8]) -> CoreResult<MatrixBuffer> {
 #[cfg(feature = "npy")]
 pub fn write_npy_matrix(buffer: &MatrixBuffer) -> CoreResult<Vec<u8>> {
     if buffer.dtype() == DType::Fixed64 {
-        return Err("write_npy(Fixed64): convert to float64 or serialise bigint payload manually".into());
+        return Err(
+            "write_npy(Fixed64): convert to float64 or serialise bigint payload manually".into(),
+        );
     }
     let array = Array2::from_shape_vec((buffer.rows(), buffer.cols()), buffer.to_f64_vec())
         .map_err(|_| "write_npy: failed to reshape matrix")?;
@@ -852,13 +859,19 @@ mod tests {
         let naive: f64 = buf.to_f64_vec().iter().sum();
         let stable = sum_pairwise(&buf);
         // naive may be 1.0 or 0.0 depending on accumulation; stable should be 3.0 or close
-        assert!(stable > 0.5, "stable sum too small: {} (naive={})", stable, naive);
+        assert!(
+            stable > 0.5,
+            "stable sum too small: {} (naive={})",
+            stable,
+            naive
+        );
     }
 
     #[test]
     fn test_welford_mean_var() {
         let data: Vec<f64> = (0..1000).map(|i| (i as f64) / 10.0).collect();
-        let buf = MatrixBuffer::from_f64_vec(crate::dtype::DType::Float64, 1, data.len(), data).unwrap();
+        let buf =
+            MatrixBuffer::from_f64_vec(crate::dtype::DType::Float64, 1, data.len(), data).unwrap();
         let (mean, var) = welford_mean_variance(&buf, false);
         assert!((mean - 49.95).abs() < 1e-9);
         assert!(var > 0.0);
@@ -907,8 +920,7 @@ mod tests {
 
     #[test]
     fn test_fixed64_transpose_preserves_scale() {
-        let base =
-            MatrixBuffer::from_fixed_i64_vec(vec![100, 200, 300, 400], 2, 2, 1).unwrap();
+        let base = MatrixBuffer::from_fixed_i64_vec(vec![100, 200, 300, 400], 2, 2, 1).unwrap();
         let transposed = transpose(&base).expect("transpose");
         assert_eq!(transposed.fixed_scale(), Some(1));
         assert_eq!(transposed.rows(), 2);
@@ -923,8 +935,9 @@ mod tests {
         assert_eq!(expanded.fixed_scale(), Some(2));
         assert_eq!(expanded.rows(), 3);
         assert_eq!(expanded.cols(), 2);
-        assert_eq!(expanded.to_f64_vec(), vec![10.5, 20.5, 10.5, 20.5, 10.5, 20.5]);
+        assert_eq!(
+            expanded.to_f64_vec(),
+            vec![10.5, 20.5, 10.5, 20.5, 10.5, 20.5]
+        );
     }
 }
-
-
