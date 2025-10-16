@@ -10,6 +10,7 @@ use num_rs_core::{
 };
 use std::convert::TryFrom;
 use std::str::FromStr;
+use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -108,8 +109,16 @@ impl Matrix {
     }
 
     #[wasm_bindgen(js_name = "to_bytes")]
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.buffer.to_contiguous_bytes_vec()
+    pub fn to_bytes(&self) -> Result<Uint8Array, JsValue> {
+        if let Some(bytes) = self.buffer.as_byte_slice() {
+            // SAFETY: the slice references memory owned by this matrix. The caller must ensure
+            // the matrix outlives the typed array view.
+            let view = unsafe { Uint8Array::view(bytes) };
+            Ok(view)
+        } else {
+            let data = self.buffer.to_contiguous_bytes_vec();
+            Ok(Uint8Array::from(data.as_slice()))
+        }
     }
 
     #[wasm_bindgen(js_name = "fromFixedI64")]

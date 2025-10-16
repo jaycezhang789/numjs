@@ -1,4 +1,4 @@
-use napi::bindgen_prelude::{BigInt64Array, Buffer, Env, Error, Float64Array, Result};
+use napi::bindgen_prelude::{BigInt64Array, Buffer, Env, Error, Float64Array, Result, TypedArrayType};
 use napi::JsObject;
 use napi_derive::napi;
 
@@ -15,6 +15,8 @@ use num_rs_core::{
 #[cfg(feature = "linalg")]
 use num_rs_core::{eigen as core_eigen, qr as core_qr, solve as core_solve, svd as core_svd};
 use std::convert::TryFrom;
+use std::ptr;
+use std::sync::Arc;
 
 #[derive(Clone)]
 #[napi]
@@ -113,8 +115,39 @@ impl Matrix {
     }
 
     #[napi]
-    pub fn to_bytes(&self) -> Buffer {
-        Buffer::from(self.buffer.to_contiguous_bytes_vec())
+    pub fn to_bytes(&self, env: Env) -> Result<JsObject> {
+        let (arc, offset_bytes, len_bytes) = match self.buffer.try_as_byte_arc() {
+            Some(view) => view,
+            None => {
+                let owned = Arc::new(self.buffer.to_contiguous_bytes_vec());
+                let len = owned.len();
+                (owned, 0usize, len)
+            }
+        };
+
+        let holder = arc.clone();
+        let ptr = if len_bytes == 0 {
+            ptr::null_mut()
+        } else {
+            unsafe {
+                Arc::as_ref(&arc)
+                    .as_ptr()
+                    .add(offset_bytes) as *mut u8
+            }
+        };
+
+        let arraybuffer = unsafe {
+            env.create_arraybuffer_with_borrowed_data(
+                ptr,
+                len_bytes,
+                holder,
+                |arc: Arc<Vec<u8>>, _env: Env| drop(arc),
+            )?
+        };
+        let typed = arraybuffer
+            .into_raw()
+            .into_typedarray(TypedArrayType::Uint8, len_bytes, 0)?;
+        typed.into_unknown().coerce_to_object()
     }
 }
 

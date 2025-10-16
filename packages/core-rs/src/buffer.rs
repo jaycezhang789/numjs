@@ -502,6 +502,22 @@ impl MatrixBuffer {
         bytes
     }
 
+    pub fn try_as_byte_arc(&self) -> Option<(Arc<Vec<u8>>, usize, usize)> {
+        if !self.is_standard_layout() {
+            return None;
+        }
+        if self.offset < 0 {
+            return None;
+        }
+        let elem_size = self.element_size();
+        let offset_bytes = (self.offset as usize).checked_mul(elem_size)?;
+        let len_bytes = self.len().checked_mul(elem_size)?;
+        if offset_bytes + len_bytes > self.data.len() {
+            return None;
+        }
+        Some((self.data.clone(), offset_bytes, len_bytes))
+    }
+
     fn from_bytes_like(&self, rows: usize, cols: usize, data: Vec<u8>) -> Result<Self, String> {
         if self.dtype == DType::Fixed64 {
             MatrixBuffer::from_bytes_with_scale(self.dtype, rows, cols, data, self.fixed_scale)

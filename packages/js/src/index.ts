@@ -690,44 +690,76 @@ function elementCount(data: MatrixInputData): number {
 }
 
 function typedArrayFromBytes(bytes: Uint8Array, dtype: DType): TypedArray {
-  const view = bytes.slice();
-  const buffer = view.buffer;
+  const { buffer, byteOffset, byteLength } = bytes;
   switch (dtype) {
     case "float64":
-      return new Float64Array(buffer);
+      return new Float64Array(
+        buffer,
+        byteOffset,
+        byteLength / Float64Array.BYTES_PER_ELEMENT
+      );
     case "float32":
-      return new Float32Array(buffer);
+      return new Float32Array(
+        buffer,
+        byteOffset,
+        byteLength / Float32Array.BYTES_PER_ELEMENT
+      );
     case "int8":
-      return new Int8Array(buffer);
+      return new Int8Array(buffer, byteOffset, byteLength);
     case "int16":
-      return new Int16Array(buffer);
+      return new Int16Array(
+        buffer,
+        byteOffset,
+        byteLength / Int16Array.BYTES_PER_ELEMENT
+      );
     case "int32":
-      return new Int32Array(buffer);
+      return new Int32Array(
+        buffer,
+        byteOffset,
+        byteLength / Int32Array.BYTES_PER_ELEMENT
+      );
     case "int64":
-      return new BigInt64Array(buffer);
+      return new BigInt64Array(
+        buffer,
+        byteOffset,
+        byteLength / BigInt64Array.BYTES_PER_ELEMENT
+      );
     case "uint8":
-      return view;
+      return new Uint8Array(buffer, byteOffset, byteLength);
     case "uint16":
-      return new Uint16Array(buffer);
+      return new Uint16Array(
+        buffer,
+        byteOffset,
+        byteLength / Uint16Array.BYTES_PER_ELEMENT
+      );
     case "uint32":
-      return new Uint32Array(buffer);
+      return new Uint32Array(
+        buffer,
+        byteOffset,
+        byteLength / Uint32Array.BYTES_PER_ELEMENT
+      );
     case "uint64":
-      return new BigUint64Array(buffer);
+      return new BigUint64Array(
+        buffer,
+        byteOffset,
+        byteLength / BigUint64Array.BYTES_PER_ELEMENT
+      );
     case "fixed64":
-      return new BigInt64Array(buffer);
+      return new BigInt64Array(
+        buffer,
+        byteOffset,
+        byteLength / BigInt64Array.BYTES_PER_ELEMENT
+      );
     case "bool":
-      return Uint8Array.from(view, (value) => (value !== 0 ? 1 : 0));
+      return new Uint8Array(buffer, byteOffset, byteLength);
     default:
-      return view;
+      return new Uint8Array(buffer, byteOffset, byteLength);
   }
 }
 
 function handleToTypedArray(handle: BackendMatrixHandle): TypedArray {
-  const dtype = getMatrixDTypeFromHandle(handle);
-  if (dtype === "float64") {
-    return handleToFloat64(handle);
-  }
   const bytes = callHandleToBytes(handle);
+  const dtype = getMatrixDTypeFromHandle(handle);
   return typedArrayFromBytes(bytes, dtype);
 }
 
