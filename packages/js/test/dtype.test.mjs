@@ -104,6 +104,36 @@ test("Matrix.astype reinterprets same-width dtype without copy", () => {
   }
 });
 
+test("Matrix.astype respects casting=safe constraints", () => {
+  const matrix = new Matrix([1, 2], 1, 2).astype("int32");
+  assert.throws(
+    () => matrix.astype("int16", { casting: "safe" }),
+    /casting='safe'/
+  );
+});
+
+test("Matrix.astype supports rounding and clipping strategies", () => {
+  const matrix = new Matrix([1.9, -1.2, -0.1], 1, 3);
+  const rounded = matrix.astype("int32", { casting: "round_floor|clip" });
+  assert.equal(rounded.dtype, "int32");
+  assert.deepEqual(Array.from(rounded.toArray()), [1, -2, -1]);
+});
+
+test("Matrix.astype wraps integer overflow when requested", () => {
+  const matrix = new Matrix([260, -5], 1, 2);
+  const wrapped = matrix.astype("uint8", { casting: "round_trunc|wrap" });
+  assert.equal(wrapped.dtype, "uint8");
+  assert.deepEqual(Array.from(wrapped.toArray()), [4, 251]);
+});
+
+test("Matrix.astype requires explicit rounding for float-to-int casts when casting is specified", () => {
+  const matrix = new Matrix([1.2], 1, 1);
+  assert.throws(
+    () => matrix.astype("int32", { casting: "clip" }),
+    /rounding mode/
+  );
+});
+
 test("Binary ops promote dtypes using promotion table", () => {
   const lhs = new Matrix([1, 2], 1, 2).astype("int16");
   const rhs = new Matrix([3, 4], 1, 2).astype("uint8");

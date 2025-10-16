@@ -257,14 +257,12 @@ pub fn dot(
     let left_cast = if a.dtype() == mul_dtype {
         a.to_contiguous()?
     } else {
-        a.cast(mul_dtype)?
-            .to_contiguous()?
+        a.cast(mul_dtype)?.to_contiguous()?
     };
     let right_cast = if b.dtype() == mul_dtype {
         b.to_contiguous()?
     } else {
-        b.cast(mul_dtype)?
-            .to_contiguous()?
+        b.cast(mul_dtype)?.to_contiguous()?
     };
 
     let result = match mul_dtype {
@@ -659,9 +657,9 @@ pub fn neg(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
             let std = matrix.to_contiguous()?;
             neg_signed_numeric::<i64>(&std)
         }
-        DType::UInt8 | DType::UInt16 | DType::UInt32 | DType::UInt64 => Err(
-            "neg: unsigned dtypes are not supported; cast to a signed dtype first".into(),
-        ),
+        DType::UInt8 | DType::UInt16 | DType::UInt32 | DType::UInt64 => {
+            Err("neg: unsigned dtypes are not supported; cast to a signed dtype first".into())
+        }
         DType::Float32 => {
             let std = matrix.to_contiguous()?;
             neg_float_numeric::<f32>(&std)

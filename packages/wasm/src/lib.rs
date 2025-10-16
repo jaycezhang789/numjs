@@ -1,11 +1,12 @@
-use num_rs_core::buffer::MatrixBuffer;
+use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer};
 use num_rs_core::dtype::DType;
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
     div as core_div, dot as core_dot, gather as core_gather, gather_pairs as core_gather_pairs,
-    matmul as core_matmul, mul as core_mul, neg as core_neg, put as core_put, scatter as core_scatter,
-    scatter_pairs as core_scatter_pairs, stack as core_stack, sub as core_sub, sum as core_sum,
-    take as core_take, transpose as core_transpose, where_select as core_where,
+    matmul as core_matmul, mul as core_mul, neg as core_neg, put as core_put,
+    scatter as core_scatter, scatter_pairs as core_scatter_pairs, stack as core_stack,
+    sub as core_sub, sum as core_sum, take as core_take, transpose as core_transpose,
+    where_select as core_where,
 };
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -64,9 +65,16 @@ impl Matrix {
     }
 
     #[wasm_bindgen]
-    pub fn astype(&self, dtype: String, copy: Option<bool>) -> Result<Matrix, JsValue> {
+    pub fn astype(
+        &self,
+        dtype: String,
+        copy: Option<bool>,
+        casting: Option<String>,
+    ) -> Result<Matrix, JsValue> {
         let dtype = DType::from_str(&dtype).map_err(|err| JsValue::from_str(&err))?;
         let copy = copy.unwrap_or(false);
+        let options =
+            CastOptions::parse(casting.as_deref()).map_err(|err| JsValue::from_str(&err))?;
         if dtype == self.buffer.dtype() {
             if copy {
                 let buffer = self
@@ -77,7 +85,10 @@ impl Matrix {
             }
             return Ok(Matrix::from_buffer(self.buffer.clone()));
         }
-        if !copy && dtype.size_of() == self.buffer.dtype().size_of() {
+        if !copy
+            && matches!(options.casting(), CastingKind::Unsafe)
+            && dtype.size_of() == self.buffer.dtype().size_of()
+        {
             let buffer = self
                 .buffer
                 .reinterpret(dtype)
@@ -86,7 +97,7 @@ impl Matrix {
         }
         let buffer = self
             .buffer
-            .cast(dtype)
+            .cast_with_options(dtype, &options)
             .map_err(|err| JsValue::from_str(&err))?;
         Ok(Matrix::from_buffer(buffer))
     }

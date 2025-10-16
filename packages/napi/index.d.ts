@@ -41,7 +41,7 @@ export class Matrix {
   get cols(): number
   get dtype(): string
   get fixedScale(): number | null
-  astype(dtype: string, copy?: boolean | undefined | null): Matrix
+  astype(dtype: string, copy?: boolean | undefined | null, casting?: string | undefined | null): Matrix
   toVec(): Float64Array
   toBytes(): Buffer
 }

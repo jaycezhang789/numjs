@@ -2,7 +2,7 @@ use napi::bindgen_prelude::{BigInt64Array, Buffer, Env, Error, Float64Array, Res
 use napi::JsObject;
 use napi_derive::napi;
 
-use num_rs_core::buffer::MatrixBuffer;
+use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer};
 use num_rs_core::dtype::DType;
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
@@ -74,9 +74,15 @@ impl Matrix {
     }
 
     #[napi]
-    pub fn astype(&self, dtype: String, copy: Option<bool>) -> Result<Self> {
+    pub fn astype(
+        &self,
+        dtype: String,
+        copy: Option<bool>,
+        casting: Option<String>,
+    ) -> Result<Self> {
         let dtype: DType = dtype.parse().map_err(Error::from_reason)?;
         let copy = copy.unwrap_or(false);
+        let options = CastOptions::parse(casting.as_deref()).map_err(Error::from_reason)?;
         if dtype == self.buffer.dtype() {
             if copy {
                 let buffer = self
@@ -87,11 +93,17 @@ impl Matrix {
             }
             return Ok(Matrix::from_buffer(self.buffer.clone()));
         }
-        if !copy && dtype.size_of() == self.buffer.dtype().size_of() {
+        if !copy
+            && matches!(options.casting(), CastingKind::Unsafe)
+            && dtype.size_of() == self.buffer.dtype().size_of()
+        {
             let buffer = self.buffer.reinterpret(dtype).map_err(Error::from_reason)?;
             return Ok(Matrix::from_buffer(buffer));
         }
-        let buffer = self.buffer.cast(dtype).map_err(Error::from_reason)?;
+        let buffer = self
+            .buffer
+            .cast_with_options(dtype, &options)
+            .map_err(Error::from_reason)?;
         Ok(Matrix::from_buffer(buffer))
     }
 

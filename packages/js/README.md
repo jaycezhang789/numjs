@@ -33,7 +33,7 @@ console.log(matmul(a, b.transpose()).toArray());
 
 ### Common Operations
 - `Matrix.fromArray(data, rows, cols, dtype?)` to build matrices from plain arrays or typed arrays.
-- `matrix.astype("float32")` to cast between dtypes (copy-on-write when possible).
+- `matrix.astype("float32", { casting: "round_floor|clip" })` to cast between dtypes with explicit rounding/overflow strategies.
 - `whereSelect(condition, truthy, falsy)` for broadcasted conditional selection.
 - `concat(matrixA, matrixB, axis)` / `stack(matrixA, matrixB, axis)` for joins with dtype promotion.
 - `matrix.transpose()` / `transpose(matrix)` for zero-copy axis swaps.

@@ -1,6 +1,7 @@
 use crate::dtype::DType;
 use crate::element::Element;
 use crate::metrics::record_copy_bytes;
+use num_traits::{Bounded, Float, NumCast, PrimInt, Signed, Unsigned};
 use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::fmt::Write;
@@ -40,6 +41,165 @@ impl SliceSpec {
             end: None,
             step: 1,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastingKind {
+    Safe,
+    SameKind,
+    Unsafe,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverflowMode {
+    Error,
+    Clip,
+    Wrap,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundingMode {
+    HalfAwayFromZero,
+    HalfEven,
+    Floor,
+    Ceil,
+    Trunc,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CastOptions {
+    casting: CastingKind,
+    overflow: OverflowMode,
+    rounding: Option<RoundingMode>,
+}
+
+impl Default for CastOptions {
+    fn default() -> Self {
+        CastOptions {
+            casting: CastingKind::Unsafe,
+            overflow: OverflowMode::Clip,
+            rounding: Some(RoundingMode::HalfAwayFromZero),
+        }
+    }
+}
+
+impl CastOptions {
+    pub fn parse(spec: Option<&str>) -> Result<Self, String> {
+        match spec {
+            None => Ok(CastOptions::default()),
+            Some(raw) => {
+                let mut options = CastOptions {
+                    casting: CastingKind::Unsafe,
+                    overflow: OverflowMode::Clip,
+                    rounding: None,
+                };
+                let mut casting_set = false;
+                let mut overflow_set = false;
+                let mut rounding_set = false;
+                for token in raw
+                    .split(|c: char| c == '|' || c == ',' || c.is_whitespace())
+                    .filter(|token| !token.is_empty())
+                {
+                    let t = token.to_ascii_lowercase();
+                    match t.as_str() {
+                        "safe" => {
+                            if casting_set {
+                                return Err("casting: multiple casting modes specified".into());
+                            }
+                            casting_set = true;
+                            options.casting = CastingKind::Safe;
+                        }
+                        "same_kind" | "samekind" => {
+                            if casting_set {
+                                return Err("casting: multiple casting modes specified".into());
+                            }
+                            casting_set = true;
+                            options.casting = CastingKind::SameKind;
+                        }
+                        "unsafe" => {
+                            if casting_set {
+                                return Err("casting: multiple casting modes specified".into());
+                            }
+                            casting_set = true;
+                            options.casting = CastingKind::Unsafe;
+                        }
+                        "clip" => {
+                            if overflow_set {
+                                return Err("casting: multiple overflow modes specified".into());
+                            }
+                            overflow_set = true;
+                            options.overflow = OverflowMode::Clip;
+                        }
+                        "wrap" => {
+                            if overflow_set {
+                                return Err("casting: multiple overflow modes specified".into());
+                            }
+                            overflow_set = true;
+                            options.overflow = OverflowMode::Wrap;
+                        }
+                        "error" | "strict" => {
+                            if overflow_set {
+                                return Err("casting: multiple overflow modes specified".into());
+                            }
+                            overflow_set = true;
+                            options.overflow = OverflowMode::Error;
+                        }
+                        "round_half_away" | "round_half_up" | "round_nearest" => {
+                            if rounding_set {
+                                return Err("casting: multiple rounding modes specified".into());
+                            }
+                            rounding_set = true;
+                            options.rounding = Some(RoundingMode::HalfAwayFromZero);
+                        }
+                        "round_half_even" | "round_bankers" => {
+                            if rounding_set {
+                                return Err("casting: multiple rounding modes specified".into());
+                            }
+                            rounding_set = true;
+                            options.rounding = Some(RoundingMode::HalfEven);
+                        }
+                        "round_floor" => {
+                            if rounding_set {
+                                return Err("casting: multiple rounding modes specified".into());
+                            }
+                            rounding_set = true;
+                            options.rounding = Some(RoundingMode::Floor);
+                        }
+                        "round_ceil" => {
+                            if rounding_set {
+                                return Err("casting: multiple rounding modes specified".into());
+                            }
+                            rounding_set = true;
+                            options.rounding = Some(RoundingMode::Ceil);
+                        }
+                        "round_trunc" | "round_towards_zero" | "round_zero" => {
+                            if rounding_set {
+                                return Err("casting: multiple rounding modes specified".into());
+                            }
+                            rounding_set = true;
+                            options.rounding = Some(RoundingMode::Trunc);
+                        }
+                        other => {
+                            return Err(format!("casting: unrecognized token '{other}'"));
+                        }
+                    }
+                }
+                Ok(options)
+            }
+        }
+    }
+
+    pub fn casting(&self) -> CastingKind {
+        self.casting
+    }
+
+    pub fn overflow(&self) -> OverflowMode {
+        self.overflow
+    }
+
+    pub fn rounding(&self) -> Option<RoundingMode> {
+        self.rounding
     }
 }
 
@@ -394,37 +554,38 @@ impl MatrixBuffer {
     }
 
     pub fn cast(&self, target: DType) -> Result<Self, String> {
+        self.cast_with_options(target, &CastOptions::default())
+    }
+
+    pub fn cast_with_spec(&self, target: DType, casting: Option<&str>) -> Result<Self, String> {
+        let options = CastOptions::parse(casting)?;
+        self.cast_with_options(target, &options)
+    }
+
+    pub fn cast_with_options(&self, target: DType, options: &CastOptions) -> Result<Self, String> {
         if target == self.dtype {
             return Ok(self.clone());
         }
+        validate_casting_mode(self.dtype, target, options)?;
+        if target == DType::Fixed64 {
+            return Err(
+                "cast: casting to fixed64 not supported; construct with from_fixed_i64_vec".into(),
+            );
+        }
         record_copy_bytes(self.len() * target.size_of());
         match target {
-            DType::Bool => {
-                let vec: Vec<bool> = self.to_bool_vec();
-                MatrixBuffer::from_vec(vec, self.rows, self.cols)
-            }
-            DType::Int8 => cast_from_f64(self, i8::MIN as f64, i8::MAX as f64, |v| v.round() as i8),
-            DType::Int16 => {
-                cast_from_f64(self, i16::MIN as f64, i16::MAX as f64, |v| v.round() as i16)
-            }
-            DType::Int32 => {
-                cast_from_f64(self, i32::MIN as f64, i32::MAX as f64, |v| v.round() as i32)
-            }
-            DType::Int64 => {
-                cast_from_f64(self, i64::MIN as f64, i64::MAX as f64, |v| v.round() as i64)
-            }
-            DType::UInt8 => cast_from_f64(self, 0.0, u8::MAX as f64, |v| v.round() as u8),
-            DType::UInt16 => cast_from_f64(self, 0.0, u16::MAX as f64, |v| v.round() as u16),
-            DType::UInt32 => cast_from_f64(self, 0.0, u32::MAX as f64, |v| v.round() as u32),
-            DType::UInt64 => cast_from_f64(self, 0.0, u64::MAX as f64, |v| v.round() as u64),
-            DType::Float32 => {
-                let vec: Vec<f32> = self.to_f64_vec().into_iter().map(|v| v as f32).collect();
-                MatrixBuffer::from_vec(vec, self.rows, self.cols)
-            }
-            DType::Float64 => MatrixBuffer::from_vec(self.to_f64_vec(), self.rows, self.cols),
-            DType::Fixed64 => Err(
-                "cast: casting to fixed64 not supported; construct with from_fixed_i64_vec".into(),
-            ),
+            DType::Bool => cast_to_bool(self, options),
+            DType::Int8 => cast_to_signed::<i8>(self, options),
+            DType::Int16 => cast_to_signed::<i16>(self, options),
+            DType::Int32 => cast_to_signed::<i32>(self, options),
+            DType::Int64 => cast_to_signed::<i64>(self, options),
+            DType::UInt8 => cast_to_unsigned::<u8>(self, options),
+            DType::UInt16 => cast_to_unsigned::<u16>(self, options),
+            DType::UInt32 => cast_to_unsigned::<u32>(self, options),
+            DType::UInt64 => cast_to_unsigned::<u64>(self, options),
+            DType::Float32 => cast_to_float::<f32>(self, options),
+            DType::Float64 => cast_to_float::<f64>(self, options),
+            DType::Fixed64 => unreachable!(),
         }
     }
 
@@ -482,51 +643,16 @@ impl MatrixBuffer {
         cols: usize,
         data: Vec<f64>,
     ) -> Result<Self, String> {
-        match dtype {
-            DType::Bool => {
-                let vec: Vec<bool> = data.into_iter().map(|v| v != 0.0).collect();
-                Self::from_vec(vec, rows, cols)
-            }
-            DType::Int8 => {
-                cast_vec_to_dtype(data, rows, cols, i8::MIN as f64, i8::MAX as f64, |v| {
-                    v.round() as i8
-                })
-            }
-            DType::Int16 => {
-                cast_vec_to_dtype(data, rows, cols, i16::MIN as f64, i16::MAX as f64, |v| {
-                    v.round() as i16
-                })
-            }
-            DType::Int32 => {
-                cast_vec_to_dtype(data, rows, cols, i32::MIN as f64, i32::MAX as f64, |v| {
-                    v.round() as i32
-                })
-            }
-            DType::Int64 => {
-                cast_vec_to_dtype(data, rows, cols, i64::MIN as f64, i64::MAX as f64, |v| {
-                    v.round() as i64
-                })
-            }
-            DType::UInt8 => {
-                cast_vec_to_dtype(data, rows, cols, 0.0, u8::MAX as f64, |v| v.round() as u8)
-            }
-            DType::UInt16 => {
-                cast_vec_to_dtype(data, rows, cols, 0.0, u16::MAX as f64, |v| v.round() as u16)
-            }
-            DType::UInt32 => {
-                cast_vec_to_dtype(data, rows, cols, 0.0, u32::MAX as f64, |v| v.round() as u32)
-            }
-            DType::UInt64 => {
-                cast_vec_to_dtype(data, rows, cols, 0.0, u64::MAX as f64, |v| v.round() as u64)
-            }
-            DType::Float32 => {
-                let vec: Vec<f32> = data.into_iter().map(|v| v as f32).collect();
-                Self::from_vec(vec, rows, cols)
-            }
-            DType::Float64 => Self::from_vec(data, rows, cols),
-            DType::Fixed64 => {
-                Err("from_f64_vec(Fixed64): requires explicit scale; use from_fixed_i64_vec".into())
-            }
+        if dtype == DType::Fixed64 {
+            return Err(
+                "from_f64_vec(Fixed64): requires explicit scale; use from_fixed_i64_vec".into(),
+            );
+        }
+        let base = MatrixBuffer::from_vec(data, rows, cols)?;
+        if dtype == DType::Float64 {
+            Ok(base)
+        } else {
+            base.cast_with_options(dtype, &CastOptions::default())
         }
     }
 
@@ -908,41 +1034,325 @@ impl MatrixBuffer {
     }
 }
 
-fn cast_from_f64<T>(
-    buffer: &MatrixBuffer,
-    min: f64,
-    max: f64,
-    map: impl Fn(f64) -> T,
-) -> Result<MatrixBuffer, String>
-where
-    T: Element,
-{
-    let vec: Vec<T> = buffer
-        .to_f64_vec()
-        .into_iter()
-        .map(|v| clamp_float(v, min, max))
-        .map(map)
-        .collect();
+fn cast_to_bool(buffer: &MatrixBuffer, _options: &CastOptions) -> Result<MatrixBuffer, String> {
+    let vec: Vec<bool> = buffer.to_f64_vec().into_iter().map(|v| v != 0.0).collect();
     MatrixBuffer::from_vec(vec, buffer.rows, buffer.cols)
 }
 
-fn cast_vec_to_dtype<T>(
-    data: Vec<f64>,
-    rows: usize,
-    cols: usize,
-    min: f64,
-    max: f64,
-    map: impl Fn(f64) -> T,
-) -> Result<MatrixBuffer, String>
+fn cast_to_float<F>(buffer: &MatrixBuffer, _options: &CastOptions) -> Result<MatrixBuffer, String>
 where
-    T: Element,
+    F: Element + Float + NumCast,
 {
-    let vec: Vec<T> = data
-        .into_iter()
-        .map(|v| clamp_float(v, min, max))
-        .map(map)
-        .collect();
-    MatrixBuffer::from_vec(vec, rows, cols)
+    let mut out = Vec::<F>::with_capacity(buffer.len());
+    for value in buffer.to_f64_vec() {
+        let casted: F = NumCast::from(value).ok_or_else(|| {
+            format!(
+                "cast({:?}->{:?}): value {value} cannot be represented",
+                buffer.dtype(),
+                F::DTYPE
+            )
+        })?;
+        out.push(casted);
+    }
+    MatrixBuffer::from_vec(out, buffer.rows, buffer.cols)
+}
+
+fn cast_to_signed<T>(buffer: &MatrixBuffer, options: &CastOptions) -> Result<MatrixBuffer, String>
+where
+    T: Element + PrimInt + Signed + Bounded + NumCast,
+{
+    let src_dtype = buffer.dtype();
+    let dst_dtype = T::DTYPE;
+    let mut out = Vec::<T>::with_capacity(buffer.len());
+    let values = buffer.to_f64_vec();
+    let rounding_required = matches!(src_dtype, DType::Float32 | DType::Float64 | DType::Fixed64);
+    let rounding_mode = if rounding_required {
+        options
+            .rounding()
+            .ok_or_else(|| float_to_int_rounding_error(src_dtype, dst_dtype))?
+    } else {
+        options.rounding().unwrap_or(RoundingMode::Trunc)
+    };
+    let min: f64 = NumCast::from(T::min_value())
+        .expect("signed minimum convertible to f64");
+    let max: f64 = NumCast::from(T::max_value())
+        .expect("signed maximum convertible to f64");
+    let span = (max - min) + 1.0;
+    for (idx, mut value) in values.into_iter().enumerate() {
+        if value.is_nan() {
+            return Err(nan_to_int_error(src_dtype, dst_dtype, idx));
+        }
+        if rounding_required || options.rounding().is_some() {
+            value = apply_rounding(value, rounding_mode);
+        }
+        if !value.is_finite() {
+            match options.overflow() {
+                OverflowMode::Clip => {
+                    value = if value.is_sign_positive() { max } else { min };
+                }
+                OverflowMode::Wrap | OverflowMode::Error => {
+                    return Err(non_finite_error(src_dtype, dst_dtype, idx));
+                }
+            }
+        }
+        let coerced = match options.overflow() {
+            OverflowMode::Error => {
+                if value < min || value > max {
+                    return Err(range_error(value, src_dtype, dst_dtype, idx));
+                }
+                value
+            }
+            OverflowMode::Clip => value.clamp(min, max),
+            OverflowMode::Wrap => wrap_value(value, min, span),
+        };
+        let integer = coerced.round();
+        let casted: T = NumCast::from(integer)
+            .ok_or_else(|| range_error(integer, src_dtype, dst_dtype, idx))?;
+        out.push(casted);
+    }
+    MatrixBuffer::from_vec(out, buffer.rows, buffer.cols)
+}
+
+fn cast_to_unsigned<T>(buffer: &MatrixBuffer, options: &CastOptions) -> Result<MatrixBuffer, String>
+where
+    T: Element + PrimInt + Unsigned + Bounded + NumCast,
+{
+    let src_dtype = buffer.dtype();
+    let dst_dtype = T::DTYPE;
+    let mut out = Vec::<T>::with_capacity(buffer.len());
+    let values = buffer.to_f64_vec();
+    let rounding_required = matches!(src_dtype, DType::Float32 | DType::Float64 | DType::Fixed64);
+    let rounding_mode = if rounding_required {
+        options
+            .rounding()
+            .ok_or_else(|| float_to_int_rounding_error(src_dtype, dst_dtype))?
+    } else {
+        options.rounding().unwrap_or(RoundingMode::Trunc)
+    };
+    let min = 0.0;
+    let max: f64 = NumCast::from(T::max_value())
+        .expect("unsigned maximum convertible to f64");
+    let span = max + 1.0;
+    for (idx, mut value) in values.into_iter().enumerate() {
+        if value.is_nan() {
+            return Err(nan_to_int_error(src_dtype, dst_dtype, idx));
+        }
+        if rounding_required || options.rounding().is_some() {
+            value = apply_rounding(value, rounding_mode);
+        }
+        if !value.is_finite() {
+            match options.overflow() {
+                OverflowMode::Clip => {
+                    value = if value.is_sign_positive() { max } else { min };
+                }
+                OverflowMode::Wrap | OverflowMode::Error => {
+                    return Err(non_finite_error(src_dtype, dst_dtype, idx));
+                }
+            }
+        }
+        let coerced = match options.overflow() {
+            OverflowMode::Error => {
+                if value < min || value > max {
+                    return Err(range_error(value, src_dtype, dst_dtype, idx));
+                }
+                value
+            }
+            OverflowMode::Clip => value.clamp(min, max),
+            OverflowMode::Wrap => wrap_value(value, min, span),
+        };
+        let integer = coerced.round();
+        let casted: T = NumCast::from(integer)
+            .ok_or_else(|| range_error(integer, src_dtype, dst_dtype, idx))?;
+        out.push(casted);
+    }
+    MatrixBuffer::from_vec(out, buffer.rows, buffer.cols)
+}
+
+fn wrap_value(value: f64, min: f64, span: f64) -> f64 {
+    if span <= 0.0 {
+        min
+    } else {
+        ((value - min).rem_euclid(span)) + min
+    }
+}
+
+fn apply_rounding(value: f64, mode: RoundingMode) -> f64 {
+    match mode {
+        RoundingMode::HalfAwayFromZero => value.round(),
+        RoundingMode::HalfEven => round_half_even(value),
+        RoundingMode::Floor => value.floor(),
+        RoundingMode::Ceil => value.ceil(),
+        RoundingMode::Trunc => value.trunc(),
+    }
+}
+
+fn round_half_even(value: f64) -> f64 {
+    const EPS: f64 = 1e-12;
+    let rounded = value.round();
+    let floor = value.floor();
+    let ceil = value.ceil();
+    let diff_floor = (value - floor).abs();
+    if (diff_floor - 0.5).abs() <= EPS {
+        let floor_even = (floor as i128) % 2 == 0;
+        return if floor_even { floor } else { ceil };
+    }
+    let diff_ceil = (value - ceil).abs();
+    if (diff_ceil - 0.5).abs() <= EPS {
+        let ceil_even = (ceil as i128) % 2 == 0;
+        return if ceil_even { ceil } else { floor };
+    }
+    rounded
+}
+
+fn float_to_int_rounding_error(src: DType, dst: DType) -> String {
+    format!(
+        "cast({src:?}->{dst:?}): float to integer casts require a rounding mode (casting=\"round_*\")"
+    )
+}
+
+fn nan_to_int_error(src: DType, dst: DType, index: usize) -> String {
+    format!("cast({src:?}->{dst:?}): NaN cannot be represented as an integer (index {index})")
+}
+
+fn non_finite_error(src: DType, dst: DType, index: usize) -> String {
+    format!("cast({src:?}->{dst:?}): non-finite value cannot be represented (index {index})")
+}
+
+fn range_error<V: std::fmt::Display>(value: V, src: DType, dst: DType, index: usize) -> String {
+    format!("cast({src:?}->{dst:?}): value {value} falls outside destination range (index {index})")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CastCategory {
+    Bool,
+    Integer,
+    Float,
+    Fixed,
+}
+
+fn validate_casting_mode(src: DType, dst: DType, options: &CastOptions) -> Result<(), String> {
+    match options.casting() {
+        CastingKind::Unsafe => Ok(()),
+        CastingKind::SameKind => {
+            if cast_category(src) == cast_category(dst) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "cast({src:?}->{dst:?}): violates casting='same_kind'"
+                ))
+            }
+        }
+        CastingKind::Safe => {
+            if can_cast_safe(src, dst) {
+                Ok(())
+            } else {
+                Err(format!("cast({src:?}->{dst:?}): violates casting='safe'"))
+            }
+        }
+    }
+}
+
+fn cast_category(dtype: DType) -> CastCategory {
+    match dtype {
+        DType::Bool => CastCategory::Bool,
+        DType::Int8
+        | DType::Int16
+        | DType::Int32
+        | DType::Int64
+        | DType::UInt8
+        | DType::UInt16
+        | DType::UInt32
+        | DType::UInt64 => CastCategory::Integer,
+        DType::Float32 | DType::Float64 => CastCategory::Float,
+        DType::Fixed64 => CastCategory::Fixed,
+    }
+}
+
+fn can_cast_safe(src: DType, dst: DType) -> bool {
+    if src == dst {
+        return true;
+    }
+    match src {
+        DType::Bool => matches!(
+            dst,
+            DType::Bool
+                | DType::Int8
+                | DType::Int16
+                | DType::Int32
+                | DType::Int64
+                | DType::UInt8
+                | DType::UInt16
+                | DType::UInt32
+                | DType::UInt64
+                | DType::Float32
+                | DType::Float64
+        ),
+        DType::Int8 | DType::Int16 | DType::Int32 | DType::Int64 => {
+            if is_signed_integer(dst) {
+                dtype_width_bits(dst) >= dtype_width_bits(src)
+            } else if is_float_dtype(dst) {
+                safe_int_to_float(dtype_width_bits(src), dst)
+            } else {
+                false
+            }
+        }
+        DType::UInt8 | DType::UInt16 | DType::UInt32 | DType::UInt64 => {
+            if is_unsigned_integer(dst) {
+                dtype_width_bits(dst) >= dtype_width_bits(src)
+            } else if is_signed_integer(dst) {
+                dtype_width_bits(dst) > dtype_width_bits(src)
+            } else if is_float_dtype(dst) {
+                safe_int_to_float(dtype_width_bits(src), dst)
+            } else {
+                false
+            }
+        }
+        DType::Float32 => matches!(dst, DType::Float32 | DType::Float64),
+        DType::Float64 => matches!(dst, DType::Float64),
+        DType::Fixed64 => dst == DType::Fixed64,
+    }
+}
+
+fn is_signed_integer(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::Int8 | DType::Int16 | DType::Int32 | DType::Int64
+    )
+}
+
+fn is_unsigned_integer(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::UInt8 | DType::UInt16 | DType::UInt32 | DType::UInt64
+    )
+}
+
+fn is_float_dtype(dtype: DType) -> bool {
+    matches!(dtype, DType::Float32 | DType::Float64)
+}
+
+fn dtype_width_bits(dtype: DType) -> u32 {
+    match dtype {
+        DType::Bool => 1,
+        DType::Int8 | DType::UInt8 => 8,
+        DType::Int16 | DType::UInt16 => 16,
+        DType::Int32 | DType::UInt32 => 32,
+        DType::Int64 | DType::UInt64 | DType::Fixed64 => 64,
+        DType::Float32 | DType::Float64 => 0,
+    }
+}
+
+fn float_mantissa_bits(dtype: DType) -> u32 {
+    match dtype {
+        DType::Float32 => 24,
+        DType::Float64 => 53,
+        _ => 0,
+    }
+}
+
+fn safe_int_to_float(width_bits: u32, float_dtype: DType) -> bool {
+    let mantissa = float_mantissa_bits(float_dtype);
+    mantissa >= width_bits
 }
 
 fn collect_numeric<T, U>(out: &mut Vec<U>, buffer: &MatrixBuffer, map: impl Fn(T) -> U)
@@ -983,18 +1393,6 @@ fn validate_view(
         return Err("view exceeds underlying buffer bounds".into());
     }
     Ok(())
-}
-
-fn clamp_float(value: f64, min: f64, max: f64) -> f64 {
-    if value.is_nan() {
-        min
-    } else if value < min {
-        min
-    } else if value > max {
-        max
-    } else {
-        value
-    }
 }
 
 pub fn normalize_index(index: isize, len: usize) -> Result<usize, String> {
@@ -1085,5 +1483,40 @@ mod tests {
             err.contains("layout"),
             "expected layout mention in error message, got: {err}"
         );
+    }
+
+    #[test]
+    fn cast_with_safe_rejects_downcast() {
+        let buffer = MatrixBuffer::from_vec(vec![10i16, -5, 20], 3, 1).expect("int16 buffer");
+        let result = buffer.cast_with_spec(DType::Int8, Some("safe"));
+        assert!(result.is_err(), "expected safe cast to reject narrowing");
+    }
+
+    #[test]
+    fn cast_round_floor_float_to_int() {
+        let buffer = MatrixBuffer::from_vec(vec![1.9f64, -1.2, -0.1], 3, 1).expect("float buffer");
+        let casted = buffer
+            .cast_with_spec(DType::Int32, Some("round_floor|clip"))
+            .expect("round_floor cast");
+        let values = casted.try_as_slice::<i32>().expect("slice");
+        assert_eq!(values, &[1, -2, -1]);
+    }
+
+    #[test]
+    fn cast_wrap_unsigned() {
+        let buffer = MatrixBuffer::from_vec(vec![260.0f64, -5.0], 2, 1).expect("float buffer");
+        let casted = buffer
+            .cast_with_spec(DType::UInt8, Some("round_trunc|wrap"))
+            .expect("wrap cast");
+        let values = casted.try_as_slice::<u8>().expect("slice");
+        assert_eq!(values, &[4, 251]);
+    }
+
+    #[test]
+    fn cast_options_parse_mixed_tokens() {
+        let options = CastOptions::parse(Some("same_kind | round_trunc | wrap")).unwrap();
+        assert_eq!(options.casting(), CastingKind::SameKind);
+        assert_eq!(options.overflow(), OverflowMode::Wrap);
+        assert_eq!(options.rounding(), Some(RoundingMode::Trunc));
     }
 }

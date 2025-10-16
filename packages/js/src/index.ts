@@ -25,7 +25,7 @@ type BackendMatrixHandle = {
 
   to_vec?(): Float64Array | number[];
   toVec?(): Float64Array | number[];
-  astype(dtype: DType, copy?: boolean): BackendMatrixHandle;
+  astype(dtype: DType, copy?: boolean, casting?: string | null): BackendMatrixHandle;
   to_bytes?(): Uint8Array;
   toBytes?(): Uint8Array;
 
@@ -957,12 +957,16 @@ export class Matrix {
     return scatterPairs(this, rowIndices, colIndices, values);
   }
 
-  astype(dtype: DType, options: { copy?: boolean } = {}): Matrix {
+  astype(
+    dtype: DType,
+    options: { copy?: boolean; casting?: string } = {}
+  ): Matrix {
     const copy = options.copy ?? false;
+    const casting = options.casting ?? null;
     if (!copy && dtype === this.dtype) {
       return this;
     }
-    const handle = getHandle(this).astype(dtype, copy);
+    const handle = getHandle(this).astype(dtype, copy, casting);
     return Matrix.fromHandle(handle);
   }
 
