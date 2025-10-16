@@ -1,17 +1,15 @@
-use crate::dtype::DType;
-
 /// Internal helper used by the macro tests to ensure compilation.
 pub(crate) fn __size_of<T>() -> usize {
     std::mem::size_of::<T>()
 }
 
-/// Dispatch a `DType` to its corresponding numeric Rust type (`i8`, `u8`, `f32`, …).
+/// Dispatch a `DType` to its corresponding numeric Rust type (`i8`, `u8`, `f32`, 闂?.
 ///
 /// ```
 /// # use num_rs_core::{dtype::DType, match_numeric_dtype};
 /// let dtype = DType::Int16;
 /// let size = match_numeric_dtype!(dtype, Ty, {
-///     num_rs_core::macros::__size_of::<Ty>()
+///     std::mem::size_of::<Ty>()
 /// });
 /// assert_eq!(size, 2);
 /// ```
@@ -60,7 +58,7 @@ macro_rules! match_numeric_dtype {
                 type $T = f64;
                 $body
             }
-            other => $fallback,
+            _ => $fallback,
         }
     }};
     ($dtype:expr, $T:ident, $body:block) => {{
@@ -68,7 +66,7 @@ macro_rules! match_numeric_dtype {
             $dtype,
             $T,
             $body,
-            fallback panic!("unsupported numeric dtype: {:?}", other)
+            fallback panic!("unsupported numeric dtype: {:?}", $dtype)
         )
     }};
 }
@@ -95,7 +93,7 @@ macro_rules! match_signed_integer_dtype {
                 type $T = i64;
                 $body
             }
-            other => $fallback,
+            _ => $fallback,
         }
     }};
     ($dtype:expr, $T:ident, $body:block) => {{
@@ -103,7 +101,7 @@ macro_rules! match_signed_integer_dtype {
             $dtype,
             $T,
             $body,
-            fallback panic!("unsupported signed integer dtype: {:?}", other)
+            fallback panic!("unsupported signed integer dtype: {:?}", $dtype)
         )
     }};
 }
@@ -130,7 +128,7 @@ macro_rules! match_unsigned_integer_dtype {
                 type $T = u64;
                 $body
             }
-            other => $fallback,
+            _ => $fallback,
         }
     }};
     ($dtype:expr, $T:ident, $body:block) => {{
@@ -138,7 +136,7 @@ macro_rules! match_unsigned_integer_dtype {
             $dtype,
             $T,
             $body,
-            fallback panic!("unsupported unsigned integer dtype: {:?}", other)
+            fallback panic!("unsupported unsigned integer dtype: {:?}", $dtype)
         )
     }};
 }
@@ -157,7 +155,7 @@ macro_rules! match_float_dtype {
                 type $T = f64;
                 $body
             }
-            other => $fallback,
+            _ => $fallback,
         }
     }};
     ($dtype:expr, $T:ident, $body:block) => {{
@@ -165,7 +163,7 @@ macro_rules! match_float_dtype {
             $dtype,
             $T,
             $body,
-            fallback panic!("unsupported float dtype: {:?}", other)
+            fallback panic!("unsupported float dtype: {:?}", $dtype)
         )
     }};
 }
@@ -201,12 +199,12 @@ macro_rules! for_each_numeric_dtype {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dtype::DType;
 
     #[test]
     fn match_numeric_dispatches_size() {
         let dtype = DType::UInt16;
-        let size = match_numeric_dtype!(dtype, Ty, { super::__size_of::<Ty>() });
+        let size = match_numeric_dtype!(dtype, Ty, { std::mem::size_of::<Ty>() });
         assert_eq!(size, 2);
     }
 
@@ -216,7 +214,7 @@ mod tests {
         let result: Result<usize, &'static str> = match_numeric_dtype!(
             dtype,
             Ty,
-            { Ok(super::__size_of::<Ty>()) },
+            { Ok(std::mem::size_of::<Ty>()) },
             fallback Err("unsupported")
         );
         assert!(result.is_err());
@@ -225,14 +223,14 @@ mod tests {
     #[test]
     fn match_signed_integer_dispatch() {
         let dtype = DType::Int32;
-        let size = match_signed_integer_dtype!(dtype, Ty, { super::__size_of::<Ty>() });
+        let size = match_signed_integer_dtype!(dtype, Ty, { std::mem::size_of::<Ty>() });
         assert_eq!(size, 4);
     }
 
     #[test]
     fn match_float_dispatch() {
         let dtype = DType::Float64;
-        let size = match_float_dtype!(dtype, Ty, { super::__size_of::<Ty>() });
+        let size = match_float_dtype!(dtype, Ty, { std::mem::size_of::<Ty>() });
         assert_eq!(size, 8);
     }
 }

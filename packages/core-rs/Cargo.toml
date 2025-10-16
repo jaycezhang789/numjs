@@ -13,3 +13,4 @@ cfg-if = "1"
 ndarray = { version = "0.15", features = ["std"] }
 nalgebra = { version = "0.33", optional = true, features = ["serde-serialize", "std"] }
 ndarray-npy = { version = "0.8", optional = true }
+num-traits = "0.2"

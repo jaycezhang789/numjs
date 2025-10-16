@@ -126,6 +126,13 @@ test("Binary ops promote dtypes using promotion table", () => {
   );
   assert.equal(boolLift.dtype, "uint8");
   assert.deepEqual(Array.from(boolLift.toArray()), [2, 1]);
+
+  const boolOr = add(
+    new Matrix([true, false, true], 1, 3).astype("bool"),
+    new Matrix([false, false, true], 1, 3).astype("bool")
+  );
+  assert.equal(boolOr.dtype, "bool");
+  assert.deepEqual(Array.from(boolOr.toArray()).map(Boolean), [true, false, true]);
   const concatAxis1 = concat(lhs, rhs, 1);
   assert.equal(concatAxis1.dtype, "int32");
   assert.deepEqual(Array.from(concatAxis1.toArray()), [1, 2, 3, 4]);
@@ -430,3 +437,4 @@ test("matrixFromBytes constructs matrices from raw buffers", (t) => {
   assert.equal(matrix.dtype, "uint32");
   assert.deepEqual(Array.from(matrix.toArray()), [10, 20, 30, 40]);
 });
+

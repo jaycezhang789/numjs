@@ -3,6 +3,7 @@ use crate::element::Element;
 use crate::metrics::record_copy_bytes;
 use std::borrow::Cow;
 use std::cmp::{max, min};
+use std::fmt::Write;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,6 +244,20 @@ impl MatrixBuffer {
         self.col_stride == 1 && self.row_stride == self.cols as isize
     }
 
+    pub fn is_contiguous(&self) -> bool {
+        self.is_standard_layout() && self.offset == 0
+    }
+
+    pub fn ensure_standard_layout(&self) -> Result<(), String> {
+        if self.col_stride != 1 {
+            return Err("matrix buffer requires column stride of 1 for a contiguous view".into());
+        }
+        if self.row_stride != self.cols as isize {
+            return Err("matrix buffer requires row stride equal to number of columns for a contiguous view".into());
+        }
+        Ok(())
+    }
+
     pub fn as_slice<T: Element>(&self) -> Option<&[T]> {
         if T::DTYPE != self.dtype {
             return None;
@@ -257,6 +272,11 @@ impl MatrixBuffer {
         }
     }
 
+    pub fn try_as_slice<T: Element>(&self) -> Result<&[T], String> {
+        self.as_slice::<T>()
+            .ok_or_else(|| self.build_view_error(Some(T::DTYPE)))
+    }
+
     pub fn as_byte_slice(&self) -> Option<&[u8]> {
         if !self.is_standard_layout() {
             return None;
@@ -268,6 +288,11 @@ impl MatrixBuffer {
         Some(&self.data.as_ref()[start..end])
     }
 
+    pub fn try_as_byte_slice(&self) -> Result<&[u8], String> {
+        self.as_byte_slice()
+            .ok_or_else(|| self.build_view_error(None))
+    }
+
     pub fn as_slice_mut<T: Element>(&mut self) -> Option<&mut [T]> {
         if T::DTYPE != self.dtype {
             return None;
@@ -276,6 +301,22 @@ impl MatrixBuffer {
         let len = self.len();
         let ptr = Arc::make_mut(&mut self.data).as_mut_ptr() as *mut T;
         unsafe { Some(std::slice::from_raw_parts_mut(ptr, len)) }
+    }
+
+    pub fn try_as_slice_mut<T: Element>(&mut self) -> Result<&mut [T], String> {
+        if T::DTYPE != self.dtype {
+            return Err(self.build_view_error(Some(T::DTYPE)));
+        }
+        if !self.is_standard_layout() || self.offset != 0 {
+            return Err(self.build_view_error(Some(T::DTYPE)));
+        }
+        let len = self.len();
+        let ptr = Arc::make_mut(&mut self.data).as_mut_ptr();
+        let byte_offset = (self.offset as isize) * self.element_size() as isize;
+        unsafe {
+            let ptr = ptr.offset(byte_offset) as *mut T;
+            Ok(std::slice::from_raw_parts_mut(ptr, len))
+        }
     }
 
     pub fn to_contiguous(&self) -> Result<Self, String> {
@@ -757,6 +798,39 @@ impl MatrixBuffer {
         self.col_stride = 1;
     }
 
+    fn build_view_error(&self, expected: Option<DType>) -> String {
+        let mut message = String::new();
+        match expected {
+            Some(dtype) => {
+                let _ = write!(
+                    &mut message,
+                    "unable to obtain contiguous view as {:?}: ",
+                    dtype
+                );
+                if self.dtype != dtype {
+                    let _ = write!(&mut message, "buffer dtype is {:?}; ", self.dtype);
+                }
+            }
+            None => {
+                let _ = write!(&mut message, "unable to obtain contiguous byte view: ");
+            }
+        }
+        if self.col_stride != 1 || self.row_stride != self.cols as isize {
+            let _ = write!(
+                &mut message,
+                "layout is not standard (row_stride={}, col_stride={}); ",
+                self.row_stride, self.col_stride
+            );
+        }
+        if self.offset != 0 {
+            let _ = write!(&mut message, "offset is {}; ", self.offset);
+        }
+        if message.ends_with("; ") {
+            message.truncate(message.len() - 2);
+        }
+        message
+    }
+
     fn validate_bounds(&self) -> Result<(), String> {
         validate_view(
             self.data.len() / self.element_size(),
@@ -978,5 +1052,38 @@ pub fn normalize_slice(len: usize, spec: SliceSpec) -> Result<(usize, usize, isi
         let span = start - end;
         let count = (span + step_abs - 1) / step_abs;
         Ok((start as usize, count as usize, step))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_as_slice_success() {
+        let buffer = MatrixBuffer::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], 2, 2).expect("buffer");
+        let view = buffer.try_as_slice::<f32>().expect("typed view");
+        assert_eq!(view, &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn try_as_slice_reports_dtype_mismatch() {
+        let buffer = MatrixBuffer::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], 2, 2).expect("buffer");
+        let err = buffer.try_as_slice::<i32>().unwrap_err();
+        assert!(
+            err.contains("dtype"),
+            "expected dtype mismatch in error message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn try_as_slice_mut_requires_standard_layout() {
+        let base = MatrixBuffer::from_vec(vec![1i32, 2, 3, 4], 2, 2).expect("buffer");
+        let mut column = base.column(0).expect("column");
+        let err = column.try_as_slice_mut::<i32>().unwrap_err();
+        assert!(
+            err.contains("layout"),
+            "expected layout mention in error message, got: {err}"
+        );
     }
 }

@@ -6,6 +6,8 @@ pub mod metrics;
 
 use buffer::MatrixBuffer;
 use dtype::{promote_many, promote_pair, DType};
+use element::Element as ElementTrait;
+use num_traits::{Bounded, Float, FromPrimitive, PrimInt, Signed, ToPrimitive, Unsigned};
 
 use ndarray::Array2;
 use std::convert::TryInto;
@@ -39,7 +41,12 @@ fn pairwise_sum_slice(data: &[f64]) -> f64 {
 }
 
 pub fn sum_pairwise(buffer: &MatrixBuffer) -> f64 {
-    let v = buffer.to_f64_vec();
+    let mut v = buffer.to_f64_vec();
+    v.sort_by(|a, b| {
+        a.abs()
+            .partial_cmp(&b.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     pairwise_sum_slice(&v)
 }
 
@@ -230,14 +237,96 @@ pub fn add(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
     }
     ensure_same_shape(a, b)?;
     let dtype = promote_pair(a.dtype(), b.dtype());
-    let out_rows = a.rows();
-    let out_cols = a.cols();
 
-    let lhs = a.to_f64_vec();
-    let rhs = b.to_f64_vec();
-    let result: Vec<f64> = lhs.into_iter().zip(rhs).map(|(x, y)| x + y).collect();
+    if dtype == DType::Bool {
+        if a.dtype() != DType::Bool || b.dtype() != DType::Bool {
+            return Err("add(bool, bool): unsupported mixed boolean addition".into());
+        }
+        let lhs_std = a.to_contiguous()?;
+        let rhs_std = b.to_contiguous()?;
+        let lhs = lhs_std.try_as_slice::<bool>()?;
+        let rhs = rhs_std.try_as_slice::<bool>()?;
+        let mut out: Vec<bool> = Vec::with_capacity(lhs.len());
+        for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+            out.push(x || y);
+        }
+        return MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into);
+    }
 
-    MatrixBuffer::from_f64_vec(dtype, out_rows, out_cols, result).map_err(Into::into)
+    let lhs_cast = a.cast(dtype)?;
+    let rhs_cast = b.cast(dtype)?;
+    let lhs_std = lhs_cast.to_contiguous()?;
+    let rhs_std = rhs_cast.to_contiguous()?;
+
+    match dtype {
+        DType::Int8 => add_signed_numeric::<i8>(&lhs_std, &rhs_std),
+        DType::Int16 => add_signed_numeric::<i16>(&lhs_std, &rhs_std),
+        DType::Int32 => add_signed_numeric::<i32>(&lhs_std, &rhs_std),
+        DType::Int64 => add_signed_numeric::<i64>(&lhs_std, &rhs_std),
+        DType::UInt8 => add_unsigned_numeric::<u8>(&lhs_std, &rhs_std),
+        DType::UInt16 => add_unsigned_numeric::<u16>(&lhs_std, &rhs_std),
+        DType::UInt32 => add_unsigned_numeric::<u32>(&lhs_std, &rhs_std),
+        DType::UInt64 => add_unsigned_numeric::<u64>(&lhs_std, &rhs_std),
+        DType::Float32 => add_float_numeric::<f32>(&lhs_std, &rhs_std),
+        DType::Float64 => add_float_numeric::<f64>(&lhs_std, &rhs_std),
+        DType::Bool | DType::Fixed64 => unreachable!(),
+    }
+}
+
+fn add_signed_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: PrimInt + Signed + Bounded + ToPrimitive + FromPrimitive + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let min = T::min_value()
+        .to_i128()
+        .ok_or_else(|| "failed to convert minimum to i128".to_string())?;
+    let max = T::max_value()
+        .to_i128()
+        .ok_or_else(|| "failed to convert maximum to i128".to_string())?;
+    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        let sum = x.to_i128().unwrap() + y.to_i128().unwrap();
+        let clamped = sum.clamp(min, max);
+        let value = T::from_i128(clamped)
+            .ok_or_else(|| "failed to cast sum back to target dtype".to_string())?;
+        out.push(value);
+    }
+    MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
+}
+
+fn add_unsigned_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: PrimInt + Unsigned + Bounded + ToPrimitive + FromPrimitive + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let max = T::max_value()
+        .to_u128()
+        .ok_or_else(|| "failed to convert maximum to u128".to_string())?;
+    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        let sum = x.to_u128().unwrap() + y.to_u128().unwrap();
+        let clamped = if sum > max { max } else { sum };
+        let value = T::from_u128(clamped)
+            .ok_or_else(|| "failed to cast sum back to target dtype".to_string())?;
+        out.push(value);
+    }
+    MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
+}
+
+fn add_float_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
+where
+    T: Float + ElementTrait,
+{
+    let lhs = a.try_as_slice::<T>()?;
+    let rhs = b.try_as_slice::<T>()?;
+    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
+    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
+        out.push(x + y);
+    }
+    MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
 }
 
 pub fn matmul(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
