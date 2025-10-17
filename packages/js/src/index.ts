@@ -4,6 +4,7 @@ import {
   isWebGpuSupported,
   WebGpuEngine,
 } from "./gpu/webgpu";
+import { LazyArray, LazyScalar, constant as lazyConstant } from "./lazy";
 
 type BackendKind = "napi" | "wasm";
 
@@ -1319,6 +1320,16 @@ export class Matrix {
     return Matrix.fromHandleWithDType(handle, "fixed64", { fixedScale: scale });
   }
 
+  static fromLazy(lazy: LazyArray, options: MatrixOptions = {}): Matrix {
+    const { data, rows, cols } = lazy.evaluate();
+    const base = new Matrix(data, rows, cols, { dtype: "float64" });
+    const target = options.dtype ?? "float64";
+    if (target !== "float64") {
+      return base.astype(target, { copy: false });
+    }
+    return base;
+  }
+
   get rows(): number {
     return this._handle.rows;
   }
@@ -1337,6 +1348,15 @@ export class Matrix {
 
   toArray(): TypedArray {
     return handleToTypedArray(this._handle);
+  }
+
+  toLazy(): LazyArray {
+    const float64 = this.astype("float64", { copy: false }).toArray();
+    const data =
+      float64 instanceof Float64Array
+        ? float64
+        : Float64Array.from(float64 as ArrayLike<number>);
+    return LazyArray.fromDense(data, this.rows, this.cols);
   }
 
   get dtypeInfo(): DTypeInfo {
@@ -1652,6 +1672,7 @@ function broadcastMatrixInJs(matrix: Matrix, rows: number, cols: number): Matrix
   if (matrix.rows === rows && matrix.cols === cols) {
     return matrix;
   }
+
   if (
     (matrix.rows !== 1 && matrix.rows !== rows) ||
     (matrix.cols !== 1 && matrix.cols !== cols)
@@ -3510,11 +3531,22 @@ export function writeNpz(entries: NamedMatrix[]): Uint8Array {
   return zipSync(archive);
 }
 
+export function lazyFromMatrix(matrix: Matrix): LazyArray {
+  return matrix.toLazy();
+}
 
+export function realizeLazyArray(
+  lazy: LazyArray,
+  options: MatrixOptions = {}
+): Matrix {
+  return Matrix.fromLazy(lazy, options);
+}
 
+export function lazyScalar(value: number): LazyScalar {
+  return LazyScalar.fromNumber(value);
+}
 
-
-
+export { LazyArray, LazyScalar, lazyConstant };
 
 
 
