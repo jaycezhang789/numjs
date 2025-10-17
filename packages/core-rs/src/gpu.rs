@@ -15,6 +15,8 @@ impl GpuBackendKind {
             GpuBackendKind::Cuda => "cuda",
             #[cfg(feature = "gpu-rocm")]
             GpuBackendKind::Rocm => "rocm",
+            #[allow(unreachable_patterns)]
+            _ => "unknown",
         }
     }
 }

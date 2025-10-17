@@ -16,7 +16,7 @@ export declare function tanh(matrix: Matrix): Matrix
 export declare function sigmoid(matrix: Matrix): Matrix
 export declare function matmul(a: Matrix, b: Matrix): Matrix
 export declare function gpuAvailable(): boolean
-export declare function gpuBackendKind(): string | undefined
+export declare function gpuBackendKind(): string | null
 export declare function gpuMatmul(a: Matrix, b: Matrix): Matrix
 export declare function clip(matrix: Matrix, min: number, max: number): Matrix
 export declare function whereSelect(condition: Matrix, truthy: Matrix, falsy: Matrix): Matrix

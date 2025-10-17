@@ -7,7 +7,7 @@ use napi_derive::napi;
 use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
 use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
-use num_rs_core::gpu::{self, GpuBackendKind as CoreGpuBackendKind};
+use num_rs_core::gpu;
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
     cos as core_cos, div as core_div, dot as core_dot, exp as core_exp, gather as core_gather,
@@ -265,8 +265,8 @@ pub fn gpu_matmul(a: &Matrix, b: &Matrix) -> Result<Matrix> {
                 b.rows()
             )));
         }
-        let lhs = ensure_float32_buffer(a.buffer()).map_err(map_core_error)?;
-        let rhs = ensure_float32_buffer(b.buffer()).map_err(map_core_error)?;
+        let lhs = ensure_float32_buffer(a.buffer())?;
+        let rhs = ensure_float32_buffer(b.buffer())?;
         let lhs_view = lhs.try_as_slice::<f32>().map_err(map_core_error)?;
         let rhs_view = rhs.try_as_slice::<f32>().map_err(map_core_error)?;
         match gpu::matmul_f32(lhs_view, rhs_view, rows, shared, cols) {
@@ -490,7 +490,7 @@ pub fn gpu_sum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
         None => None,
     };
     if let Some(_kind) = gpu::active_backend_kind() {
-        let buffer = ensure_float32_buffer(matrix.buffer()).map_err(map_core_error)?;
+        let buffer = ensure_float32_buffer(matrix.buffer())?;
         let view = buffer.try_as_slice::<f32>().map_err(map_core_error)?;
         match gpu::reduce_sum_f32(view) {
             Ok(total) => {
@@ -627,11 +627,13 @@ fn convert_indices(indices: &[i64]) -> Result<Vec<isize>> {
         .collect()
 }
 
-fn ensure_float32_buffer(buffer: &MatrixBuffer) -> Result<MatrixBuffer, String> {
+fn ensure_float32_buffer(buffer: &MatrixBuffer) -> Result<MatrixBuffer> {
     if buffer.dtype() == DType::Float32 {
         Ok(buffer.clone())
     } else {
-        buffer.cast(DType::Float32)
+        buffer
+            .cast(DType::Float32)
+            .map_err(|err| map_core_error(err))
     }
 }
 
