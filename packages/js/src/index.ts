@@ -18,6 +18,8 @@ import {
   type PolarsToMatrixOptions,
   type MatrixToPolarsOptions,
 } from "./io/polars";
+export type { ArrowTableLike, ArrowToMatrixOptions, ArrowConversionResult } from "./io/arrow";
+export type { PolarsToMatrixOptions, MatrixToPolarsOptions } from "./io/polars";
 
 type BackendKind = "napi" | "wasm";
 
@@ -38,8 +40,18 @@ export type DType =
   | "float64"
   | "fixed64";
 
+export type BackendPreference = "auto" | "napi" | "wasm";
+
+export type BackendResolvedInfo = {
+  kind: BackendKind;
+  webGpu: boolean;
+};
+
 export type InitOptions = {
   threads?: boolean | number;
+  preferBackend?: BackendPreference;
+  onBackendReady?: (info: BackendResolvedInfo) => void;
+  webGpu?: WebGpuInitOptions;
 };
 
 export type GpuBackendKind = "webgpu" | "cuda" | "rocm";
@@ -130,6 +142,20 @@ export type OnnxRunOptions = {
 };
 
 export type OnnxRunResult = Record<string, Matrix>;
+
+export type Shape = readonly number[];
+export type Shape1D = readonly [number];
+export type Shape2D = readonly [number, number];
+export type Shape3D = readonly [number, number, number];
+
+export type StridedArray<T = number> = {
+  data: ArrayLike<T>;
+  shape: Shape;
+  strides?: Shape;
+  offset?: number;
+};
+
+export type MatrixLike<T = number> = Matrix | StridedArray<T> | ArrayLike<T>;
 
 type BackendMatrixHandle = {
   readonly rows: number;
@@ -389,6 +415,8 @@ let wasmThreadsInitialized = false;
 let webGpuEngine: WebGpuEngine | null = null;
 let webGpuEnginePromise: Promise<WebGpuEngine | null> | null = null;
 let activeGpuKind: GpuBackendKind | null = null;
+let backendPreference: BackendPreference = "auto";
+let backendReadyHook: ((info: BackendResolvedInfo) => void) | null = null;
 
 export type NamedMatrix = { name: string; matrix: Matrix };
 
@@ -628,12 +656,20 @@ async function loadBackend(options: InitOptions): Promise<void> {
     return;
   }
 
-  if (isNode) {
+  const preference = options.preferBackend ?? backendPreference;
+
+  if (isNode && preference !== "wasm") {
     const napi = await loadNapiBackend();
     if (napi) {
       activeBackend = wrapBackendErrors(napi);
       activeKind = "napi";
+      notifyBackendReady();
       return;
+    }
+    if (preference === "napi") {
+      console.warn(
+        "[numjs] Requested N-API backend unavailable; falling back to WebAssembly runtime."
+      );
     }
   }
 
@@ -641,12 +677,22 @@ async function loadBackend(options: InitOptions): Promise<void> {
   activeBackend = wrapBackendErrors(wasm);
   activeKind = "wasm";
   await ensureWasmThreadState(options);
+  notifyBackendReady();
 }
 
 function mergeInitOptions(base: InitOptions, extra: InitOptions): InitOptions {
   const merged: InitOptions = { ...base };
   if (extra.threads !== undefined) {
     merged.threads = extra.threads;
+  }
+  if (extra.preferBackend !== undefined) {
+    merged.preferBackend = extra.preferBackend;
+  }
+  if (typeof extra.onBackendReady === "function") {
+    merged.onBackendReady = extra.onBackendReady;
+  }
+  if (extra.webGpu) {
+    merged.webGpu = { ...(merged.webGpu ?? {}), ...extra.webGpu };
   }
   return merged;
 }
@@ -663,6 +709,24 @@ function supportsSharedArrayBuffer(): boolean {
     return false;
   }
   return true;
+}
+
+function notifyBackendReady(): void {
+  if (backendReadyHook && activeKind) {
+    try {
+      backendReadyHook({ kind: activeKind, webGpu: webGpuAvailable() });
+    } catch (error) {
+      console.warn("[numjs] backend ready hook threw an error", error);
+    }
+  }
+}
+
+export function setBackendPreference(preference: BackendPreference): void {
+  backendPreference = preference;
+}
+
+export function getBackendPreference(): BackendPreference {
+  return backendPreference;
 }
 
 async function ensureWasmThreadState(options: InitOptions): Promise<void> {
@@ -927,6 +991,7 @@ async function ensureWebGpuEngine(
   if (engine) {
     webGpuEngine = engine;
     activeGpuKind = "webgpu";
+    notifyBackendReady();
   } else {
     if (activeGpuKind === "webgpu") {
       activeGpuKind = null;
@@ -1261,14 +1326,22 @@ function handleToTypedArray(handle: BackendMatrixHandle): TypedArray {
 }
 
 export async function init(options: InitOptions = {}): Promise<void> {
+  if (options.preferBackend) {
+    backendPreference = options.preferBackend;
+  }
+  if (typeof options.onBackendReady === "function") {
+    backendReadyHook = options.onBackendReady;
+  }
   pendingInitOptions = mergeInitOptions(pendingInitOptions, options);
   if (activeBackend) {
     await ensureWasmThreadState(pendingInitOptions);
+    const webGpuOptions = pendingInitOptions.webGpu;
     if (!isNode) {
-      await initWebGpu().catch(() => {
+      await initWebGpu(webGpuOptions ?? {}).catch(() => {
         /* noop - fall back to CPU */
       });
     }
+    notifyBackendReady();
     return;
   }
   if (!pendingLoad) {
@@ -1279,11 +1352,13 @@ export async function init(options: InitOptions = {}): Promise<void> {
   }
   await pendingLoad;
   await ensureWasmThreadState(pendingInitOptions);
+  const webGpuOptions = pendingInitOptions.webGpu;
   if (!isNode) {
-    await initWebGpu().catch(() => {
+    await initWebGpu(webGpuOptions ?? {}).catch(() => {
       /* noop - fall back to CPU */
     });
   }
+  notifyBackendReady();
 }
 
 export class Matrix {
@@ -4634,11 +4709,4 @@ export {
   matrixToArrowTable,
   polarsDataFrameToMatrix,
   matrixToPolarsDataFrame,
-};
-export type {
-  ArrowTableLike,
-  ArrowToMatrixOptions,
-  ArrowConversionResult,
-  PolarsToMatrixOptions,
-  MatrixToPolarsOptions,
 };
