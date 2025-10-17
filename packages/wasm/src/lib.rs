@@ -1,17 +1,19 @@
+use js_sys::Uint8Array;
 use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
 use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
-    div as core_div, dot as core_dot, gather as core_gather, gather_pairs as core_gather_pairs,
-    matmul as core_matmul, mul as core_mul, neg as core_neg, put as core_put,
-    scatter as core_scatter, scatter_pairs as core_scatter_pairs, stack as core_stack,
-    sub as core_sub, sum as core_sum, take as core_take, transpose as core_transpose,
-    where_select as core_where,
+    cos as core_cos, div as core_div, dot as core_dot, exp as core_exp, gather as core_gather,
+    gather_pairs as core_gather_pairs, log as core_log, matmul as core_matmul,
+    median as core_median, mul as core_mul, nanmean as core_nanmean, nansum as core_nansum,
+    neg as core_neg, percentile as core_percentile, put as core_put, quantile as core_quantile,
+    scatter as core_scatter, scatter_pairs as core_scatter_pairs, sigmoid as core_sigmoid,
+    sin as core_sin, stack as core_stack, sub as core_sub, sum as core_sum, take as core_take,
+    tanh as core_tanh, transpose as core_transpose, where_select as core_where,
 };
 use std::convert::TryFrom;
 use std::str::FromStr;
-use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -183,6 +185,36 @@ pub fn div(a: &Matrix, b: &Matrix) -> Result<Matrix, JsValue> {
 #[wasm_bindgen]
 pub fn neg(matrix: &Matrix) -> Result<Matrix, JsValue> {
     map_matrix(core_neg(matrix.buffer()))
+}
+
+#[wasm_bindgen]
+pub fn exp(matrix: &Matrix) -> Result<Matrix, JsValue> {
+    map_matrix(core_exp(matrix.buffer()))
+}
+
+#[wasm_bindgen]
+pub fn log(matrix: &Matrix) -> Result<Matrix, JsValue> {
+    map_matrix(core_log(matrix.buffer()))
+}
+
+#[wasm_bindgen]
+pub fn sin(matrix: &Matrix) -> Result<Matrix, JsValue> {
+    map_matrix(core_sin(matrix.buffer()))
+}
+
+#[wasm_bindgen]
+pub fn cos(matrix: &Matrix) -> Result<Matrix, JsValue> {
+    map_matrix(core_cos(matrix.buffer()))
+}
+
+#[wasm_bindgen]
+pub fn tanh(matrix: &Matrix) -> Result<Matrix, JsValue> {
+    map_matrix(core_tanh(matrix.buffer()))
+}
+
+#[wasm_bindgen]
+pub fn sigmoid(matrix: &Matrix) -> Result<Matrix, JsValue> {
+    map_matrix(core_sigmoid(matrix.buffer()))
 }
 
 #[wasm_bindgen]
@@ -379,6 +411,51 @@ pub fn sum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix, JsValue> {
 }
 
 #[wasm_bindgen]
+pub fn nansum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix, JsValue> {
+    let target = match dtype {
+        Some(value) => Some(DType::from_str(&value).map_err(|err| JsValue::from_str(&err))?),
+        None => None,
+    };
+    map_matrix(core_nansum(matrix.buffer(), target))
+}
+
+#[wasm_bindgen]
+pub fn nanmean(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix, JsValue> {
+    let target = match dtype {
+        Some(value) => Some(DType::from_str(&value).map_err(|err| JsValue::from_str(&err))?),
+        None => None,
+    };
+    map_matrix(core_nanmean(matrix.buffer(), target))
+}
+
+#[wasm_bindgen]
+pub fn median(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix, JsValue> {
+    let target = match dtype {
+        Some(value) => Some(DType::from_str(&value).map_err(|err| JsValue::from_str(&err))?),
+        None => None,
+    };
+    map_matrix(core_median(matrix.buffer(), target))
+}
+
+#[wasm_bindgen]
+pub fn quantile(matrix: &Matrix, q: f64, dtype: Option<String>) -> Result<Matrix, JsValue> {
+    let target = match dtype {
+        Some(value) => Some(DType::from_str(&value).map_err(|err| JsValue::from_str(&err))?),
+        None => None,
+    };
+    map_matrix(core_quantile(matrix.buffer(), q, target))
+}
+
+#[wasm_bindgen]
+pub fn percentile(matrix: &Matrix, p: f64, dtype: Option<String>) -> Result<Matrix, JsValue> {
+    let target = match dtype {
+        Some(value) => Some(DType::from_str(&value).map_err(|err| JsValue::from_str(&err))?),
+        None => None,
+    };
+    map_matrix(core_percentile(matrix.buffer(), p, target))
+}
+
+#[wasm_bindgen]
 pub fn dot(a: &Matrix, b: &Matrix, dtype: Option<String>) -> Result<Matrix, JsValue> {
     let target = match dtype {
         Some(value) => Some(DType::from_str(&value).map_err(|err| JsValue::from_str(&err))?),
@@ -404,7 +481,3 @@ mod tests {
         assert_eq!(combined.fixed_scale(), Some(2));
     }
 }
-
-
-
-

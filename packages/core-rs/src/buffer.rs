@@ -209,7 +209,6 @@ impl MatrixBuffer {
         rows: usize,
         cols: usize,
     ) -> Result<Self, String> {
-        
         if data.len() != rows * cols {
             return Err("data length does not match shape".into());
         }
@@ -239,7 +238,6 @@ impl MatrixBuffer {
         cols: usize,
         data: Vec<u8>,
     ) -> Result<Self, String> {
-        
         let expected = rows
             .checked_mul(cols)
             .and_then(|n| n.checked_mul(dtype.size_of()))
@@ -287,7 +285,6 @@ impl MatrixBuffer {
         row_stride: isize,
         col_stride: isize,
     ) -> Result<Self, String> {
-        
         if data.len() % dtype.size_of() != 0 {
             return Err("backing buffer is not aligned to dtype width".into());
         }
@@ -332,7 +329,6 @@ impl MatrixBuffer {
         cols: usize,
         scale: i32,
     ) -> Result<Self, String> {
-        
         if data.len() != rows * cols {
             return Err("data length does not match shape".into());
         }
@@ -1546,4 +1542,3 @@ mod tests {
         assert_eq!(options.rounding(), Some(RoundingMode::Trunc));
     }
 }
-

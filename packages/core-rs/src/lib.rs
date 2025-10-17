@@ -1,9 +1,9 @@
 pub mod buffer;
+pub mod compress;
 pub mod dtype;
 pub mod element;
 mod macros;
 pub mod metrics;
-pub mod compress;
 
 use buffer::MatrixBuffer;
 use dtype::{promote_many, promote_pair, DType};
@@ -25,8 +25,8 @@ use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
 #[cfg(feature = "linalg")]
 use nalgebra::{DMatrix, SymmetricEigen};
 
-pub use metrics::{copy_bytes_total, reset_copy_bytes, take_copy_bytes};
 pub use compress::compress;
+pub use metrics::{copy_bytes_total, reset_copy_bytes, take_copy_bytes};
 pub type CoreResult<T> = Result<T, String>;
 
 // ---------------------------------------------------------------------
@@ -162,6 +162,133 @@ pub fn sum(matrix: &MatrixBuffer, target_dtype: Option<DType>) -> CoreResult<Mat
         DType::Float64 => sum_float_numeric::<f64>(matrix),
         DType::Fixed64 => sum_fixed64(matrix),
     }?;
+    apply_reduce_output_dtype(result, target_dtype)
+}
+
+pub fn nansum(matrix: &MatrixBuffer, target_dtype: Option<DType>) -> CoreResult<MatrixBuffer> {
+    match matrix.dtype() {
+        DType::Float32 => {
+            let contiguous = matrix.to_contiguous()?;
+            let values = contiguous.try_as_slice::<f32>()?;
+            let mut total: f32 = 0.0;
+            for &value in values {
+                if !value.is_nan() {
+                    total += value;
+                }
+            }
+            let result = MatrixBuffer::from_vec(vec![total], 1, 1).map_err(|err| err)?;
+            apply_reduce_output_dtype(result, target_dtype)
+        }
+        DType::Float64 => {
+            let contiguous = matrix.to_contiguous()?;
+            let values = contiguous.try_as_slice::<f64>()?;
+            let mut total: f64 = 0.0;
+            for &value in values {
+                if !value.is_nan() {
+                    total += value;
+                }
+            }
+            let result = MatrixBuffer::from_vec(vec![total], 1, 1).map_err(|err| err)?;
+            apply_reduce_output_dtype(result, target_dtype)
+        }
+        _ => sum(matrix, target_dtype),
+    }
+}
+
+pub fn nanmean(matrix: &MatrixBuffer, target_dtype: Option<DType>) -> CoreResult<MatrixBuffer> {
+    match matrix.dtype() {
+        DType::Float32 => {
+            let contiguous = matrix.to_contiguous()?;
+            let values = contiguous.try_as_slice::<f32>()?;
+            let mut total: f64 = 0.0;
+            let mut count: usize = 0;
+            for &value in values {
+                if !value.is_nan() {
+                    total += value as f64;
+                    count += 1;
+                }
+            }
+            let mean = if count == 0 {
+                f32::NAN
+            } else {
+                (total / (count as f64)) as f32
+            };
+            let result = MatrixBuffer::from_vec(vec![mean], 1, 1).map_err(|err| err)?;
+            apply_reduce_output_dtype(result, target_dtype)
+        }
+        DType::Float64 => {
+            let contiguous = matrix.to_contiguous()?;
+            let values = contiguous.try_as_slice::<f64>()?;
+            let mut total: f64 = 0.0;
+            let mut count: usize = 0;
+            for &value in values {
+                if !value.is_nan() {
+                    total += value;
+                    count += 1;
+                }
+            }
+            let mean = if count == 0 {
+                f64::NAN
+            } else {
+                total / (count as f64)
+            };
+            let result = MatrixBuffer::from_vec(vec![mean], 1, 1).map_err(|err| err)?;
+            apply_reduce_output_dtype(result, target_dtype)
+        }
+        _ => {
+            let mut total: f64 = 0.0;
+            let mut count: usize = 0;
+            for value in matrix.to_f64_vec() {
+                if !value.is_nan() {
+                    total += value;
+                    count += 1;
+                }
+            }
+            let mean = if count == 0 {
+                f64::NAN
+            } else {
+                total / (count as f64)
+            };
+            let result =
+                MatrixBuffer::from_f64_vec(DType::Float64, 1, 1, vec![mean]).map_err(|err| err)?;
+            apply_reduce_output_dtype(result, target_dtype)
+        }
+    }
+}
+
+pub fn median(matrix: &MatrixBuffer, target_dtype: Option<DType>) -> CoreResult<MatrixBuffer> {
+    let value = compute_linear_quantile(matrix, 0.5)?;
+    let result =
+        MatrixBuffer::from_f64_vec(DType::Float64, 1, 1, vec![value]).map_err(|err| err)?;
+    apply_reduce_output_dtype(result, target_dtype)
+}
+
+pub fn quantile(
+    matrix: &MatrixBuffer,
+    q: f64,
+    target_dtype: Option<DType>,
+) -> CoreResult<MatrixBuffer> {
+    if !(0.0..=1.0).contains(&q) {
+        return Err("quantile: q must be within [0, 1]".into());
+    }
+    let value = compute_linear_quantile(matrix, q)?;
+    let result =
+        MatrixBuffer::from_f64_vec(DType::Float64, 1, 1, vec![value]).map_err(|err| err)?;
+    apply_reduce_output_dtype(result, target_dtype)
+}
+
+pub fn percentile(
+    matrix: &MatrixBuffer,
+    p: f64,
+    target_dtype: Option<DType>,
+) -> CoreResult<MatrixBuffer> {
+    if !(0.0..=100.0).contains(&p) {
+        return Err("percentile: p must be within [0, 100]".into());
+    }
+    let q = p / 100.0;
+    let value = compute_linear_quantile(matrix, q)?;
+    let result =
+        MatrixBuffer::from_f64_vec(DType::Float64, 1, 1, vec![value]).map_err(|err| err)?;
     apply_reduce_output_dtype(result, target_dtype)
 }
 
@@ -637,6 +764,50 @@ pub fn div(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
     }
 }
 
+pub fn exp(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    apply_float_unary_op(matrix, |v: f32| v.exp(), |v: f64| v.exp())
+}
+
+pub fn log(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    apply_float_unary_op(matrix, |v: f32| v.ln(), |v: f64| v.ln())
+}
+
+pub fn sin(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    apply_float_unary_op(matrix, |v: f32| v.sin(), |v: f64| v.sin())
+}
+
+pub fn cos(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    apply_float_unary_op(matrix, |v: f32| v.cos(), |v: f64| v.cos())
+}
+
+pub fn tanh(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    apply_float_unary_op(matrix, |v: f32| v.tanh(), |v: f64| v.tanh())
+}
+
+pub fn sigmoid(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    apply_float_unary_op(
+        matrix,
+        |v: f32| {
+            if v >= 0.0 {
+                let z = (-v).exp();
+                1.0 / (1.0 + z)
+            } else {
+                let z = v.exp();
+                z / (1.0 + z)
+            }
+        },
+        |v: f64| {
+            if v >= 0.0 {
+                let z = (-v).exp();
+                1.0 / (1.0 + z)
+            } else {
+                let z = v.exp();
+                z / (1.0 + z)
+            }
+        },
+    )
+}
+
 pub fn neg(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
     match matrix.dtype() {
         DType::Fixed64 => neg_fixed64(matrix),
@@ -905,6 +1076,76 @@ where
         out.push(x / y);
     }
     MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
+}
+
+fn apply_float_unary_op<F32, F64>(
+    matrix: &MatrixBuffer,
+    op32: F32,
+    op64: F64,
+) -> CoreResult<MatrixBuffer>
+where
+    F32: Fn(f32) -> f32,
+    F64: Fn(f64) -> f64,
+{
+    match matrix.dtype() {
+        DType::Float32 => {
+            let contiguous = matrix.to_contiguous()?;
+            let values = contiguous.try_as_slice::<f32>()?;
+            let mut out: Vec<f32> = Vec::with_capacity(values.len());
+            for &value in values.iter() {
+                out.push(op32(value));
+            }
+            MatrixBuffer::from_vec(out, matrix.rows(), matrix.cols()).map_err(|err| err)
+        }
+        DType::Float64 => {
+            let contiguous = matrix.to_contiguous()?;
+            let values = contiguous.try_as_slice::<f64>()?;
+            let mut out: Vec<f64> = Vec::with_capacity(values.len());
+            for &value in values.iter() {
+                out.push(op64(value));
+            }
+            MatrixBuffer::from_vec(out, matrix.rows(), matrix.cols()).map_err(|err| err)
+        }
+        _ => {
+            let data: Vec<f64> = matrix
+                .to_f64_vec()
+                .into_iter()
+                .map(|value| op64(value))
+                .collect();
+            MatrixBuffer::from_f64_vec(DType::Float64, matrix.rows(), matrix.cols(), data)
+                .map_err(|err| err)
+        }
+    }
+}
+
+fn compute_linear_quantile(matrix: &MatrixBuffer, q: f64) -> CoreResult<f64> {
+    if matrix.len() == 0 {
+        return Ok(f64::NAN);
+    }
+    if q.is_nan() {
+        return Ok(f64::NAN);
+    }
+    let mut values = matrix.to_f64_vec();
+    if values.iter().any(|value| value.is_nan()) {
+        return Ok(f64::NAN);
+    }
+    values.sort_by(|a, b| {
+        a.partial_cmp(b)
+            .unwrap_or_else(|| a.is_nan().cmp(&b.is_nan()))
+    });
+    let n = values.len();
+    if n == 1 {
+        return Ok(values[0]);
+    }
+    let pos = q * (n as f64 - 1.0);
+    let lower = pos.floor() as usize;
+    let upper = pos.ceil() as usize;
+    if lower == upper {
+        Ok(values[lower])
+    } else {
+        let fraction = pos - lower as f64;
+        Ok(values[lower] + (values[upper] - values[lower]) * fraction)
+    }
 }
 
 fn neg_signed_numeric<T>(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer>
@@ -1436,7 +1677,12 @@ fn assemble_npy_header(dict_repr: &str) -> CoreResult<Vec<u8>> {
 }
 
 #[cfg(feature = "npy")]
-fn make_npy_header(dtype: DType, rows: usize, cols: usize, fixed_scale: Option<i32>) -> CoreResult<Vec<u8>> {
+fn make_npy_header(
+    dtype: DType,
+    rows: usize,
+    cols: usize,
+    fixed_scale: Option<i32>,
+) -> CoreResult<Vec<u8>> {
     let descr = dtype_to_numpy_descr(dtype);
     let mut dict = format!(
         "{{'descr': '{}', 'fortran_order': False, 'shape': ({}, {})",
@@ -1645,12 +1891,12 @@ fn parse_npy_header(bytes: &[u8]) -> CoreResult<(usize, DType, usize, usize, boo
                 if let Some(tuple) = value.as_tuple() {
                     let mut dims = Vec::with_capacity(tuple.len());
                     for elem in tuple {
-                        let int = elem
-                            .as_integer()
-                            .ok_or_else(|| "read_npy: shape contains non-integer entries".to_string())?;
-                        let dim = int
-                            .to_usize()
-                            .ok_or_else(|| "read_npy: shape dimension does not fit usize".to_string())?;
+                        let int = elem.as_integer().ok_or_else(|| {
+                            "read_npy: shape contains non-integer entries".to_string()
+                        })?;
+                        let dim = int.to_usize().ok_or_else(|| {
+                            "read_npy: shape dimension does not fit usize".to_string()
+                        })?;
                         dims.push(dim);
                     }
                     shape = Some(dims);
@@ -1734,7 +1980,10 @@ fn decode_matrix_from_bytes(
             MatrixBuffer::from_vec(values, rows, cols).map_err(Into::into)
         }
         DType::Int8 => {
-            let mut values = bytes.iter().map(|&b| i8::from_le_bytes([b])).collect::<Vec<_>>();
+            let mut values = bytes
+                .iter()
+                .map(|&b| i8::from_le_bytes([b]))
+                .collect::<Vec<_>>();
             if fortran {
                 values = reorder_from_fortran(&values, rows, cols);
             }
@@ -2135,6 +2384,70 @@ mod tests {
         let neg_fixed = neg(&fixed).expect("neg fixed");
         assert_eq!(neg_fixed.fixed_scale(), Some(1));
         assert_eq!(neg_fixed.to_f64_vec(), vec![-15.0, 2.0]);
+    }
+
+    #[test]
+    fn test_exp_preserves_float32() {
+        let buf = MatrixBuffer::from_vec(vec![0.0f32, 1.0f32], 1, 2).unwrap();
+        let result = exp(&buf).expect("exp");
+        assert_eq!(result.dtype(), DType::Float32);
+        let values = result.try_as_slice::<f32>().unwrap();
+        assert!((values[0] - 1.0).abs() < 1e-6);
+        assert!((values[1] - std::f32::consts::E).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_sigmoid_bounds() {
+        let buf = MatrixBuffer::from_vec(vec![-4.0f64, 0.0f64, 4.0f64], 1, 3).unwrap();
+        let result = sigmoid(&buf).expect("sigmoid");
+        assert_eq!(result.dtype(), DType::Float64);
+        let values = result.try_as_slice::<f64>().unwrap();
+        assert!(values[0] > 0.0 && values[0] < 0.5);
+        assert!((values[1] - 0.5).abs() < 1e-12);
+        assert!(values[2] > 0.5 && values[2] < 1.0);
+    }
+
+    #[test]
+    fn test_nansum_ignores_nan() {
+        let buf = MatrixBuffer::from_vec(vec![1.0f64, f64::NAN, 3.0f64], 1, 3).unwrap();
+        let result = nansum(&buf, None).expect("nansum");
+        assert_eq!(result.dtype(), DType::Float64);
+        let values = result.try_as_slice::<f64>().unwrap();
+        assert!((values[0] - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_nanmean_all_nan_returns_nan() {
+        let buf = MatrixBuffer::from_vec(vec![f32::NAN, f32::NAN], 1, 2).unwrap();
+        let result = nanmean(&buf, None).expect("nanmean");
+        assert!(result.try_as_slice::<f32>().unwrap()[0].is_nan());
+    }
+
+    #[test]
+    fn test_median_even_length_uses_midpoint() {
+        let buf = MatrixBuffer::from_vec(vec![1i32, 5i32, 7i32, 9i32], 2, 2).unwrap();
+        let result = median(&buf, None).expect("median");
+        assert_eq!(result.dtype(), DType::Float64);
+        let value = result.try_as_slice::<f64>().unwrap()[0];
+        assert!((value - 6.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_quantile_linear_interpolation() {
+        let buf = MatrixBuffer::from_vec(vec![1.0f64, 3.0, 5.0, 7.0], 2, 2).unwrap();
+        let result = quantile(&buf, 0.25, None).expect("quantile");
+        let value = result.try_as_slice::<f64>().unwrap()[0];
+        assert!((value - 2.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_percentile_matches_quantile() {
+        let buf = MatrixBuffer::from_vec(vec![10.0f64, 20.0, 30.0, 40.0], 2, 2).unwrap();
+        let q = quantile(&buf, 0.75, None).expect("quantile 0.75");
+        let p = percentile(&buf, 75.0, None).expect("percentile 75");
+        let qv = q.try_as_slice::<f64>().unwrap()[0];
+        let pv = p.try_as_slice::<f64>().unwrap()[0];
+        assert!((qv - pv).abs() < 1e-12);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::buffer::MatrixBuffer;
-use crate::element::Element as ElementTrait;
 use crate::dtype::DType;
+use crate::element::Element as ElementTrait;
 
 pub type CoreResult<T> = Result<T, String>;
 
@@ -10,7 +10,8 @@ pub fn compress(mask: &MatrixBuffer, matrix: &MatrixBuffer) -> CoreResult<Matrix
     }
     if mask.rows() != matrix.rows() || mask.cols() != matrix.cols() {
         return Err(
-            "compress: shapes must match; broadcast inputs to the same shape before compress".into(),
+            "compress: shapes must match; broadcast inputs to the same shape before compress"
+                .into(),
         );
     }
     let mask_contig = mask.to_contiguous()?;
@@ -58,10 +59,11 @@ fn compress_fixed64(mask: &[bool], matrix: &MatrixBuffer) -> CoreResult<MatrixBu
     let mut out: Vec<i64> = Vec::with_capacity(mask.len());
     for (i, chunk) in bytes.chunks_exact(8).enumerate() {
         if mask[i] {
-            let arr = [chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]];
+            let arr = [
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ];
             out.push(i64::from_ne_bytes(arr));
         }
     }
     MatrixBuffer::from_fixed_i64_vec(out, mask.iter().filter(|&&b| b).count(), 1, scale)
 }
-

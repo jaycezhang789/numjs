@@ -71,8 +71,27 @@ type BackendModule = {
   mul(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
   div(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
   neg(matrix: BackendMatrixHandle): BackendMatrixHandle;
+  exp?(matrix: BackendMatrixHandle): BackendMatrixHandle;
+  log?(matrix: BackendMatrixHandle): BackendMatrixHandle;
+  sin?(matrix: BackendMatrixHandle): BackendMatrixHandle;
+  cos?(matrix: BackendMatrixHandle): BackendMatrixHandle;
+  tanh?(matrix: BackendMatrixHandle): BackendMatrixHandle;
+  sigmoid?(matrix: BackendMatrixHandle): BackendMatrixHandle;
   matmul(a: BackendMatrixHandle, b: BackendMatrixHandle): BackendMatrixHandle;
   sum?(matrix: BackendMatrixHandle, dtype?: DType | null): BackendMatrixHandle;
+  nansum?(matrix: BackendMatrixHandle, dtype?: DType | null): BackendMatrixHandle;
+  nanmean?(matrix: BackendMatrixHandle, dtype?: DType | null): BackendMatrixHandle;
+  median?(matrix: BackendMatrixHandle, dtype?: DType | null): BackendMatrixHandle;
+  quantile?(
+    matrix: BackendMatrixHandle,
+    q: number,
+    dtype?: DType | null
+  ): BackendMatrixHandle;
+  percentile?(
+    matrix: BackendMatrixHandle,
+    p: number,
+    dtype?: DType | null
+  ): BackendMatrixHandle;
   dot?(
     a: BackendMatrixHandle,
     b: BackendMatrixHandle,
@@ -1371,6 +1390,67 @@ export function neg(matrix: Matrix): Matrix {
   });
 }
 
+export function exp(matrix: Matrix): Matrix {
+  const backend = ensureBackend();
+  if (backend.exp) {
+    const handle = backend.exp(getHandle(matrix));
+    const dtype = getMatrixDTypeFromHandle(handle);
+    const fixedScale = dtype === "fixed64" ? getMatrixFixedScaleFromHandle(handle) : undefined;
+    return Matrix.fromHandleWithDType(handle, dtype, { fixedScale });
+  }
+  return unaryFloatOpInJs(matrix, Math.exp, matrix.dtype === "float32");
+}
+
+export function log(matrix: Matrix): Matrix {
+  const backend = ensureBackend();
+  if (backend.log) {
+    const handle = backend.log(getHandle(matrix));
+    const dtype = getMatrixDTypeFromHandle(handle);
+    return Matrix.fromHandleWithDType(handle, dtype);
+  }
+  return unaryFloatOpInJs(matrix, Math.log, matrix.dtype === "float32");
+}
+
+export function sin(matrix: Matrix): Matrix {
+  const backend = ensureBackend();
+  if (backend.sin) {
+    const handle = backend.sin(getHandle(matrix));
+    const dtype = getMatrixDTypeFromHandle(handle);
+    return Matrix.fromHandleWithDType(handle, dtype);
+  }
+  return unaryFloatOpInJs(matrix, Math.sin, matrix.dtype === "float32");
+}
+
+export function cos(matrix: Matrix): Matrix {
+  const backend = ensureBackend();
+  if (backend.cos) {
+    const handle = backend.cos(getHandle(matrix));
+    const dtype = getMatrixDTypeFromHandle(handle);
+    return Matrix.fromHandleWithDType(handle, dtype);
+  }
+  return unaryFloatOpInJs(matrix, Math.cos, matrix.dtype === "float32");
+}
+
+export function tanh(matrix: Matrix): Matrix {
+  const backend = ensureBackend();
+  if (backend.tanh) {
+    const handle = backend.tanh(getHandle(matrix));
+    const dtype = getMatrixDTypeFromHandle(handle);
+    return Matrix.fromHandleWithDType(handle, dtype);
+  }
+  return unaryFloatOpInJs(matrix, Math.tanh, matrix.dtype === "float32");
+}
+
+export function sigmoid(matrix: Matrix): Matrix {
+  const backend = ensureBackend();
+  if (backend.sigmoid) {
+    const handle = backend.sigmoid(getHandle(matrix));
+    const dtype = getMatrixDTypeFromHandle(handle);
+    return Matrix.fromHandleWithDType(handle, dtype);
+  }
+  return unaryFloatOpInJs(matrix, sigmoidStable, matrix.dtype === "float32");
+}
+
 export function matmul(a: Matrix, b: Matrix): Matrix {
   if (a.dtype === "fixed64" || b.dtype === "fixed64") {
     throw new Error("matmul does not support fixed64 matrices; cast operands to float64 first");
@@ -1770,6 +1850,127 @@ export type ReduceOptions = {
   dtype?: DType;
 };
 
+function unaryFloatOpInJs(
+  matrix: Matrix,
+  op: (value: number) => number,
+  preferFloat32: boolean
+): Matrix {
+  const values = matrix.astype("float64", { copy: false }).toArray() as Float64Array;
+  const out = new Float64Array(values.length);
+  for (let index = 0; index < values.length; index += 1) {
+    out[index] = op(values[index]);
+  }
+  const base = new Matrix(out, matrix.rows, matrix.cols, { dtype: "float64" });
+  return preferFloat32 ? base.astype("float32", { copy: false }) : base;
+}
+
+function sigmoidStable(value: number): number {
+  if (value >= 0) {
+    const z = Math.exp(-value);
+    return 1 / (1 + z);
+  }
+  const z = Math.exp(value);
+  return z / (1 + z);
+}
+
+function nansumInJs(matrix: Matrix, options: ReduceOptions): Matrix {
+  const preferFloat32 =
+    matrix.dtype === "float32" && (!options.dtype || options.dtype === "float32");
+  if (preferFloat32) {
+    const data = matrix.astype("float32", { copy: false }).toArray() as Float32Array;
+    let total = 0;
+    for (let index = 0; index < data.length; index += 1) {
+      const value = data[index];
+      if (!Number.isNaN(value)) {
+        total += value;
+      }
+    }
+    const scalar = createScalarMatrix(Math.fround(total), "float32");
+    return castReduceResult(scalar, options.dtype);
+  }
+  const data = matrix.astype("float64", { copy: false }).toArray() as Float64Array;
+  let total = 0;
+  for (let index = 0; index < data.length; index += 1) {
+    const value = data[index];
+    if (!Number.isNaN(value)) {
+      total += value;
+    }
+  }
+  const scalar = createScalarMatrix(total, "float64");
+  return castReduceResult(scalar, options.dtype);
+}
+
+function nanmeanInJs(matrix: Matrix, options: ReduceOptions): Matrix {
+  const preferFloat32 =
+    matrix.dtype === "float32" && (!options.dtype || options.dtype === "float32");
+  if (preferFloat32) {
+    const data = matrix.astype("float32", { copy: false }).toArray() as Float32Array;
+    let total = 0;
+    let count = 0;
+    for (let index = 0; index < data.length; index += 1) {
+      const value = data[index];
+      if (!Number.isNaN(value)) {
+        total += value;
+        count += 1;
+      }
+    }
+    const mean = count === 0 ? Number.NaN : total / count;
+    const scalar = createScalarMatrix(Math.fround(mean), "float32");
+    return castReduceResult(scalar, options.dtype);
+  }
+  const data = matrix.astype("float64", { copy: false }).toArray() as Float64Array;
+  let total = 0;
+  let count = 0;
+  for (let index = 0; index < data.length; index += 1) {
+    const value = data[index];
+    if (!Number.isNaN(value)) {
+      total += value;
+      count += 1;
+    }
+  }
+  const mean = count === 0 ? Number.NaN : total / count;
+  const scalar = createScalarMatrix(mean, "float64");
+  return castReduceResult(scalar, options.dtype);
+}
+
+function computeLinearQuantileArray(values: Float64Array, q: number): number {
+  if (values.length === 0) {
+    return Number.NaN;
+  }
+  const sorted = Array.from(values);
+  if (sorted.some((value) => Number.isNaN(value))) {
+    return Number.NaN;
+  }
+  sorted.sort((a, b) => a - b);
+  if (sorted.length === 1) {
+    return sorted[0];
+  }
+  const pos = q * (sorted.length - 1);
+  const lower = Math.floor(pos);
+  const upper = Math.ceil(pos);
+  if (lower === upper) {
+    return sorted[lower];
+  }
+  const fraction = pos - lower;
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * fraction;
+}
+
+function quantileInJs(matrix: Matrix, q: number, options: ReduceOptions): Matrix {
+  const values = matrix.astype("float64", { copy: false }).toArray() as Float64Array;
+  const value = computeLinearQuantileArray(values, q);
+  const scalar = createScalarMatrix(value, "float64");
+  return castReduceResult(scalar, options.dtype);
+}
+
+function medianInJs(matrix: Matrix, options: ReduceOptions): Matrix {
+  return quantileInJs(matrix, 0.5, options);
+}
+
+function percentileInJs(matrix: Matrix, p: number, options: ReduceOptions): Matrix {
+  const q = p / 100;
+  return quantileInJs(matrix, q, options);
+}
+
 function reductionAccumulatorDType(dtype: DType): DType {
   switch (dtype) {
     case "bool":
@@ -2033,6 +2234,76 @@ export function sum(matrix: Matrix, options: ReduceOptions = {}): Matrix {
     return Matrix.fromHandleWithDType(handle, dtype, { fixedScale });
   }
   return sumInJs(matrix, options);
+}
+
+export function nansum(matrix: Matrix, options: ReduceOptions = {}): Matrix {
+  const backend = ensureBackend();
+  const target = options.dtype ?? null;
+  if (backend.nansum) {
+    const handle = backend.nansum(getHandle(matrix), target);
+    const dtype = getMatrixDTypeFromHandle(handle);
+    const fixedScale = dtype === "fixed64" ? getMatrixFixedScaleFromHandle(handle) : undefined;
+    return Matrix.fromHandleWithDType(handle, dtype, { fixedScale });
+  }
+  return nansumInJs(matrix, options);
+}
+
+export function nanmean(matrix: Matrix, options: ReduceOptions = {}): Matrix {
+  const backend = ensureBackend();
+  const target = options.dtype ?? null;
+  if (backend.nanmean) {
+    const handle = backend.nanmean(getHandle(matrix), target);
+    const dtype = getMatrixDTypeFromHandle(handle);
+    return Matrix.fromHandleWithDType(handle, dtype);
+  }
+  return nanmeanInJs(matrix, options);
+}
+
+export function median(matrix: Matrix, options: ReduceOptions = {}): Matrix {
+  const backend = ensureBackend();
+  const target = options.dtype ?? null;
+  if (backend.median) {
+    const handle = backend.median(getHandle(matrix), target);
+    const dtype = getMatrixDTypeFromHandle(handle);
+    return Matrix.fromHandleWithDType(handle, dtype);
+  }
+  return medianInJs(matrix, options);
+}
+
+export function quantile(
+  matrix: Matrix,
+  q: number,
+  options: ReduceOptions = {}
+): Matrix {
+  if (Number.isNaN(q) || q < 0 || q > 1) {
+    throw new Error("quantile: q must be within [0, 1]");
+  }
+  const backend = ensureBackend();
+  const target = options.dtype ?? null;
+  if (backend.quantile) {
+    const handle = backend.quantile(getHandle(matrix), q, target);
+    const dtype = getMatrixDTypeFromHandle(handle);
+    return Matrix.fromHandleWithDType(handle, dtype);
+  }
+  return quantileInJs(matrix, q, options);
+}
+
+export function percentile(
+  matrix: Matrix,
+  p: number,
+  options: ReduceOptions = {}
+): Matrix {
+  if (Number.isNaN(p) || p < 0 || p > 100) {
+    throw new Error("percentile: p must be within [0, 100]");
+  }
+  const backend = ensureBackend();
+  const target = options.dtype ?? null;
+  if (backend.percentile) {
+    const handle = backend.percentile(getHandle(matrix), p, target);
+    const dtype = getMatrixDTypeFromHandle(handle);
+    return Matrix.fromHandleWithDType(handle, dtype);
+  }
+  return percentileInJs(matrix, p, options);
 }
 
 export function dot(a: Matrix, b: Matrix, options: ReduceOptions = {}): Matrix {

@@ -1,16 +1,21 @@
-use napi::bindgen_prelude::{BigInt64Array, Buffer, Env, Error, Float64Array, Result, TypedArrayType};
+use napi::bindgen_prelude::{
+    BigInt64Array, Buffer, Env, Error, Float64Array, Result, TypedArrayType,
+};
 use napi::JsObject;
 use napi_derive::napi;
 
 use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
-use num_rs_core::dtype::DType;
 use num_rs_core::compress::compress as core_compress;
+use num_rs_core::dtype::DType;
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
-    div as core_div, dot as core_dot, gather as core_gather, gather_pairs as core_gather_pairs,
-    matmul as core_matmul, mul as core_mul, neg as core_neg, put as core_put, read_npy_matrix,
-    scatter as core_scatter, scatter_pairs as core_scatter_pairs, stack as core_stack,
-    sub as core_sub, sum as core_sum, take as core_take, transpose as core_transpose,
+    cos as core_cos, div as core_div, dot as core_dot, exp as core_exp, gather as core_gather,
+    gather_pairs as core_gather_pairs, log as core_log, matmul as core_matmul,
+    median as core_median, mul as core_mul, nanmean as core_nanmean, nansum as core_nansum,
+    neg as core_neg, percentile as core_percentile, put as core_put, quantile as core_quantile,
+    read_npy_matrix, scatter as core_scatter, scatter_pairs as core_scatter_pairs,
+    sigmoid as core_sigmoid, sin as core_sin, stack as core_stack, sub as core_sub,
+    sum as core_sum, take as core_take, tanh as core_tanh, transpose as core_transpose,
     where_select as core_where, where_select_multi as core_where_multi, write_npy_matrix,
 };
 #[cfg(feature = "linalg")]
@@ -130,11 +135,7 @@ impl Matrix {
         let ptr = if len_bytes == 0 {
             ptr::null_mut()
         } else {
-            unsafe {
-                Arc::as_ref(&arc)
-                    .as_ptr()
-                    .add(offset_bytes) as *mut u8
-            }
+            unsafe { Arc::as_ref(&arc).as_ptr().add(offset_bytes) as *mut u8 }
         };
 
         let arraybuffer = unsafe {
@@ -190,6 +191,36 @@ pub fn div(a: &Matrix, b: &Matrix) -> Result<Matrix> {
 #[napi]
 pub fn neg(matrix: &Matrix) -> Result<Matrix> {
     map_matrix(core_neg(matrix.buffer()))
+}
+
+#[napi]
+pub fn exp(matrix: &Matrix) -> Result<Matrix> {
+    map_matrix(core_exp(matrix.buffer()))
+}
+
+#[napi]
+pub fn log(matrix: &Matrix) -> Result<Matrix> {
+    map_matrix(core_log(matrix.buffer()))
+}
+
+#[napi]
+pub fn sin(matrix: &Matrix) -> Result<Matrix> {
+    map_matrix(core_sin(matrix.buffer()))
+}
+
+#[napi]
+pub fn cos(matrix: &Matrix) -> Result<Matrix> {
+    map_matrix(core_cos(matrix.buffer()))
+}
+
+#[napi]
+pub fn tanh(matrix: &Matrix) -> Result<Matrix> {
+    map_matrix(core_tanh(matrix.buffer()))
+}
+
+#[napi]
+pub fn sigmoid(matrix: &Matrix) -> Result<Matrix> {
+    map_matrix(core_sigmoid(matrix.buffer()))
 }
 
 #[napi]
@@ -399,6 +430,51 @@ pub fn sum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
 }
 
 #[napi]
+pub fn nansum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
+    let target = match dtype {
+        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        None => None,
+    };
+    map_matrix(core_nansum(matrix.buffer(), target))
+}
+
+#[napi]
+pub fn nanmean(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
+    let target = match dtype {
+        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        None => None,
+    };
+    map_matrix(core_nanmean(matrix.buffer(), target))
+}
+
+#[napi]
+pub fn median(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
+    let target = match dtype {
+        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        None => None,
+    };
+    map_matrix(core_median(matrix.buffer(), target))
+}
+
+#[napi]
+pub fn quantile(matrix: &Matrix, q: f64, dtype: Option<String>) -> Result<Matrix> {
+    let target = match dtype {
+        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        None => None,
+    };
+    map_matrix(core_quantile(matrix.buffer(), q, target))
+}
+
+#[napi]
+pub fn percentile(matrix: &Matrix, p: f64, dtype: Option<String>) -> Result<Matrix> {
+    let target = match dtype {
+        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        None => None,
+    };
+    map_matrix(core_percentile(matrix.buffer(), p, target))
+}
+
+#[napi]
 pub fn dot(a: &Matrix, b: &Matrix, dtype: Option<String>) -> Result<Matrix> {
     let target = match dtype {
         Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
@@ -406,7 +482,6 @@ pub fn dot(a: &Matrix, b: &Matrix, dtype: Option<String>) -> Result<Matrix> {
     };
     map_matrix(core_dot(a.buffer(), b.buffer(), target))
 }
-
 
 // ---------------------------------------------------------------------
 // Views: row/column/slice
@@ -505,8 +580,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-
-
-
-
-
