@@ -19,6 +19,10 @@ export type DType =
   | "float64"
   | "fixed64";
 
+export type InitOptions = {
+  threads?: boolean | number;
+};
+
 type BackendMatrixHandle = {
   readonly rows: number;
   readonly cols: number;
@@ -31,6 +35,10 @@ type BackendMatrixHandle = {
   astype(dtype: DType, copy?: boolean, casting?: string | null): BackendMatrixHandle;
   to_bytes?(): Uint8Array;
   toBytes?(): Uint8Array;
+  toFloat32Array?(): Float32Array;
+  to_float32_array?(): Float32Array;
+  toFloat64Array?(): Float64Array;
+  to_float64_array?(): Float64Array;
 
 
 };
@@ -100,6 +108,8 @@ type BackendModule = {
     b: BackendMatrixHandle,
     dtype?: DType | null
   ): BackendMatrixHandle;
+  initThreads?(threads?: number | null): Promise<void>;
+  init_threads?(threads?: number | null): Promise<void>;
   from_fixed_i64?(
     data: BigInt64Array,
     rows: number,
@@ -250,6 +260,8 @@ const NAPI_DISTRIBUTIONS: Record<string, NapiDistribution> = {
 let activeBackend: BackendModule | null = null;
 let activeKind: BackendKind | null = null;
 let pendingLoad: Promise<void> | null = null;
+let pendingInitOptions: InitOptions = {};
+let wasmThreadsInitialized = false;
 
 export type NamedMatrix = { name: string; matrix: Matrix };
 
@@ -484,7 +496,7 @@ function promoteManyDType(dtypes: readonly DType[]): DType {
   }
   return result;
 }
-async function loadBackend(): Promise<void> {
+async function loadBackend(options: InitOptions): Promise<void> {
   if (activeBackend) {
     return;
   }
@@ -501,6 +513,64 @@ async function loadBackend(): Promise<void> {
   const wasm = await loadWasmBackend();
   activeBackend = wrapBackendErrors(wasm);
   activeKind = "wasm";
+  await ensureWasmThreadState(options);
+}
+
+function mergeInitOptions(base: InitOptions, extra: InitOptions): InitOptions {
+  const merged: InitOptions = { ...base };
+  if (extra.threads !== undefined) {
+    merged.threads = extra.threads;
+  }
+  return merged;
+}
+
+function supportsSharedArrayBuffer(): boolean {
+  if (typeof SharedArrayBuffer === "undefined" || typeof Atomics === "undefined") {
+    return false;
+  }
+  if (
+    typeof self !== "undefined" &&
+    Object.prototype.hasOwnProperty.call(self, "crossOriginIsolated") &&
+    (self as { crossOriginIsolated?: boolean }).crossOriginIsolated === false
+  ) {
+    return false;
+  }
+  return true;
+}
+
+async function ensureWasmThreadState(options: InitOptions): Promise<void> {
+  if (activeKind !== "wasm") {
+    return;
+  }
+  const requested = options.threads;
+  if (!requested || wasmThreadsInitialized) {
+    return;
+  }
+  if (!supportsSharedArrayBuffer()) {
+    console.warn(
+      "[numjs] SharedArrayBuffer/Atomics unavailable; skipping WASM thread pool initialisation."
+    );
+    return;
+  }
+  const backend = ensureBackend();
+  const initThreads =
+    (backend as { initThreads?: (threads?: number | null) => Promise<void> }).initThreads ??
+    (backend as { init_threads?: (threads?: number | null) => Promise<void> }).init_threads;
+  if (typeof initThreads !== "function") {
+    console.warn(
+      "[numjs] WASM backend does not expose initThreads(); skipping thread pool initialisation."
+    );
+    wasmThreadsInitialized = true;
+    return;
+  }
+  const normalized =
+    typeof requested === "number" ? Math.max(1, Math.floor(requested)) : undefined;
+  try {
+    await initThreads.call(backend, normalized ?? null);
+  } catch (error) {
+    console.warn("[numjs] Failed to initialise WASM thread pool:", error);
+  }
+  wasmThreadsInitialized = true;
 }
 
 async function loadNapiBackend(): Promise<BackendModule | null> {
@@ -859,22 +929,53 @@ function typedArrayFromBytes(bytes: Uint8Array, dtype: DType): TypedArray {
   }
 }
 
+function isTypedArray(value: unknown): value is TypedArray {
+  return ArrayBuffer.isView(value) && !(value instanceof DataView);
+}
+
 function handleToTypedArray(handle: BackendMatrixHandle): TypedArray {
-  const bytes = callHandleToBytes(handle);
   const dtype = getMatrixDTypeFromHandle(handle);
+
+  if (dtype === "float32") {
+    const direct =
+      (handle as { toFloat32Array?: () => unknown }).toFloat32Array ??
+      (handle as { to_float32_array?: () => unknown }).to_float32_array;
+    if (typeof direct === "function") {
+      const result = direct.call(handle);
+      if (isTypedArray(result)) {
+        return result as Float32Array;
+      }
+    }
+  } else if (dtype === "float64") {
+    const direct =
+      (handle as { toFloat64Array?: () => unknown }).toFloat64Array ??
+      (handle as { to_float64_array?: () => unknown }).to_float64_array;
+    if (typeof direct === "function") {
+      const result = direct.call(handle);
+      if (isTypedArray(result)) {
+        return result as Float64Array;
+      }
+    }
+  }
+
+  const bytes = callHandleToBytes(handle);
   return typedArrayFromBytes(bytes, dtype);
 }
 
-export async function init(): Promise<void> {
+export async function init(options: InitOptions = {}): Promise<void> {
+  pendingInitOptions = mergeInitOptions(pendingInitOptions, options);
   if (activeBackend) {
+    await ensureWasmThreadState(pendingInitOptions);
     return;
   }
   if (!pendingLoad) {
-    pendingLoad = loadBackend().finally(() => {
+    const scheduledOptions = pendingInitOptions;
+    pendingLoad = loadBackend(scheduledOptions).finally(() => {
       pendingLoad = null;
     });
   }
   await pendingLoad;
+  await ensureWasmThreadState(pendingInitOptions);
 }
 
 export class Matrix {

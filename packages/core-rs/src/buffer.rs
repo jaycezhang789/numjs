@@ -1,6 +1,6 @@
 use crate::dtype::DType;
-use crate::error;
 use crate::element::Element;
+use crate::error;
 use crate::metrics::record_copy_bytes;
 use num_traits::{Bounded, Float, NumCast, PrimInt, Signed, Unsigned};
 use std::borrow::Cow;

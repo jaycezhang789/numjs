@@ -4,12 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["linalg", "npy"]
+default = ["linalg", "npy", "parallel"]
 linalg = ["nalgebra"]
 npy = ["ndarray-npy"]
 cpu-openblas = ["dep:cblas", "dep:openblas-src"]
 cpu-blis = ["dep:cblas", "dep:blis-src"]
 cpu-mkl = ["dep:cblas", "dep:intel-mkl-src", "intel-mkl-src/mkl-static-lp64-iomp"]
+parallel = ["dep:rayon"]
 
 [dependencies]
 cfg-if = "1"
@@ -23,3 +24,4 @@ cblas = { version = "0.5", optional = true }
 openblas-src = { version = "0.10", optional = true, default-features = false, features = ["cblas"] }
 blis-src = { version = "0.2", optional = true, default-features = false, features = ["cblas"] }
 intel-mkl-src = { version = "0.8", optional = true, default-features = false }
+rayon = { version = "1.10", optional = true }

@@ -1,12 +1,14 @@
 pub mod buffer;
 pub mod compress;
-pub mod dtype;
-pub mod element;
 #[cfg(any(feature = "cpu-openblas", feature = "cpu-blis", feature = "cpu-mkl"))]
 mod cpu;
+pub mod dtype;
+pub mod element;
 pub mod error;
 mod macros;
 pub mod metrics;
+mod simd;
+mod threading;
 
 use buffer::MatrixBuffer;
 use dtype::{promote_many, promote_pair, DType};
@@ -14,6 +16,7 @@ use element::Element as ElementTrait;
 use num_traits::{Bounded, Float, FromPrimitive, PrimInt, Signed, ToPrimitive, Unsigned};
 
 use ndarray::Array2;
+use simd::SimdFloat;
 use std::convert::TryInto;
 
 #[cfg(feature = "npy")]
@@ -62,6 +65,108 @@ fn apply_reduce_output_dtype(
     }
 }
 
+const MATMUL_TILE_M: usize = 64;
+const MATMUL_TILE_N: usize = 64;
+const MATMUL_TILE_K: usize = 64;
+
+fn matmul_blocked<T>(lhs: &[T], rhs: &[T], m: usize, k: usize, n: usize) -> Vec<T>
+where
+    T: SimdFloat,
+{
+    if m == 0 || n == 0 {
+        return Vec::new();
+    }
+    let mut out = vec![T::zero(); m * n];
+    if threading::should_parallelize(m, n, k) {
+        #[cfg(feature = "parallel")]
+        {
+            threading::ensure_rayon_pool();
+            matmul_blocked_parallel(&mut out, lhs, rhs, m, k, n);
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            matmul_blocked_sequential(&mut out, lhs, rhs, m, k, n);
+        }
+    } else {
+        matmul_blocked_sequential(&mut out, lhs, rhs, m, k, n);
+    }
+    out
+}
+
+fn matmul_blocked_sequential<T>(out: &mut [T], lhs: &[T], rhs: &[T], m: usize, k: usize, n: usize)
+where
+    T: SimdFloat,
+{
+    let tile_rows = MATMUL_TILE_M.max(1);
+    for i0 in (0..m).step_by(tile_rows) {
+        let i_end = (i0 + tile_rows).min(m);
+        let rows = i_end - i0;
+        let offset = i0 * n;
+        let chunk = &mut out[offset..offset + rows * n];
+        compute_block(chunk, lhs, rhs, k, n, i0, i_end);
+    }
+}
+
+#[cfg(feature = "parallel")]
+fn matmul_blocked_parallel<T>(out: &mut [T], lhs: &[T], rhs: &[T], m: usize, k: usize, n: usize)
+where
+    T: SimdFloat,
+{
+    use rayon::prelude::*;
+
+    let tile_rows = MATMUL_TILE_M.max(1);
+    let chunk_size = tile_rows.saturating_mul(n.max(1)).max(1);
+    out.par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(block_idx, chunk)| {
+            let i0 = block_idx * tile_rows;
+            if i0 >= m {
+                return;
+            }
+            let i_end = (i0 + tile_rows).min(m);
+            let rows = i_end - i0;
+            let len = rows * n;
+            let chunk = &mut chunk[..len];
+            compute_block(chunk, lhs, rhs, k, n, i0, i_end);
+        });
+}
+
+#[cfg(not(feature = "parallel"))]
+#[allow(dead_code)]
+fn matmul_blocked_parallel<T>(_out: &mut [T], _: &[T], _: &[T], _: usize, _: usize, _: usize)
+where
+    T: SimdFloat,
+{
+    // no-op when the `parallel` feature is disabled
+}
+
+fn compute_block<T>(
+    out: &mut [T],
+    lhs: &[T],
+    rhs: &[T],
+    k: usize,
+    n: usize,
+    i0: usize,
+    i_end: usize,
+) where
+    T: SimdFloat,
+{
+    for k0 in (0..k).step_by(MATMUL_TILE_K.max(1)) {
+        let k_end = (k0 + MATMUL_TILE_K).min(k);
+        for j0 in (0..n).step_by(MATMUL_TILE_N.max(1)) {
+            let j_end = (j0 + MATMUL_TILE_N).min(n);
+            for (local_row, i) in (i0..i_end).enumerate() {
+                let row_slice = &mut out[local_row * n..(local_row + 1) * n];
+                for kk in k0..k_end {
+                    let a_val = lhs[i * k + kk];
+                    let rhs_offset = kk * n;
+                    let rhs_row = &rhs[rhs_offset..rhs_offset + n];
+                    T::mul_add_segment(row_slice, rhs_row, a_val, j0, j_end);
+                }
+            }
+        }
+    }
+}
 fn sum_bool(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
     let contiguous = matrix.to_contiguous()?;
     let slice = contiguous.try_as_slice::<bool>()?;
@@ -123,18 +228,11 @@ where
 
 fn sum_float_numeric<T>(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer>
 where
-    T: Float + ElementTrait,
+    T: SimdFloat,
 {
     let contiguous = matrix.to_contiguous()?;
     let slice = contiguous.try_as_slice::<T>()?;
-    let mut sum = T::zero();
-    let mut compensation = T::zero();
-    for &value in slice {
-        let y = value - compensation;
-        let t = sum + y;
-        compensation = (t - sum) - y;
-        sum = t;
-    }
+    let sum = T::reduce_sum(slice);
     MatrixBuffer::from_vec(vec![sum], 1, 1).map_err(Into::into)
 }
 
@@ -901,14 +999,12 @@ where
 
 fn add_float_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
 where
-    T: Float + ElementTrait,
+    T: SimdFloat,
 {
     let lhs = a.try_as_slice::<T>()?;
     let rhs = b.try_as_slice::<T>()?;
-    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
-    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
-        out.push(x + y);
-    }
+    let mut out = vec![T::zero(); lhs.len()];
+    T::vec_add(lhs, rhs, &mut out);
     MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
 }
 
@@ -1011,14 +1107,12 @@ where
 
 fn mul_float_numeric<T>(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer>
 where
-    T: Float + ElementTrait,
+    T: SimdFloat,
 {
     let lhs = a.try_as_slice::<T>()?;
     let rhs = b.try_as_slice::<T>()?;
-    let mut out: Vec<T> = Vec::with_capacity(lhs.len());
-    for (&x, &y) in lhs.iter().zip(rhs.iter()) {
-        out.push(x * y);
-    }
+    let mut out = vec![T::zero(); lhs.len()];
+    T::vec_mul(lhs, rhs, &mut out);
     MatrixBuffer::from_vec(out, a.rows(), a.cols()).map_err(Into::into)
 }
 
@@ -1236,19 +1330,89 @@ pub fn matmul(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
         }
     }
 
-    let a_matrix = Array2::from_shape_vec((a.rows(), a.cols()), a.to_f64_vec())
-        .map_err(|_| error::shape_mismatch("matmul: failed to reshape left matrix"))?;
-    let b_matrix = Array2::from_shape_vec((b.rows(), b.cols()), b.to_f64_vec())
-        .map_err(|_| error::shape_mismatch("matmul: failed to reshape right matrix"))?;
-    let product = a_matrix.dot(&b_matrix);
+    match dtype {
+        DType::Float32 => {
+            let lhs = a.to_contiguous()?;
+            let rhs = b.to_contiguous()?;
+            let m = lhs.rows();
+            let k = lhs.cols();
+            let n = rhs.cols();
+            if k != rhs.rows() {
+                return Err(error::shape_mismatch(
+                    "matmul: inner dimensions do not match",
+                ));
+            }
+            let lhs_slice = lhs.try_as_slice::<f32>()?;
+            let rhs_slice = rhs.try_as_slice::<f32>()?;
+            let data = matmul_blocked(lhs_slice, rhs_slice, m, k, n);
+            MatrixBuffer::from_vec(data, m, n).map_err(Into::into)
+        }
+        DType::Float64 => {
+            let lhs = a.to_contiguous()?;
+            let rhs = b.to_contiguous()?;
+            let m = lhs.rows();
+            let k = lhs.cols();
+            let n = rhs.cols();
+            if k != rhs.rows() {
+                return Err(error::shape_mismatch(
+                    "matmul: inner dimensions do not match",
+                ));
+            }
+            let lhs_slice = lhs.try_as_slice::<f64>()?;
+            let rhs_slice = rhs.try_as_slice::<f64>()?;
+            let data = matmul_blocked(lhs_slice, rhs_slice, m, k, n);
+            MatrixBuffer::from_vec(data, m, n).map_err(Into::into)
+        }
+        _ => {
+            let a_matrix = Array2::from_shape_vec((a.rows(), a.cols()), a.to_f64_vec())
+                .map_err(|_| error::shape_mismatch("matmul: failed to reshape left matrix"))?;
+            let b_matrix = Array2::from_shape_vec((b.rows(), b.cols()), b.to_f64_vec())
+                .map_err(|_| error::shape_mismatch("matmul: failed to reshape right matrix"))?;
+            let product = a_matrix.dot(&b_matrix);
 
-    MatrixBuffer::from_f64_vec(
-        dtype,
-        product.nrows(),
-        product.ncols(),
-        product.into_raw_vec(),
-    )
-    .map_err(Into::into)
+            MatrixBuffer::from_f64_vec(
+                dtype,
+                product.nrows(),
+                product.ncols(),
+                product.into_raw_vec(),
+            )
+            .map_err(Into::into)
+        }
+    }
+}
+
+pub fn matmul_batched(
+    batches_a: &[MatrixBuffer],
+    batches_b: &[MatrixBuffer],
+) -> CoreResult<Vec<MatrixBuffer>> {
+    if batches_a.len() != batches_b.len() {
+        return Err(error::shape_mismatch(
+            "matmul_batched: batch dimensions do not match",
+        ));
+    }
+    let batch = batches_a.len();
+    if batch == 0 {
+        return Ok(Vec::new());
+    }
+
+    #[cfg(feature = "parallel")]
+    {
+        if batch > 1 && !threading::parallel_disabled() {
+            threading::ensure_rayon_pool();
+            use rayon::prelude::*;
+            let results: CoreResult<Vec<MatrixBuffer>> = (0..batch)
+                .into_par_iter()
+                .map(|idx| matmul(&batches_a[idx], &batches_b[idx]))
+                .collect();
+            return results;
+        }
+    }
+
+    batches_a
+        .iter()
+        .zip(batches_b.iter())
+        .map(|(a, b)| matmul(a, b))
+        .collect()
 }
 
 pub fn clip(buffer: &MatrixBuffer, min: f64, max: f64) -> CoreResult<MatrixBuffer> {
@@ -1565,9 +1729,7 @@ pub fn solve(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
         return Err("solve: matrix A must be square".into());
     }
     if a.rows() != b.rows() {
-        return Err(error::shape_mismatch(
-            "solve: RHS has incompatible shape",
-        ));
+        return Err(error::shape_mismatch("solve: RHS has incompatible shape"));
     }
     let a_mat = DMatrix::from_row_slice(a.rows(), a.cols(), &a.to_f64_vec());
     let b_mat = DMatrix::from_row_slice(b.rows(), b.cols(), &b.to_f64_vec());
@@ -1941,8 +2103,8 @@ fn parse_npy_header(bytes: &[u8]) -> CoreResult<(usize, DType, usize, usize, boo
     let descr = descr.ok_or_else(|| "read_npy: header missing 'descr' key".to_string())?;
     let fortran_order =
         fortran_order.ok_or_else(|| "read_npy: header missing 'fortran_order' key".to_string())?;
-    let shape = shape
-        .ok_or_else(|| error::shape_mismatch("read_npy: header missing 'shape' key"))?;
+    let shape =
+        shape.ok_or_else(|| error::shape_mismatch("read_npy: header missing 'shape' key"))?;
     if shape.len() != 2 {
         return Err(error::shape_mismatch(format!(
             "read_npy: expected 2D array, but header shape is {:?}",

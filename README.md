@@ -37,6 +37,17 @@ Fixed-point matrices are backed by signed 64-bit integers plus a per-matrix scal
 - Default floating-point comparisons share exported constants `DEFAULT_RTOL = 1e-12` and `DEFAULT_ATOL = 0`. These values balance double-precision arithmetic on the native backend with the WebAssembly/JS fallbacks.
 - Minor cross-backend differences remain possible (WebAssembly paths occasionally round through `float32`). When comparing results fetched from different backends, use the shared tolerances or adjust them for tighter/looser acceptance depending on your workload.
 
+## Parallelism & Performance
+
+- Large GEMMs now use cache-aware tiling with adaptive threading. The Rust core combines Rayon with vendor BLAS backends (OpenBLAS/BLIS/MKL) when available.
+- Environment variables let you tune concurrency without recompilation:
+  - `NUMJS_CPU_THREADS` fixes the thread count for Rayon and BLAS backends.
+  - `NUMJS_DISABLE_PARALLEL=1` disables automatic parallel scheduling entirely.
+  - `NUMJS_PARALLEL_MIN_ELEMS` / `NUMJS_PARALLEL_MIN_FLOPS` adjust the size thresholds that trigger parallel execution.
+- Small matrices automatically fall back to single-threaded execution to avoid oversubscription.
+- `matmul_batched` performs batched GEMM across 3D tensors and parallelises over batch items when profitable.
+- In browsers, opt-in WASM threads via `await init({ threads: true })` (requires `SharedArrayBuffer` and a cross-origin isolated context). You can cap the worker count with `init({ threads: 4 })`.
+
 ## Licensing and Feedback
 
 The project is currently pre-release. File issues or pull requests if you encounter bugs, missing algorithms, or performance regressions.

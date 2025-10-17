@@ -1,4 +1,4 @@
-use js_sys::{Error as JsError, Reflect, Uint8Array};
+use js_sys::{Error as JsError, Float32Array, Float64Array, Reflect, Uint8Array};
 use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
 use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
@@ -15,6 +15,12 @@ use num_rs_core::{
 use std::convert::TryFrom;
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
+
+#[cfg(feature = "threads")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "threads")]
+static THREAD_POOL: OnceLock<()> = OnceLock::new();
 
 #[wasm_bindgen]
 #[derive(Clone)]
@@ -124,6 +130,44 @@ impl Matrix {
         }
     }
 
+    #[wasm_bindgen(js_name = "toFloat32Array")]
+    pub fn to_float32_array(&self) -> Result<Float32Array, JsValue> {
+        if self.buffer.dtype() != DType::Float32 {
+            return Err(JsValue::from_str(
+                "toFloat32Array requires a matrix with dtype \"float32\"",
+            ));
+        }
+        match self.buffer.try_as_slice::<f32>() {
+            Ok(slice) => Ok(unsafe { Float32Array::view(slice) }),
+            Err(_) => {
+                let contiguous = self
+                    .buffer
+                    .to_contiguous()
+                    .map_err(|err| JsValue::from_str(&err))?;
+                let values = contiguous
+                    .try_as_slice::<f32>()
+                    .map_err(|err| JsValue::from_str(&err))?;
+                Ok(Float32Array::from(values))
+            }
+        }
+    }
+
+    #[wasm_bindgen(js_name = "toFloat64Array")]
+    pub fn to_float64_array(&self) -> Result<Float64Array, JsValue> {
+        if self.buffer.dtype() != DType::Float64 {
+            return Err(JsValue::from_str(
+                "toFloat64Array requires a matrix with dtype \"float64\"",
+            ));
+        }
+        match self.buffer.try_as_slice::<f64>() {
+            Ok(slice) => Ok(unsafe { Float64Array::view(slice) }),
+            Err(_) => {
+                let data = self.buffer.to_f64_vec();
+                Ok(Float64Array::from(data.as_slice()))
+            }
+        }
+    }
+
     #[wasm_bindgen(js_name = "fromFixedI64")]
     pub fn from_fixed_i64(
         data: Vec<i64>,
@@ -155,7 +199,11 @@ fn map_matrix(res: num_rs_core::CoreResult<MatrixBuffer>) -> Result<Matrix, JsVa
 fn map_core_error(err: &str) -> JsValue {
     if let Some((code, message)) = err.split_once(": ") {
         let js_error = JsError::new(message);
-        let _ = Reflect::set(&js_error, &JsValue::from_str("code"), &JsValue::from_str(code));
+        let _ = Reflect::set(
+            &js_error,
+            &JsValue::from_str("code"),
+            &JsValue::from_str(code),
+        );
         js_error.into()
     } else {
         JsError::new(err).into()
@@ -407,6 +455,30 @@ pub fn reset_copy_bytes() {
     num_rs_core::reset_copy_bytes();
 }
 
+#[cfg(feature = "threads")]
+#[wasm_bindgen(js_name = "initThreads")]
+pub async fn init_threads(workers: Option<u32>) -> Result<(), JsValue> {
+    if THREAD_POOL.get().is_some() {
+        return Ok(());
+    }
+    let request = workers
+        .map(|value| usize::try_from(value).unwrap_or(1).max(1))
+        .map(Some)
+        .unwrap_or(None);
+    wasm_bindgen_rayon::init_thread_pool(request)
+        .await
+        .map_err(|err| JsValue::from(err))?;
+    let _ = THREAD_POOL.set(());
+    Ok(())
+}
+
+#[cfg(not(feature = "threads"))]
+#[wasm_bindgen(js_name = "initThreads")]
+pub async fn init_threads(_workers: Option<u32>) -> Result<(), JsValue> {
+    Err(JsValue::from_str(
+        "wasm threads support disabled; rebuild num_rs_wasm with the `threads` feature",
+    ))
+}
 // ---------------------------------------------------------------------
 // Stable reductions
 // ---------------------------------------------------------------------

@@ -9,6 +9,7 @@ linalg = ["num_rs_core/linalg"]
 cpu-openblas = ["num_rs_core/cpu-openblas"]
 cpu-blis = ["num_rs_core/cpu-blis"]
 cpu-mkl = ["num_rs_core/cpu-mkl"]
+parallel = ["num_rs_core/parallel"]
 
 [lib]
 crate-type = ["cdylib"]

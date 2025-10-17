@@ -3,6 +3,7 @@
 use crate::buffer::MatrixBuffer;
 use crate::dtype::DType;
 use crate::error;
+use crate::threading;
 use crate::CoreResult;
 use std::env;
 use std::sync::OnceLock;
@@ -49,6 +50,8 @@ fn ensure_backend_configured() {
 }
 
 fn configure_backend() {
+    threading::ensure_rayon_pool();
+    configure_thread_overrides();
     let instruction = detect_instruction_set();
     match BACKEND {
         #[cfg(feature = "cpu-openblas")]
@@ -57,6 +60,23 @@ fn configure_backend() {
         CpuBackend::Blis => configure_blis(instruction),
         #[cfg(feature = "cpu-mkl")]
         CpuBackend::Mkl => configure_mkl(instruction),
+    }
+}
+
+fn configure_thread_overrides() {
+    if let Some(threads) = threading::thread_override() {
+        #[cfg(feature = "cpu-openblas")]
+        if env::var("OPENBLAS_NUM_THREADS").is_err() {
+            env::set_var("OPENBLAS_NUM_THREADS", threads.to_string());
+        }
+        #[cfg(feature = "cpu-blis")]
+        if env::var("BLIS_NUM_THREADS").is_err() {
+            env::set_var("BLIS_NUM_THREADS", threads.to_string());
+        }
+        #[cfg(feature = "cpu-mkl")]
+        if env::var("MKL_NUM_THREADS").is_err() {
+            env::set_var("MKL_NUM_THREADS", threads.to_string());
+        }
     }
 }
 

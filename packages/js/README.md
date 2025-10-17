@@ -39,6 +39,7 @@ yarn add @jayce789/numjs
 - Rich dtype support covering floats, integers, booleans, and experimental fixed-point data.
 - Rust core for predictable performance and copy-on-write semantics.
 - Tree-shakable distribution that ships both ESM and CJS bundles.
+- Zero-copy typed array views for Float32/Float64 matrices on the WASM backend, plus SIMD-accelerated fused kernels for elementwise math and matmul.
 
 ## Quick Start
 ```ts
@@ -73,6 +74,8 @@ Refer to the generated TypeScript declarations in `dist/index.d.ts` for the comp
 
 You can inspect the decision with `backendKind()` or provide your own loader if you need custom logic.
 
+- When the WASM backend is active, call `await init({ threads: true })` to spin up a WebAssembly thread pool (requires `SharedArrayBuffer` and `crossOriginIsolated`). Pass a number (for example `init({ threads: 4 })`) to clamp the worker count.
+
 ## Browser Usage
 ```ts
 import { init, Matrix, broadcastTo } from "@jayce789/numjs";
@@ -82,6 +85,8 @@ const vector = new Matrix([1, 2, 3], 3, 1);
 console.log(broadcastTo(vector, 3, 2).toArray());
 ```
 Ensure your bundler knows how to serve `.wasm` assets (Vite, Webpack, Rollup, etc.).
+
+On the WASM backend, `matrix.toArray()` now reuses the underlying memory for `float32`/`float64` matrices whenever the layout is contiguous, returning a typed array view instead of copying.
 
 ## Node.js Compatibility
 - Supports Node.js 16 and newer.
