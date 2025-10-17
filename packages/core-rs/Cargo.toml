@@ -12,7 +12,12 @@ cpu-blis = ["dep:cblas", "dep:blis-src"]
 cpu-mkl = ["dep:cblas", "dep:intel-mkl-src", "intel-mkl-src/mkl-static-lp64-iomp"]
 parallel = ["dep:rayon"]
 gpu = []
-gpu-cuda = ["gpu", "dep:cudarc", "dep:once_cell"]
+gpu-cuda = [
+    "gpu",
+    "dep:cudarc",
+    "dep:once_cell",
+    "cudarc/cuda-version-from-build-system",
+]
 gpu-rocm = ["gpu"]
 
 [dependencies]
