@@ -3,6 +3,8 @@ import { Matrix } from "../index";
 export type PolarsModuleLike = {
   DataFrame: new (data: Record<string, unknown[]>) => any;
   Series?: new (name: string, values: unknown[]) => any;
+  readParquet?: (path: string, options?: unknown) => Promise<unknown>;
+  writeParquet?: (path: string, dataframe: unknown, options?: unknown) => Promise<void>;
 };
 
 type PolarsSeriesLike = {
@@ -76,7 +78,7 @@ export async function matrixToPolarsDataFrame(
       `matrixToPolarsDataFrame: expected ${matrix.cols} column names, received ${options.columnNames.length}`
     );
   }
-  const polars = await loadPolarsModule(options.polarsModule);
+  const polars = await ensurePolarsModule(options.polarsModule);
   const columns: Record<string, unknown[]> = {};
   for (let col = 0; col < matrix.cols; col += 1) {
     const seriesData = matrix
@@ -153,7 +155,7 @@ function createSeriesShim(name: string, values: unknown[]): PolarsSeriesLike {
   };
 }
 
-async function loadPolarsModule(provided: unknown): Promise<PolarsModuleLike> {
+export async function ensurePolarsModule(provided: unknown): Promise<PolarsModuleLike> {
   if (provided) {
     return provided as PolarsModuleLike;
   }

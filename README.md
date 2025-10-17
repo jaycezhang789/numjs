@@ -87,6 +87,13 @@ Fixed-point matrices are backed by signed 64-bit integers plus a per-matrix scal
   If the modules are missing, the helpers throw informative errors explaining which dependency to add.
 - **CI follow-up.** Our GitHub Actions matrix will gain conditional jobs that install these optional dependencies and run interop smoke tests once the zero-copy pipeline lands. Until then the code paths remain best-effort and are guarded by runtime type-checks.
 
+## DataFrame View & CSV/Parquet IO (Preview)
+
+- **Lightweight DataFrameView.** `DataFrameView` wraps a 2D `Matrix` and tracks column names plus per-column dtypes. It supports column selection, renaming, per-column dtype overrides, and projection back to plain matrices/row objects.
+- **CSV helpers.** New Node utilities `readCsvDataFrame` / `writeDataFrameToCsv` load and persist numeric/boolean tables. Browser code can feed a `ReadableStream<Uint8Array>` into `readCsvDataFrameFromStream` for progressive parsing. The parser currently targets numeric and boolean columns; non-numeric cells become `NaN` and can be coerced later.
+- **Parquet helpers.** On Node, `readParquetDataFrame` / `writeParquetDataFrame` integrate with Polars. Install `nodejs-polars` (or `polars`) and the helpers will bridge through the existing Polars converters. Without the dependency the functions raise clear guidance.
+- **Interoperability.** `DataFrameView` cooperates with the Arrow/Polars bridges, so you can move between CSV ↔︎ DataFrameView ↔︎ Arrow/Parquet with minimal glue. The class deliberately keeps the underlying `Matrix` in `float64`; dtype hints drive conversions when you request individual columns.
+
 ## Licensing and Feedback
 
 The project is currently pre-release. File issues or pull requests if you encounter bugs, missing algorithms, or performance regressions.

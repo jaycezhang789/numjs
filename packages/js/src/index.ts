@@ -60,6 +60,38 @@ export type Conv2DOptions = {
   mode?: GpuExecutionMode;
 };
 
+export type DataFrameInitOptions = {
+  columns?: readonly string[];
+  columnDTypes?: Record<string, DType>;
+  inferColumnDTypes?: boolean;
+};
+
+export type CsvReadOptions = {
+  delimiter?: string;
+  hasHeader?: boolean;
+  columns?: readonly string[];
+  columnTypes?: Record<string, DType>;
+  encoding?: string;
+  skipEmptyLines?: boolean;
+};
+
+export type CsvWriteOptions = {
+  delimiter?: string;
+  includeHeader?: boolean;
+  newline?: "\n" | "\r\n";
+  encoding?: string;
+};
+
+export type ParquetReadOptions = {
+  columns?: readonly string[];
+  polarsModule?: unknown;
+};
+
+export type ParquetWriteOptions = {
+  polarsModule?: unknown;
+  compression?: string;
+};
+
 type BackendMatrixHandle = {
   readonly rows: number;
   readonly cols: number;
@@ -3544,6 +3576,477 @@ export function writeNpz(entries: NamedMatrix[]): Uint8Array {
   return zipSync(archive);
 }
 
+const DATAFRAME_DEFAULT_DTYPE: DType = "float64";
+const CSV_DEFAULT_DELIMITER = ",";
+
+export class DataFrameView {
+  private readonly _matrix: Matrix;
+  private readonly _columnNames: string[];
+  private readonly _columnDTypes: Record<string, DType>;
+
+  constructor(matrix: Matrix, columnNames?: readonly string[], columnDTypes?: Record<string, DType>) {
+    const names =
+      columnNames && columnNames.length === matrix.cols
+        ? Array.from(columnNames)
+        : generateDefaultColumnNames(matrix.cols);
+    if (names.length !== matrix.cols) {
+      throw new Error(
+        `DataFrameView: expected ${matrix.cols} column names, received ${names.length}`
+      );
+    }
+    this._matrix = matrix.dtype === "float64" ? matrix : matrix.astype("float64", { copy: true });
+    this._columnNames = names;
+    const dtypes: Record<string, DType> = {};
+    for (const name of names) {
+      dtypes[name] = columnDTypes?.[name] ?? DATAFRAME_DEFAULT_DTYPE;
+    }
+    this._columnDTypes = dtypes;
+  }
+
+  static fromMatrix(matrix: Matrix, options: DataFrameInitOptions = {}): DataFrameView {
+    const view = new DataFrameView(matrix, options.columns, options.columnDTypes);
+    if (options.inferColumnDTypes) {
+      const inferred: Record<string, DType> = {};
+      for (let index = 0; index < view._columnNames.length; index += 1) {
+        const name = view._columnNames[index];
+        inferred[name] = matrix.column(index).dtype;
+      }
+      return view.withColumnDTypes(inferred);
+    }
+    return view;
+  }
+
+  get rowCount(): number {
+    return this._matrix.rows;
+  }
+
+  get columnCount(): number {
+    return this._matrix.cols;
+  }
+
+  get columnNames(): string[] {
+    return Array.from(this._columnNames);
+  }
+
+  get columnDTypes(): Record<string, DType> {
+    return { ...this._columnDTypes };
+  }
+
+  toMatrix(copy = false): Matrix {
+    return copy ? this._matrix.astype("float64", { copy: true }) : this._matrix;
+  }
+
+  column(name: string, dtype?: DType): Matrix {
+    const index = this.columnIndex(name);
+    const target = dtype ?? this._columnDTypes[name] ?? DATAFRAME_DEFAULT_DTYPE;
+    let column = this._matrix.column(index);
+    if (column.dtype !== target) {
+      column = column.astype(target, { copy: true });
+    }
+    return column;
+  }
+
+  select(columnNames: readonly string[]): DataFrameView {
+    if (columnNames.length === 0) {
+      throw new Error("DataFrameView.select requires at least one column");
+    }
+    const matrices: Matrix[] = columnNames.map((name) =>
+      this._matrix.column(this.columnIndex(name)).astype("float64", { copy: true })
+    );
+    const matrix = combineColumnsAsMatrix(matrices);
+    const dtypes: Record<string, DType> = {};
+    for (const name of columnNames) {
+      dtypes[name] = this._columnDTypes[name] ?? DATAFRAME_DEFAULT_DTYPE;
+    }
+    return new DataFrameView(matrix, columnNames, dtypes);
+  }
+
+  withColumnDTypes(overrides: Record<string, DType>): DataFrameView {
+    const merged = { ...this._columnDTypes };
+    for (const [name, dtype] of Object.entries(overrides)) {
+      if (!this._columnNames.includes(name)) {
+        throw new Error(`DataFrameView: unknown column "${name}"`);
+      }
+      merged[name] = dtype;
+    }
+    return new DataFrameView(this._matrix, this._columnNames, merged);
+  }
+
+  renameColumns(mapping: Record<string, string>): DataFrameView {
+    const renamed = this._columnNames.map((name) => mapping[name] ?? name);
+    const dtypes: Record<string, DType> = {};
+    for (let index = 0; index < renamed.length; index += 1) {
+      dtypes[renamed[index]] = this._columnDTypes[this._columnNames[index]] ?? DATAFRAME_DEFAULT_DTYPE;
+    }
+    return new DataFrameView(this._matrix, renamed, dtypes);
+  }
+
+  toColumnArrays(): Record<string, Array<number | boolean>> {
+    const result: Record<string, Array<number | boolean>> = {};
+    for (const name of this._columnNames) {
+      const dtype = this._columnDTypes[name] ?? DATAFRAME_DEFAULT_DTYPE;
+      const column = this.column(name, dtype);
+      const numeric = Array.from(column.toArray() as ArrayLike<number>);
+      if (dtype === "bool") {
+        result[name] = numeric.map((value) => Boolean(value));
+      } else {
+        result[name] = numeric;
+      }
+    }
+    return result;
+  }
+
+  toObjectRows(limit?: number): Array<Record<string, number | boolean>> {
+    const rows: Array<Record<string, number | boolean>> = [];
+    const columnData = this.toColumnArrays();
+    const max = typeof limit === "number" ? Math.min(limit, this.rowCount) : this.rowCount;
+    for (let row = 0; row < max; row += 1) {
+      const record: Record<string, number | boolean> = {};
+      for (const name of this._columnNames) {
+        record[name] = columnData[name][row];
+      }
+      rows.push(record);
+    }
+    return rows;
+  }
+
+  private columnIndex(name: string): number {
+    const index = this._columnNames.indexOf(name);
+    if (index === -1) {
+      throw new Error(`DataFrameView: unknown column "${name}"`);
+    }
+    return index;
+  }
+}
+
+function combineColumnsAsMatrix(columns: Matrix[]): Matrix {
+  if (columns.length === 0) {
+    throw new Error("combineColumnsAsMatrix requires at least one column matrix");
+  }
+  let combined = columns[0].astype("float64", { copy: true });
+  for (let index = 1; index < columns.length; index += 1) {
+    const next = columns[index].astype("float64", { copy: true });
+    combined = concat(combined, next, 1);
+  }
+  return combined;
+}
+
+function generateDefaultColumnNames(count: number): string[] {
+  const result: string[] = [];
+  for (let index = 0; index < count; index += 1) {
+    result.push(`col${index}`);
+  }
+  return result;
+}
+
+function parseCsvString(content: string, delimiter: string, skipEmptyLines: boolean): string[][] {
+  const rows: string[][] = [];
+  let field = "";
+  let row: string[] = [];
+  let inQuotes = false;
+  for (let i = 0; i < content.length; i += 1) {
+    const ch = content[i];
+    if (ch === '"') {
+      if (inQuotes && content[i + 1] === '"') {
+        field += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+    if (ch === delimiter && !inQuotes) {
+      row.push(field);
+      field = "";
+      continue;
+    }
+    if ((ch === "\n" || ch === "\r") && !inQuotes) {
+      if (ch === "\r" && content[i + 1] === "\n") {
+        i += 1;
+      }
+      row.push(field);
+      field = "";
+      if (!(skipEmptyLines && row.every((cell) => cell.trim() === ""))) {
+        rows.push(row);
+      }
+      row = [];
+      continue;
+    }
+    field += ch;
+  }
+  row.push(field);
+  if (!(skipEmptyLines && row.every((cell) => cell.trim() === ""))) {
+    if (!(row.length === 1 && row[0] === "")) {
+      rows.push(row);
+    }
+  }
+  return rows;
+}
+
+function buildDataFrameFromCsvString(content: string, options: CsvReadOptions = {}): DataFrameView {
+  const delimiter = options.delimiter ?? CSV_DEFAULT_DELIMITER;
+  const rows = parseCsvString(content, delimiter, options.skipEmptyLines !== false);
+  if (rows.length === 0) {
+    throw new Error("readCsvDataFrame: CSV source is empty");
+  }
+  let headerRow: string[] | null = null;
+  let bodyRows: string[][] = rows;
+  if (options.hasHeader !== false) {
+    headerRow = rows[0];
+    bodyRows = rows.slice(1);
+    if (!headerRow || headerRow.length === 0) {
+      throw new Error("readCsvDataFrame: header row is empty");
+    }
+  }
+  let columnNames: string[];
+  if (options.hasHeader === false) {
+    columnNames =
+      options.columns && options.columns.length > 0
+        ? Array.from(options.columns)
+        : generateDefaultColumnNames(rows[0].length);
+  } else if (options.columns && options.columns.length > 0) {
+    if (!headerRow) {
+      throw new Error("readCsvDataFrame: header row required when selecting columns");
+    }
+    const indices = options.columns.map((name) => {
+      const index = headerRow!.indexOf(name);
+      if (index === -1) {
+        throw new Error(`readCsvDataFrame: column "${name}" not found in header`);
+      }
+      return index;
+    });
+    columnNames = Array.from(options.columns);
+    bodyRows = bodyRows.map((row) => indices.map((idx) => row[idx] ?? ""));
+  } else {
+    columnNames = headerRow ?? generateDefaultColumnNames(rows[0].length);
+  }
+  if (columnNames.length === 0) {
+    columnNames = generateDefaultColumnNames(rows[0].length);
+  }
+  const columnCount = columnNames.length;
+  for (const row of bodyRows) {
+    if (row.length !== columnCount) {
+      throw new Error(
+        `readCsvDataFrame: row length (${row.length}) does not match column count (${columnCount})`
+      );
+    }
+  }
+  const columnDTypes: Record<string, DType> = {};
+  const columnValues: Array<string[]> = columnNames.map((_, index) => bodyRows.map((row) => row[index] ?? ""));
+  for (let index = 0; index < columnNames.length; index += 1) {
+    const name = columnNames[index];
+    const explicit = options.columnTypes?.[name];
+    columnDTypes[name] = explicit ?? inferColumnType(columnValues[index]);
+  }
+  const matrix = constructMatrixFromCsv(columnNames, columnValues, columnDTypes);
+  return new DataFrameView(matrix, columnNames, columnDTypes);
+}
+
+function constructMatrixFromCsv(
+  columnNames: string[],
+  columnValues: Array<string[]>,
+  columnDTypes: Record<string, DType>
+): Matrix {
+  const rows = columnValues[0]?.length ?? 0;
+  const cols = columnNames.length;
+  const buffer = new Float64Array(rows * cols);
+  for (let col = 0; col < cols; col += 1) {
+    const name = columnNames[col];
+    const dtype = columnDTypes[name] ?? DATAFRAME_DEFAULT_DTYPE;
+    const values = columnValues[col];
+    for (let row = 0; row < rows; row += 1) {
+      buffer[row * cols + col] = coerceValueToNumber(values[row] ?? "", dtype);
+    }
+  }
+  return new Matrix(buffer, rows, cols, { dtype: "float64" });
+}
+
+function inferColumnType(values: readonly string[]): DType {
+  let boolCandidate = values.length > 0;
+  let intCandidate = values.length > 0;
+  for (const value of values) {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "" || normalized === "nan") {
+      boolCandidate = false;
+      intCandidate = false;
+      continue;
+    }
+    if (boolCandidate && normalized !== "true" && normalized !== "false" && normalized !== "1" && normalized !== "0") {
+      boolCandidate = false;
+    }
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || !Number.isInteger(numeric)) {
+      intCandidate = false;
+    }
+    if (!boolCandidate && !intCandidate) {
+      break;
+    }
+  }
+  if (boolCandidate) {
+    return "bool";
+  }
+  if (intCandidate) {
+    return "int32";
+  }
+  return "float64";
+}
+
+function coerceValueToNumber(value: string, dtype: DType): number {
+  const trimmed = value.trim();
+  switch (dtype) {
+    case "bool": {
+      if (/^(true|1)$/i.test(trimmed)) return 1;
+      if (/^(false|0)$/i.test(trimmed)) return 0;
+      return trimmed.length > 0 ? 1 : 0;
+    }
+    case "int32": {
+      const parsed = Number.parseInt(trimmed, 10);
+      return Number.isFinite(parsed) ? parsed : NaN;
+    }
+    default: {
+      const parsed = Number(trimmed);
+      return Number.isFinite(parsed) ? parsed : NaN;
+    }
+  }
+}
+
+function ensureNodeEnvironment(feature: string): void {
+  if (!isNode) {
+    throw new Error(`${feature} is only available in Node.js environments`);
+  }
+}
+
+async function loadNodeFs() {
+  return import("node:fs/promises");
+}
+
+export async function readCsvDataFrame(
+  path: string,
+  options: CsvReadOptions = {}
+): Promise<DataFrameView> {
+  ensureNodeEnvironment("readCsvDataFrame");
+  const fs = await loadNodeFs();
+  const encoding = options.encoding ?? "utf8";
+  const content = (await fs.readFile(path, { encoding } as any)) as unknown as string;
+  return buildDataFrameFromCsvString(content, options);
+}
+
+export async function writeDataFrameToCsv(
+  frame: DataFrameView,
+  path: string,
+  options: CsvWriteOptions = {}
+): Promise<void> {
+  ensureNodeEnvironment("writeDataFrameToCsv");
+  const fs = await loadNodeFs();
+  const delimiter = options.delimiter ?? CSV_DEFAULT_DELIMITER;
+  const includeHeader = options.includeHeader !== false;
+  const newline = options.newline ?? "\n";
+  const pieces: string[] = [];
+  if (includeHeader) {
+    pieces.push(frame.columnNames.map((name) => escapeCsvValue(name, delimiter)).join(delimiter));
+  }
+  const columns = frame.toColumnArrays();
+  for (let row = 0; row < frame.rowCount; row += 1) {
+    const values = frame.columnNames.map((name) => {
+      const dtype = frame.columnDTypes[name] ?? DATAFRAME_DEFAULT_DTYPE;
+      const raw = columns[name][row];
+      if (dtype === "bool") {
+        return escapeCsvValue(String(Boolean(raw)), delimiter);
+      }
+      return escapeCsvValue(String(raw ?? ""), delimiter);
+    });
+    pieces.push(values.join(delimiter));
+  }
+  const payload = pieces.join(newline) + newline;
+  await fs.writeFile(path, payload, { encoding: options.encoding ?? "utf8" } as any);
+}
+
+export async function readCsvDataFrameFromStream(
+  stream: ReadableStream<Uint8Array>,
+  options: CsvReadOptions = {}
+): Promise<DataFrameView> {
+  const decoder = new TextDecoder(options.encoding ?? "utf-8");
+  const reader = stream.getReader();
+  let content = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    content += decoder.decode(value, { stream: true });
+  }
+  content += decoder.decode(new Uint8Array(), { stream: false });
+  return buildDataFrameFromCsvString(content, options);
+}
+
+export async function readParquetDataFrame(
+  path: string,
+  options: ParquetReadOptions = {}
+): Promise<DataFrameView> {
+  ensureNodeEnvironment("readParquetDataFrame");
+  try {
+    const polars = await import("./io/polars");
+    const module = await polars.ensurePolarsModule(options.polarsModule);
+    if (typeof module.readParquet !== "function") {
+      throw new Error("Loaded Polars module does not expose readParquet");
+    }
+    const dataframe = (await module.readParquet(
+      path,
+      options.columns ? { columns: options.columns } : undefined
+    )) as unknown;
+    const { matrix, columnNames } = polars.polarsDataFrameToMatrix(dataframe as any, {
+      columns: options.columns,
+    });
+    return DataFrameView.fromMatrix(matrix, {
+      columns: columnNames,
+      inferColumnDTypes: true,
+    });
+  } catch (error) {
+    throw new Error(
+      'readParquetDataFrame requires the "nodejs-polars" (preferred) or "polars" package. Install it and optionally pass the module via options.polarsModule.',
+      { cause: error }
+    );
+  }
+}
+
+export async function writeParquetDataFrame(
+  frame: DataFrameView,
+  path: string,
+  options: ParquetWriteOptions = {}
+): Promise<void> {
+  ensureNodeEnvironment("writeParquetDataFrame");
+  try {
+    const polars = await import("./io/polars");
+    const module = await polars.ensurePolarsModule(options.polarsModule);
+    const df = (await polars.matrixToPolarsDataFrame(frame.toMatrix(true), {
+      columnNames: frame.columnNames,
+      polarsModule: module,
+    })) as { writeParquet?: (path: string, options?: unknown) => Promise<void> };
+    if (df && typeof df.writeParquet === "function") {
+      await df.writeParquet(path, options);
+      return;
+    }
+    if (typeof module.writeParquet === "function") {
+      await module.writeParquet(path, df, options);
+      return;
+    }
+    throw new Error("Loaded Polars module does not expose writeParquet");
+  } catch (error) {
+    throw new Error(
+      'writeParquetDataFrame requires the "nodejs-polars" (preferred) or "polars" package. Install it and optionally pass the module via options.polarsModule.',
+      { cause: error }
+    );
+  }
+}
+
+function escapeCsvValue(value: string, delimiter: string): string {
+  if (value.includes('"')) {
+    value = value.replace(/"/g, '""');
+  }
+  if (value.includes(delimiter) || /\r|\n/.test(value) || value.includes('"')) {
+    return `"${value}"`;
+  }
+  return value;
+}
+
 export function lazyFromMatrix(matrix: Matrix): LazyArray {
   return matrix.toLazy();
 }
@@ -3573,10 +4076,3 @@ export type {
   PolarsToMatrixOptions,
   MatrixToPolarsOptions,
 };
-
-
-
-
-
-
-
