@@ -5,6 +5,7 @@ mod cpu;
 pub mod dtype;
 pub mod element;
 pub mod error;
+pub mod gpu;
 mod macros;
 pub mod metrics;
 mod simd;

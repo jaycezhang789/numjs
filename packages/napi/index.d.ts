@@ -15,6 +15,9 @@ export declare function cos(matrix: Matrix): Matrix
 export declare function tanh(matrix: Matrix): Matrix
 export declare function sigmoid(matrix: Matrix): Matrix
 export declare function matmul(a: Matrix, b: Matrix): Matrix
+export declare function gpuAvailable(): boolean
+export declare function gpuBackendKind(): string | undefined
+export declare function gpuMatmul(a: Matrix, b: Matrix): Matrix
 export declare function clip(matrix: Matrix, min: number, max: number): Matrix
 export declare function whereSelect(condition: Matrix, truthy: Matrix, falsy: Matrix): Matrix
 export declare function whereSelectMulti(conditions: Array<Matrix>, choices: Array<Matrix>, defaultValue?: Matrix | undefined | null): Matrix
@@ -38,6 +41,7 @@ export declare function copyBytesTotal(): number
 export declare function takeCopyBytes(): number
 export declare function resetCopyBytes(): void
 export declare function sum(matrix: Matrix, dtype?: string | undefined | null): Matrix
+export declare function gpuSum(matrix: Matrix, dtype?: string | undefined | null): Matrix
 export declare function nansum(matrix: Matrix, dtype?: string | undefined | null): Matrix
 export declare function nanmean(matrix: Matrix, dtype?: string | undefined | null): Matrix
 export declare function median(matrix: Matrix, dtype?: string | undefined | null): Matrix

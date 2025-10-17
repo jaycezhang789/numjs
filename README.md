@@ -48,6 +48,35 @@ Fixed-point matrices are backed by signed 64-bit integers plus a per-matrix scal
 - `matmul_batched` performs batched GEMM across 3D tensors and parallelises over batch items when profitable.
 - In browsers, opt-in WASM threads via `await init({ threads: true })` (requires `SharedArrayBuffer` and a cross-origin isolated context). You can cap the worker count with `init({ threads: 4 })`.
 
+## GPU Acceleration (Beta)
+
+- **WebGPU hot paths.** `matmulAsync`, `sumAsync`, and the new `conv2d` helper offload to WebGPU compute shaders when `navigator.gpu` is available. The JavaScript wrapper coordinates scheduling, automatically falling back to WASM/JS when WebGPU initialisation fails. These APIs always resolve to the same results as their synchronous counterparts, so you can feature-detect with `if (webGpuAvailable())`.
+- **Node CUDA binding.** The N-API module now exposes `gpuAvailable()`, `gpuBackendKind()`, `gpuMatmul()`, and `gpuSum()`. When the binary is built with `--features gpu-cuda`, the wrapper will try the CUDA kernels first and transparently return to the CPU implementation if the GPU is missing or rejects a workload.
+- **Build switches.** CUDA support is off by default. Enable it by rebuilding the native addon with:
+
+  ```shell
+  cargo build -p num_rs_napi --release --features gpu-cuda
+  ```
+
+  The JS package will automatically detect the accelerated backend once the addon is on the module search path.
+
+- **Usage example.**
+
+  ```ts
+  import { init, Matrix, matmulAsync, gpuBackendKind } from "@jayce789/numjs";
+
+  await init();
+  console.log("GPU:", gpuBackendKind() ?? "cpu");
+
+  const a = new Matrix(new Float32Array([1, 2, 3, 4]), 2, 2, { dtype: "float32" });
+  const b = new Matrix(new Float32Array([4, 3, 2, 1]), 2, 2, { dtype: "float32" });
+
+  const accelerated = await matmulAsync(a, b);
+  console.log(accelerated.toArray()); // falls back gracefully if GPU is unavailable
+  ```
+
+- **Fallback guarantees.** Both the WebGPU and CUDA paths are optional. When a GPU path fails initialisation or throws, the library reverts to the existing WASM/native implementations without changing return types or throwing additional errors.
+
 ## Licensing and Feedback
 
 The project is currently pre-release. File issues or pull requests if you encounter bugs, missing algorithms, or performance regressions.

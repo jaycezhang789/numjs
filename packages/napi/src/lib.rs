@@ -7,6 +7,7 @@ use napi_derive::napi;
 use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
 use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
+use num_rs_core::gpu::{self, GpuBackendKind as CoreGpuBackendKind};
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
     cos as core_cos, div as core_div, dot as core_dot, exp as core_exp, gather as core_gather,
@@ -243,6 +244,45 @@ pub fn matmul(a: &Matrix, b: &Matrix) -> Result<Matrix> {
 }
 
 #[napi]
+pub fn gpu_available() -> bool {
+    gpu::active_backend_kind().is_some()
+}
+
+#[napi]
+pub fn gpu_backend_kind() -> Option<String> {
+    gpu::backend_name().map(|kind| kind.to_string())
+}
+
+#[napi]
+pub fn gpu_matmul(a: &Matrix, b: &Matrix) -> Result<Matrix> {
+    if let Some(_kind) = gpu::active_backend_kind() {
+        let rows = a.rows() as usize;
+        let shared = a.cols() as usize;
+        let cols = b.cols() as usize;
+        if shared != b.rows() as usize {
+            return Err(map_core_error(format!(
+                "gpu_matmul: left.cols ({shared}) must equal right.rows ({})",
+                b.rows()
+            )));
+        }
+        let lhs = ensure_float32_buffer(a.buffer()).map_err(map_core_error)?;
+        let rhs = ensure_float32_buffer(b.buffer()).map_err(map_core_error)?;
+        let lhs_view = lhs.try_as_slice::<f32>().map_err(map_core_error)?;
+        let rhs_view = rhs.try_as_slice::<f32>().map_err(map_core_error)?;
+        match gpu::matmul_f32(lhs_view, rhs_view, rows, shared, cols) {
+            Ok(values) => {
+                let buffer = MatrixBuffer::from_vec(values, rows, cols).map_err(map_core_error)?;
+                return Ok(Matrix::from_buffer(buffer));
+            }
+            Err(err) => {
+                eprintln!("[numjs] GPU matmul failed: {err}. Falling back to CPU.");
+            }
+        }
+    }
+    map_matrix(core_matmul(a.buffer(), b.buffer()))
+}
+
+#[napi]
 pub fn clip(matrix: &Matrix, min: f64, max: f64) -> Result<Matrix> {
     map_matrix(core_clip(matrix.buffer(), min, max))
 }
@@ -444,6 +484,35 @@ pub fn sum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
 }
 
 #[napi]
+pub fn gpu_sum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
+    let target = match dtype {
+        Some(value) => Some(value.parse::<DType>().map_err(map_core_error)?),
+        None => None,
+    };
+    if let Some(_kind) = gpu::active_backend_kind() {
+        let buffer = ensure_float32_buffer(matrix.buffer()).map_err(map_core_error)?;
+        let view = buffer.try_as_slice::<f32>().map_err(map_core_error)?;
+        match gpu::reduce_sum_f32(view) {
+            Ok(total) => {
+                let base = MatrixBuffer::from_vec(vec![total], 1, 1).map_err(map_core_error)?;
+                let mut result = Matrix::from_buffer(base);
+                if let Some(target_dtype) = target {
+                    if target_dtype != DType::Float32 {
+                        result =
+                            result.astype(target_dtype.as_str().to_string(), Some(false), None)?;
+                    }
+                }
+                return Ok(result);
+            }
+            Err(err) => {
+                eprintln!("[numjs] GPU sum failed: {err}. Falling back to CPU.");
+            }
+        }
+    }
+    map_matrix(core_sum(matrix.buffer(), target))
+}
+
+#[napi]
 pub fn nansum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
     let target = match dtype {
         Some(value) => Some(value.parse::<DType>().map_err(map_core_error)?),
@@ -556,6 +625,14 @@ fn convert_indices(indices: &[i64]) -> Result<Vec<isize>> {
                 .map_err(|_| map_core_error(format!("index {value} exceeds platform limits")))
         })
         .collect()
+}
+
+fn ensure_float32_buffer(buffer: &MatrixBuffer) -> Result<MatrixBuffer, String> {
+    if buffer.dtype() == DType::Float32 {
+        Ok(buffer.clone())
+    } else {
+        buffer.cast(DType::Float32)
+    }
 }
 
 // ---------------------------------------------------------------------

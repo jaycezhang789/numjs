@@ -38,6 +38,7 @@
     "fflate": "^0.8.1"
   },
   "devDependencies": {
+    "@webgpu/types": "^0.1.39",
     "@types/node": "^20",
     "tsup": "^8",
     "typescript": "^5"

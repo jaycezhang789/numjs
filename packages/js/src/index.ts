@@ -1,4 +1,9 @@
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
+import {
+  createWebGpuEngine,
+  isWebGpuSupported,
+  WebGpuEngine,
+} from "./gpu/webgpu";
 
 type BackendKind = "napi" | "wasm";
 
@@ -21,6 +26,24 @@ export type DType =
 
 export type InitOptions = {
   threads?: boolean | number;
+};
+
+export type GpuBackendKind = "webgpu" | "cuda" | "rocm";
+
+export type GpuExecutionMode = "auto" | "gpu-only" | "cpu-only";
+
+export type WebGpuInitOptions = {
+  forceFallback?: boolean;
+};
+
+export type GpuMatmulOptions = {
+  mode?: GpuExecutionMode;
+};
+
+export type Conv2DOptions = {
+  stride?: number;
+  pad?: number;
+  mode?: GpuExecutionMode;
 };
 
 type BackendMatrixHandle = {
@@ -262,6 +285,9 @@ let activeKind: BackendKind | null = null;
 let pendingLoad: Promise<void> | null = null;
 let pendingInitOptions: InitOptions = {};
 let wasmThreadsInitialized = false;
+let webGpuEngine: WebGpuEngine | null = null;
+let webGpuEnginePromise: Promise<WebGpuEngine | null> | null = null;
+let activeGpuKind: GpuBackendKind | null = null;
 
 export type NamedMatrix = { name: string; matrix: Matrix };
 
@@ -776,6 +802,177 @@ function callHandleToBytes(handle: BackendMatrixHandle): Uint8Array {
   throw new Error("Backend handle lacks to_bytes/toBytes method");
 }
 
+async function ensureWebGpuEngine(
+  options?: WebGpuInitOptions
+): Promise<WebGpuEngine | null> {
+  if (options?.forceFallback) {
+    webGpuEngine = null;
+    webGpuEnginePromise = null;
+    if (activeGpuKind === "webgpu") {
+      activeGpuKind = null;
+    }
+    return null;
+  }
+  if (webGpuEngine) {
+    return webGpuEngine;
+  }
+  if (!webGpuEnginePromise) {
+    webGpuEnginePromise = createWebGpuEngine(options).catch((error) => {
+      console.warn("[numjs] Failed to initialise WebGPU engine:", error);
+      return null;
+    });
+  }
+  const engine = await webGpuEnginePromise;
+  if (engine) {
+    webGpuEngine = engine;
+    activeGpuKind = "webgpu";
+  } else {
+    if (activeGpuKind === "webgpu") {
+      activeGpuKind = null;
+    }
+    webGpuEnginePromise = null;
+  }
+  return webGpuEngine;
+}
+
+export async function initWebGpu(
+  options: WebGpuInitOptions = {}
+): Promise<boolean> {
+  const engine = await ensureWebGpuEngine(options);
+  return engine !== null;
+}
+
+export function webGpuAvailable(): boolean {
+  return !!webGpuEngine || isWebGpuSupported();
+}
+
+export function gpuBackendKind(): GpuBackendKind | null {
+  if (activeGpuKind) {
+    return activeGpuKind;
+  }
+  if (isNode) {
+    try {
+      const backend = ensureBackend();
+      const kindFn =
+        (backend as Record<string, unknown>).gpu_backend_kind ??
+        (backend as Record<string, unknown>).gpuBackendKind;
+      if (typeof kindFn === "function") {
+        const result = kindFn.call(backend);
+        if (result === "cuda") {
+          activeGpuKind = "cuda";
+          return activeGpuKind;
+        }
+        if (result === "rocm") {
+          activeGpuKind = "rocm";
+          return activeGpuKind;
+        }
+      }
+    } catch (error) {
+      console.warn("[numjs] Failed to query native GPU backend:", error);
+    }
+  }
+  return activeGpuKind;
+}
+
+export function gpuAvailable(): boolean {
+  return gpuBackendKind() !== null || webGpuAvailable();
+}
+
+async function selectGpuEngine(
+  mode: GpuExecutionMode | undefined
+): Promise<WebGpuEngine | null> {
+  if (mode === "cpu-only") {
+    return null;
+  }
+  const engine = await ensureWebGpuEngine();
+  if (!engine && mode === "gpu-only") {
+    throw new Error("WebGPU backend requested but unavailable in this environment");
+  }
+  return engine;
+}
+
+function toFloat32View(matrix: Matrix): {
+  rows: number;
+  cols: number;
+  array: Float32Array;
+} {
+  const source =
+    matrix.dtype === "float32" ? matrix : matrix.astype("float32", { copy: true });
+  const arr = source.toArray();
+  if (arr instanceof Float32Array) {
+    return { rows: source.rows, cols: source.cols, array: arr };
+  }
+  return {
+    rows: source.rows,
+    cols: source.cols,
+    array: Float32Array.from(arr as ArrayLike<number>),
+  };
+}
+
+function computeConv2DOutputShape(
+  inputRows: number,
+  inputCols: number,
+  kernelRows: number,
+  kernelCols: number,
+  stride: number,
+  pad: number
+): { rows: number; cols: number } {
+  if (stride <= 0) {
+    throw new Error("conv2d: stride must be positive");
+  }
+  if (kernelRows <= 0 || kernelCols <= 0) {
+    throw new Error("conv2d: kernel dimensions must be positive");
+  }
+  const outRows = Math.floor((inputRows + 2 * pad - kernelRows) / stride + 1);
+  const outCols = Math.floor((inputCols + 2 * pad - kernelCols) / stride + 1);
+  if (outRows <= 0 || outCols <= 0) {
+    throw new Error(
+      `conv2d: invalid output shape (${outRows} x ${outCols}); check stride/padding/kernel dimensions`
+    );
+  }
+  return { rows: outRows, cols: outCols };
+}
+
+function conv2dCpuImplementation(
+  input: Float32Array,
+  kernel: Float32Array,
+  inputRows: number,
+  inputCols: number,
+  kernelRows: number,
+  kernelCols: number,
+  stride: number,
+  pad: number
+): Float32Array {
+  const { rows: outRows, cols: outCols } = computeConv2DOutputShape(
+    inputRows,
+    inputCols,
+    kernelRows,
+    kernelCols,
+    stride,
+    pad
+  );
+  const output = new Float32Array(outRows * outCols);
+  for (let orow = 0; orow < outRows; orow += 1) {
+    for (let ocol = 0; ocol < outCols; ocol += 1) {
+      let acc = 0;
+      for (let krow = 0; krow < kernelRows; krow += 1) {
+        for (let kcol = 0; kcol < kernelCols; kcol += 1) {
+          const inRow = orow * stride + krow - pad;
+          const inCol = ocol * stride + kcol - pad;
+          if (inRow < 0 || inRow >= inputRows || inCol < 0 || inCol >= inputCols) {
+            continue;
+          }
+          const inputIndex = inRow * inputCols + inCol;
+          const kernelIndex = krow * kernelCols + kcol;
+          acc += input[inputIndex] * kernel[kernelIndex];
+        }
+      }
+      output[orow * outCols + ocol] = acc;
+    }
+  }
+  return output;
+}
+
 function handleToFloat64(handle: BackendMatrixHandle): Float64Array {
   const raw = callHandleToVec(handle);
   return raw instanceof Float64Array ? raw : Float64Array.from(raw);
@@ -966,6 +1163,11 @@ export async function init(options: InitOptions = {}): Promise<void> {
   pendingInitOptions = mergeInitOptions(pendingInitOptions, options);
   if (activeBackend) {
     await ensureWasmThreadState(pendingInitOptions);
+    if (!isNode) {
+      await initWebGpu().catch(() => {
+        /* noop - fall back to CPU */
+      });
+    }
     return;
   }
   if (!pendingLoad) {
@@ -976,6 +1178,11 @@ export async function init(options: InitOptions = {}): Promise<void> {
   }
   await pendingLoad;
   await ensureWasmThreadState(pendingInitOptions);
+  if (!isNode) {
+    await initWebGpu().catch(() => {
+      /* noop - fall back to CPU */
+    });
+  }
 }
 
 export class Matrix {
@@ -1647,6 +1854,110 @@ export function matmul(a: Matrix, b: Matrix): Matrix {
   return Matrix.fromHandleWithDType(result, dtype);
 }
 
+export async function matmulAsync(
+  a: Matrix,
+  b: Matrix,
+  options: GpuMatmulOptions = {}
+): Promise<Matrix> {
+  if (a.dtype === "fixed64" || b.dtype === "fixed64") {
+    throw new Error("matmulAsync does not support fixed64 matrices; cast operands to float32 first");
+  }
+  if (a.cols !== b.rows) {
+    throw new Error(
+      `matmulAsync dimension mismatch: left columns (${a.cols}) must equal right rows (${b.rows})`
+    );
+  }
+  if (isNode) {
+    const backend = ensureBackend();
+    const nativeGpuMatmul =
+      (backend as Record<string, unknown>).gpu_matmul ??
+      (backend as Record<string, unknown>).gpuMatmul;
+    if (typeof nativeGpuMatmul === "function") {
+      try {
+        const handle = (nativeGpuMatmul as (lhs: BackendMatrixHandle, rhs: BackendMatrixHandle) => BackendMatrixHandle)(
+          getHandle(a),
+          getHandle(b)
+        );
+        const dtype = getMatrixDTypeFromHandle(handle) ?? "float32";
+        const metadata =
+          dtype === "fixed64"
+            ? { fixedScale: getMatrixFixedScaleFromHandle(handle) ?? null }
+            : undefined;
+        activeGpuKind = "cuda";
+        return Matrix.fromHandleWithDType(handle, dtype, metadata);
+      } catch (error) {
+        console.warn("[numjs] N-API gpu_matmul failed; falling back to other accelerators.", error);
+      }
+    }
+  }
+  const engine = await selectGpuEngine(options.mode ?? "auto");
+  if (!engine) {
+    return Promise.resolve(matmul(a, b));
+  }
+  const left = toFloat32View(a);
+  const right = toFloat32View(b);
+  if (left.cols !== right.rows) {
+    throw new Error(
+      `matmulAsync dimension mismatch: left columns (${left.cols}) must equal right rows (${right.rows})`
+    );
+  }
+  const result = await engine.matmul({
+    a: left.array,
+    b: right.array,
+    rowsA: left.rows,
+    colsA: left.cols,
+    colsB: right.cols,
+  });
+  return new Matrix(result, left.rows, right.cols, { dtype: "float32" });
+}
+
+export async function conv2d(
+  input: Matrix,
+  kernel: Matrix,
+  options: Conv2DOptions = {}
+): Promise<Matrix> {
+  if (input.dtype === "fixed64" || kernel.dtype === "fixed64") {
+    throw new Error("conv2d does not support fixed64 matrices; cast to float32 first");
+  }
+  const stride = options.stride ?? 1;
+  const pad = options.pad ?? 0;
+  const inputView = toFloat32View(input);
+  const kernelView = toFloat32View(kernel);
+  const { rows: outRows, cols: outCols } = computeConv2DOutputShape(
+    inputView.rows,
+    inputView.cols,
+    kernelView.rows,
+    kernelView.cols,
+    stride,
+    pad
+  );
+  const engine = await selectGpuEngine(options.mode ?? "auto");
+  if (engine) {
+    const result = await engine.conv2d({
+      input: inputView.array,
+      kernel: kernelView.array,
+      inputRows: inputView.rows,
+      inputCols: inputView.cols,
+      kernelRows: kernelView.rows,
+      kernelCols: kernelView.cols,
+      stride,
+      pad,
+    });
+    return new Matrix(result, outRows, outCols, { dtype: "float32" });
+  }
+  const cpuResult = conv2dCpuImplementation(
+    inputView.array,
+    kernelView.array,
+    inputView.rows,
+    inputView.cols,
+    kernelView.rows,
+    kernelView.cols,
+    stride,
+    pad
+  );
+  return new Matrix(cpuResult, outRows, outCols, { dtype: "float32" });
+}
+
 
 export function row(matrix: Matrix, index: number): Matrix {
   const backend = ensureBackend();
@@ -2034,6 +2345,10 @@ export type ReduceOptions = {
   dtype?: DType;
 };
 
+export type GpuReduceOptions = ReduceOptions & {
+  mode?: GpuExecutionMode;
+};
+
 function unaryFloatOpInJs(
   matrix: Matrix,
   op: (value: number) => number,
@@ -2418,6 +2733,53 @@ export function sum(matrix: Matrix, options: ReduceOptions = {}): Matrix {
     return Matrix.fromHandleWithDType(handle, dtype, { fixedScale });
   }
   return sumInJs(matrix, options);
+}
+
+export async function sumAsync(
+  matrix: Matrix,
+  options: GpuReduceOptions = {}
+): Promise<Matrix> {
+  const { mode = "auto", dtype } = options;
+  if (isNode) {
+    const backend = ensureBackend();
+    const nativeGpuSum =
+      (backend as Record<string, unknown>).gpu_sum ?? (backend as Record<string, unknown>).gpuSum;
+    if (typeof nativeGpuSum === "function") {
+      try {
+        const handle = (nativeGpuSum as (
+          source: BackendMatrixHandle,
+          dtype: string | null
+        ) => BackendMatrixHandle)(getHandle(matrix), dtype ?? null);
+        const resolvedDType = getMatrixDTypeFromHandle(handle) ?? (dtype ?? "float32");
+        const metadata =
+          resolvedDType === "fixed64"
+            ? { fixedScale: getMatrixFixedScaleFromHandle(handle) ?? null }
+            : undefined;
+        activeGpuKind = "cuda";
+        return Matrix.fromHandleWithDType(handle, resolvedDType, metadata);
+      } catch (error) {
+        console.warn("[numjs] N-API gpu_sum failed; falling back to other accelerators.", error);
+      }
+    }
+  }
+  const engine = await selectGpuEngine(mode);
+  if (!engine) {
+    const reduceOptions: ReduceOptions = {};
+    if (dtype) {
+      reduceOptions.dtype = dtype;
+    }
+    return Promise.resolve(sum(matrix, reduceOptions));
+  }
+  if (matrix.dtype === "fixed64") {
+    throw new Error("sumAsync does not support fixed64 matrices; cast to float32 first");
+  }
+  const view = toFloat32View(matrix);
+  const total = await engine.reduceSum({ data: view.array });
+  const result = new Matrix(new Float32Array([total]), 1, 1, { dtype: "float32" });
+  if (dtype && dtype !== "float32") {
+    return result.astype(dtype, { copy: false });
+  }
+  return result;
 }
 
 export function nansum(matrix: Matrix, options: ReduceOptions = {}): Matrix {
