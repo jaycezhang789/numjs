@@ -105,6 +105,18 @@ Fixed-point matrices are backed by signed 64-bit integers plus a per-matrix scal
 - **ONNX Runtime.** `loadOnnxModel` dynamically imports `onnxruntime-node`, creates an inference session, and exposes a lightweight `OnnxModel` wrapper. Feed `Matrix` or typed arrays to `model.run` and receive output matrices. The dependency is optional—if it’s absent the helper raises an informative error.
 - **Safety defaults.** Both bridges are Node-only and lazy-load their optional dependencies. No extra code ships to the browser bundles unless you explicitly call the APIs.
 
+## Debugging & Diagnostics
+
+- Set `DEBUG=1` before invoking `init()` to enable verbose logging. NumJS reports backend selection, fallback decisions (N-API → WASM → WebGPU), and emits low-level metrics to help you diagnose performance and interop issues.
+- Use `init({ preferBackend: "napi" | "wasm", onBackendReady(info) { … } })` to steer backend selection. When a requested backend fails to load, NumJS logs guidance—e.g., installing the appropriate N-API binary or enabling WebGPU—and automatically moves down the fallback chain.
+- Debug mode also captures timing/fallback information during GPU initialisation and Python/ONNX integrations, making it easier to follow the control flow when bridging ecosystems.
+
+## Testing & Benchmarks
+
+- **Property tests.** The Rust core uses [`proptest`](https://docs.rs/proptest) to exercise arithmetic and matmul kernels across random shapes, while the JavaScript wrapper mirrors this with [`fast-check`](https://github.com/dubzzz/fast-check). Run `cargo test -p num_rs_core` and `npm --prefix packages/js run test` to execute both suites.
+- **Backend consistency.** JavaScript tests spawn N-API and WASM processes to ensure numerical parity (within tolerance) across the two runtimes. Skips automatically if a backend is missing on the host.
+- **Benchmarks.** `npm --prefix packages/js run bench` records micro/macro benchmarks (matmul, convolution, pooling pipelines) and emits an HTML report under `tmp/numjs-bench.html` so you can track performance regressions over time.
+
 ## Licensing and Feedback
 
 The project is currently pre-release. File issues or pull requests if you encounter bugs, missing algorithms, or performance regressions.

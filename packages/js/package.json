@@ -19,10 +19,11 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "test": "npm --prefix ../napi run build && npm --prefix ../wasm run build && npm run build && node --test ./test/io.test.mjs",
+    "test": "npm --prefix ../napi run build && npm --prefix ../wasm run build && npm run build && node --test ./test/*.mjs ./test/**/*.mjs",
     "build": "npm run build:js && npm run copy:artifacts",
     "build:js": "tsup src/index.ts --format esm,cjs --dts --clean",
     "copy:artifacts": "node ./scripts/copy-artifacts.mjs",
+    "bench": "node ./scripts/bench.mjs",
     "prepublishOnly": "npm --prefix ../wasm run build && npm --prefix ../napi run build && npm run build",
     "prepack": "npm --prefix ../wasm run build && npm --prefix ../napi run build && npm run build"
   },
@@ -64,6 +65,7 @@
   "devDependencies": {
     "@webgpu/types": "^0.1.39",
     "@types/node": "^20",
+    "fast-check": "^3",
     "tsup": "^8",
     "typescript": "^5"
   },

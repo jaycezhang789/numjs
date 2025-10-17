@@ -417,6 +417,7 @@ let webGpuEnginePromise: Promise<WebGpuEngine | null> | null = null;
 let activeGpuKind: GpuBackendKind | null = null;
 let backendPreference: BackendPreference = "auto";
 let backendReadyHook: ((info: BackendResolvedInfo) => void) | null = null;
+let debugEnabled = false;
 
 export type NamedMatrix = { name: string; matrix: Matrix };
 
@@ -670,6 +671,9 @@ async function loadBackend(options: InitOptions): Promise<void> {
       console.warn(
         "[numjs] Requested N-API backend unavailable; falling back to WebAssembly runtime."
       );
+      if (debugEnabled) {
+        console.debug("[numjs][debug] loadNapiBackend returned null; switching to WASM fallback");
+      }
     }
   }
 
@@ -719,10 +723,17 @@ function notifyBackendReady(): void {
       console.warn("[numjs] backend ready hook threw an error", error);
     }
   }
+  if (debugEnabled && activeKind) {
+    const info = { kind: activeKind, webGpu: webGpuAvailable() };
+    console.debug("[numjs][debug] backend ready", info);
+  }
 }
 
 export function setBackendPreference(preference: BackendPreference): void {
   backendPreference = preference;
+  if (debugEnabled) {
+    console.debug("[numjs][debug] backend preference set", preference);
+  }
 }
 
 export function getBackendPreference(): BackendPreference {
@@ -779,6 +790,9 @@ async function loadNapiBackend(): Promise<BackendModule | null> {
           `[numjs] Failed to load native backend from "${specifier}". Falling back if possible.`,
           error
         );
+        if (debugEnabled) {
+          console.debug("[numjs][debug] Candidate", specifier, "failed to load", error);
+        }
       }
     }
   }
@@ -984,6 +998,9 @@ async function ensureWebGpuEngine(
   if (!webGpuEnginePromise) {
     webGpuEnginePromise = createWebGpuEngine(options).catch((error) => {
       console.warn("[numjs] Failed to initialise WebGPU engine:", error);
+      if (debugEnabled) {
+        console.debug("[numjs][debug] WebGPU initialisation error", error);
+      }
       return null;
     });
   }
@@ -1326,6 +1343,10 @@ function handleToTypedArray(handle: BackendMatrixHandle): TypedArray {
 }
 
 export async function init(options: InitOptions = {}): Promise<void> {
+  if (!debugEnabled && (globalThis as any)?.process?.env?.DEBUG === "1") {
+    debugEnabled = true;
+    console.debug("[numjs][debug] Debug logging enabled");
+  }
   if (options.preferBackend) {
     backendPreference = options.preferBackend;
   }
