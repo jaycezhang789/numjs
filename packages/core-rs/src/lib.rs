@@ -2,6 +2,8 @@ pub mod buffer;
 pub mod compress;
 pub mod dtype;
 pub mod element;
+#[cfg(any(feature = "cpu-openblas", feature = "cpu-blis", feature = "cpu-mkl"))]
+mod cpu;
 pub mod error;
 mod macros;
 pub mod metrics;
@@ -1226,6 +1228,13 @@ pub fn matmul(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
         return Err("matmul(Fixed64): convert operands to float64 before multiplying".into());
     }
     let dtype = promote_pair(a.dtype(), b.dtype()).map_err(|err| format!("where_select: {err}"))?;
+
+    #[cfg(any(feature = "cpu-openblas", feature = "cpu-blis", feature = "cpu-mkl"))]
+    {
+        if let Some(result) = cpu::try_matmul(a, b) {
+            return result;
+        }
+    }
 
     let a_matrix = Array2::from_shape_vec((a.rows(), a.cols()), a.to_f64_vec())
         .map_err(|_| error::shape_mismatch("matmul: failed to reshape left matrix"))?;

@@ -6,6 +6,9 @@ edition = "2021"
 [features]
 default = ["linalg"]
 linalg = ["num_rs_core/linalg"]
+cpu-openblas = ["num_rs_core/cpu-openblas"]
+cpu-blis = ["num_rs_core/cpu-blis"]
+cpu-mkl = ["num_rs_core/cpu-mkl"]
 
 [lib]
 crate-type = ["cdylib"]

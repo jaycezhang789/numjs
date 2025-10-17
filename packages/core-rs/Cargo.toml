@@ -7,6 +7,9 @@ edition = "2021"
 default = ["linalg", "npy"]
 linalg = ["nalgebra"]
 npy = ["ndarray-npy"]
+cpu-openblas = ["dep:cblas", "dep:openblas-src"]
+cpu-blis = ["dep:cblas", "dep:blis-src"]
+cpu-mkl = ["dep:cblas", "dep:intel-mkl-src", "intel-mkl-src/mkl-static-lp64-iomp"]
 
 [dependencies]
 cfg-if = "1"
@@ -16,3 +19,7 @@ ndarray-npy = { version = "0.8", optional = true }
 num-traits = "0.2"
 py_literal = "0.4"
 zip = { version = "0.5", default-features = false, features = ["deflate"] }
+cblas = { version = "0.5", optional = true }
+openblas-src = { version = "0.10", optional = true, default-features = false, features = ["cblas"] }
+blis-src = { version = "0.2", optional = true, default-features = false, features = ["cblas"] }
+intel-mkl-src = { version = "0.8", optional = true, default-features = false }
