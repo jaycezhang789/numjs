@@ -1,6 +1,29 @@
-﻿# @jayce789/numjs
+# @jayce789/numjs
+
+[![GitHub](https://img.shields.io/badge/github-numjs-24292f?logo=github)](https://github.com/jaycezhang789/numjs)
 
 `@jayce789/numjs` brings a Rust-powered numerical core to the JavaScript ecosystem, delivering a NumPy-inspired matrix API. The package ships with a high-performance Node N-API backend and a WebAssembly fallback, automatically loading the best option at runtime so the same code runs in Node.js and modern browsers.
+
+## Table of Contents
+- [Project Links](#project-links)
+- [Installation](#installation)
+- [Key Features](#key-features)
+- [Quick Start](#quick-start)
+  - [Common Operations](#common-operations)
+- [Backend Strategy](#backend-strategy)
+- [Browser Usage](#browser-usage)
+- [Node.js Compatibility](#nodejs-compatibility)
+- [Error Handling & Diagnostics](#error-handling--diagnostics)
+- [Performance Tips](#performance-tips)
+- [Output & Rounding (Display Only)](#output--rounding-display-only)
+- [Stable Reductions](#stable-reductions)
+- [Fixed64 (alpha)](#fixed64-alpha)
+- [Publishing](#publishing)
+- [Contributing](#contributing)
+
+## Project Links
+- **Repository:** <https://github.com/jaycezhang789/numjs>
+- **Issue Tracker:** <https://github.com/jaycezhang789/numjs/issues>
 
 ## Installation
 ```bash
@@ -65,6 +88,13 @@ Ensure your bundler knows how to serve `.wasm` assets (Vite, Webpack, Rollup, et
 - Bundles CommonJS (`dist/index.cjs`) and ES Module (`dist/index.js`) entry points.
 - Works in Electron/NW.js – when the native module cannot be loaded the code automatically falls back to WebAssembly.
 
+## Error Handling & Diagnostics
+- Core operations surface structured error codes (`E_SHAPE_MISMATCH`, `E_NUMERIC_ISSUE`, `E_CHOLESKY_NOT_SPD`) so you can branch on failures without parsing strings. Errors thrown from the package expose `error.code` alongside human-readable messages.
+- Use the shared tolerances `DEFAULT_RTOL` (`1e-12`) and `DEFAULT_ATOL` (`0`) for backend-neutral floating-point comparisons. Adjust them when porting workloads that demand tighter or looser error bounds.
+- The helper functions `isClose` and `allClose` accept optional overrides if you need to change tolerances, and default to the shared constants above.
+- When debugging backend choices or performance, pair diagnostics with `backendKind()` and the copy-byte counters detailed below.
+- For memory investigations, `copyBytesTotal()`, `takeCopyBytes()`, and `resetCopyBytes()` provide visibility into internal copies.
+
 ## Performance Tips
 - Prefer the N-API backend for heavy workloads; prebuild binaries for your deployment targets when possible.
 - Use `copyBytesTotal()`, `takeCopyBytes()`, and `resetCopyBytes()` to monitor internal copies when tuning code.
@@ -96,5 +126,10 @@ npm publish --workspace packages/js
 ```
 Add `--access public` on first publish if the package is not yet public.
 
+## Contributing
+- Star or fork the project on GitHub: <https://github.com/jaycezhang789/numjs>
+- File issues for bugs, feature requests, or usability feedback.
+- Pull requests are welcome—please run `npm run build` and any relevant tests before submitting.
+
 ---
-Questions or ideas? Issues and pull requests are always welcome.
+Questions or ideas? Issues and pull requests are always welcome via [GitHub](https://github.com/jaycezhang789/numjs/issues).
