@@ -831,6 +831,15 @@ impl MatrixBuffer {
         values: &MatrixBuffer,
         pairwise: bool,
     ) -> Result<Self, String> {
+        // Ensure fixed64 scale consistency when writing into a fixed64 destination
+        if self.dtype == DType::Fixed64 {
+            if values.dtype != DType::Fixed64 {
+                return Err("scatter: values dtype must be fixed64 to match destination".into());
+            }
+            if values.fixed_scale != self.fixed_scale {
+                return Err("scatter: fixed64 scale mismatch".into());
+            }
+        }
         let values_cow = if values.dtype() == self.dtype() {
             Cow::Borrowed(values)
         } else {
@@ -866,6 +875,8 @@ impl MatrixBuffer {
                     );
                 }
             }
+            // Record number of bytes written
+            record_copy_bytes(value_bytes.len());
             Ok(base)
         } else {
             if values.rows != row_indices.len() || values.cols != col_indices.len() {
@@ -887,6 +898,7 @@ impl MatrixBuffer {
                     }
                 }
             }
+            record_copy_bytes(value_bytes.len());
             Ok(base)
         }
     }
@@ -900,6 +912,7 @@ impl MatrixBuffer {
                 &mut data[row_out * self.cols * elem_size..(row_out + 1) * self.cols * elem_size];
             self.copy_row_into(idx, dst_slice);
         }
+        record_copy_bytes(data.len());
         self.from_bytes_like(indices.len(), self.cols, data)
     }
 
@@ -916,6 +929,7 @@ impl MatrixBuffer {
                 }
             }
         }
+        record_copy_bytes(data.len());
         self.from_bytes_like(self.rows, indices.len(), data)
     }
 
