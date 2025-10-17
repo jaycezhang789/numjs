@@ -15,4 +15,4 @@ nalgebra = { version = "0.33", optional = true, features = ["serde-serialize", "
 ndarray-npy = { version = "0.8", optional = true }
 num-traits = "0.2"
 py_literal = "0.4"
-zip = "0.5"
+zip = { version = "0.5", default-features = false, features = ["deflate"] }

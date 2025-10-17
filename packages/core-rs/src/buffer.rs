@@ -209,9 +209,7 @@ impl MatrixBuffer {
         rows: usize,
         cols: usize,
     ) -> Result<Self, String> {
-        if rows == 0 || cols == 0 {
-            return Err("rows and cols must be greater than zero".into());
-        }
+        
         if data.len() != rows * cols {
             return Err("data length does not match shape".into());
         }
@@ -241,9 +239,7 @@ impl MatrixBuffer {
         cols: usize,
         data: Vec<u8>,
     ) -> Result<Self, String> {
-        if rows == 0 || cols == 0 {
-            return Err("rows and cols must be greater than zero".into());
-        }
+        
         let expected = rows
             .checked_mul(cols)
             .and_then(|n| n.checked_mul(dtype.size_of()))
@@ -291,9 +287,7 @@ impl MatrixBuffer {
         row_stride: isize,
         col_stride: isize,
     ) -> Result<Self, String> {
-        if rows == 0 || cols == 0 {
-            return Err("rows and cols must be greater than zero".into());
-        }
+        
         if data.len() % dtype.size_of() != 0 {
             return Err("backing buffer is not aligned to dtype width".into());
         }
@@ -338,9 +332,7 @@ impl MatrixBuffer {
         cols: usize,
         scale: i32,
     ) -> Result<Self, String> {
-        if rows == 0 || cols == 0 {
-            return Err("rows and cols must be greater than zero".into());
-        }
+        
         if data.len() != rows * cols {
             return Err("data length does not match shape".into());
         }
@@ -1388,6 +1380,13 @@ fn validate_view(
     row_stride: isize,
     col_stride: isize,
 ) -> Result<(), String> {
+    // Permit empty views (rows==0 or cols==0) as long as offset is within [0, total]
+    if rows == 0 || cols == 0 {
+        if offset < 0 || (offset as usize) > total_elems {
+            return Err("view exceeds underlying buffer bounds".into());
+        }
+        return Ok(());
+    }
     let total = total_elems as isize;
     let row_extent = if rows == 0 { 0 } else { (rows - 1) as isize };
     let col_extent = if cols == 0 { 0 } else { (cols - 1) as isize };
@@ -1533,3 +1532,4 @@ mod tests {
         assert_eq!(options.rounding(), Some(RoundingMode::Trunc));
     }
 }
+

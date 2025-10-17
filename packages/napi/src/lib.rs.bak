@@ -457,18 +457,12 @@ pub fn slice(
         .slice(rows, cols)
         .map(Matrix::from_buffer)
         .map_err(Error::from_reason)
-}
-
-fn convert_indices(indices: &[i64]) -> Result<Vec<isize>> {
+}fn convert_indices(indices: &[i64]) -> Result<Vec<isize>> {
     indices
         .iter()
         .map(|value| {
             isize::try_from(*value)
-                .map_err(|_| Error::from_reason(format!("index {value} exceeds platform limits")))
-        })
-        .collect()
-}
-
+                .map_err(|_| Error::from_reason(format!("index {value}
 // ---------------------------------------------------------------------
 // Boolean mask compress
 // ---------------------------------------------------------------------
@@ -478,6 +472,9 @@ pub fn compress(mask: &Matrix, matrix: &Matrix) -> Result<Matrix> {
     core_compress(mask.buffer(), matrix.buffer())
         .map(Matrix::from_buffer)
         .map_err(Error::from_reason)
+} exceeds platform limits")))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -505,7 +502,6 @@ mod tests {
         assert!(result.is_err());
     }
 }
-
 
 
 

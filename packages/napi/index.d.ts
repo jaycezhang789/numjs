@@ -33,6 +33,10 @@ export declare function takeCopyBytes(): number
 export declare function resetCopyBytes(): void
 export declare function sum(matrix: Matrix, dtype?: string | undefined | null): Matrix
 export declare function dot(a: Matrix, b: Matrix, dtype?: string | undefined | null): Matrix
+export declare function row(matrix: Matrix, index: number): Matrix
+export declare function column(matrix: Matrix, index: number): Matrix
+export declare function slice(matrix: Matrix, rowStart?: number | undefined | null, rowEnd?: number | undefined | null, rowStep?: number | undefined | null, colStart?: number | undefined | null, colEnd?: number | undefined | null, colStep?: number | undefined | null): Matrix
+export declare function compress(mask: Matrix, matrix: Matrix): Matrix
 export class Matrix {
   constructor(data: Float64Array, rows: number, cols: number)
   static fromBytes(data: Buffer, rows: number, cols: number, dtype: string): Matrix

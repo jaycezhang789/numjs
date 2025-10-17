@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 wasm-bindgen = "=0.2.104"
 ndarray = "0.15"
 num_rs_core = { path = "../core-rs", default-features = false, features = ["linalg"] }
+js-sys = "0.3"
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false

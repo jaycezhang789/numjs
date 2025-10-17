@@ -3,7 +3,6 @@ pub mod dtype;
 pub mod element;
 mod macros;
 pub mod metrics;
-pub mod compress;
 
 use buffer::MatrixBuffer;
 use dtype::{promote_many, promote_pair, DType};
@@ -26,7 +25,6 @@ use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
 use nalgebra::{DMatrix, SymmetricEigen};
 
 pub use metrics::{copy_bytes_total, reset_copy_bytes, take_copy_bytes};
-pub use compress::compress;
 pub type CoreResult<T> = Result<T, String>;
 
 // ---------------------------------------------------------------------
@@ -2181,3 +2179,4 @@ mod tests {
         assert!(err.contains("astype") && err.contains("dot"));
     }
 }
+

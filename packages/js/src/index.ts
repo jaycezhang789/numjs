@@ -933,7 +933,21 @@ export class Matrix {
     return DTYPE_INFO[this.dtype];
   }
 
-  toBytes(): Uint8Array {
+
+  row(index: number): Matrix {
+    return row(this, index);
+  }
+
+  column(index: number): Matrix {
+    return column(this, index);
+  }
+
+  slice(
+    rows?: { start?: number; end?: number; step?: number },
+    cols?: { start?: number; end?: number; step?: number }
+  ): Matrix {
+    return slice(this, rows, cols);
+  }  toBytes(): Uint8Array {
     return callHandleToBytes(this._handle);
   }
 
@@ -1369,7 +1383,59 @@ export function matmul(a: Matrix, b: Matrix): Matrix {
   return Matrix.fromHandleWithDType(result, dtype);
 }
 
-export function clip(matrix: Matrix, min: number, max: number): Matrix {
+
+export function row(matrix: Matrix, index: number): Matrix {
+  const backend = ensureBackend();
+  const fn = (backend as any).row ?? (backend as any).Row;
+  if (typeof fn === "function") {
+    const handle = fn(getHandle(matrix), index);
+    const meta = matrix.dtype === "fixed64" ? { fixedScale: matrix.fixedScale } : undefined;
+    return Matrix.fromHandleWithDType(handle, matrix.dtype, meta);
+  }
+  return take(matrix, 0, [index]);
+}
+
+export function column(matrix: Matrix, index: number): Matrix {
+  const backend = ensureBackend();
+  const fn = (backend as any).column ?? (backend as any).Column;
+  if (typeof fn === "function") {
+    const handle = fn(getHandle(matrix), index);
+    const meta = matrix.dtype === "fixed64" ? { fixedScale: matrix.fixedScale } : undefined;
+    return Matrix.fromHandleWithDType(handle, matrix.dtype, meta);
+  }
+  return take(matrix, 1, [index]);
+}
+
+export function slice(
+  matrix: Matrix,
+  rows?: { start?: number; end?: number; step?: number },
+  cols?: { start?: number; end?: number; step?: number }
+): Matrix {
+  const backend = ensureBackend();
+  const fn = (backend as any).slice ?? (backend as any).Slice;
+  if (typeof fn !== "function") {
+    throw new Error("slice is not supported by current backend");
+  }
+  const rs = rows ?? {};
+  const cs = cols ?? {};
+  const rowStart = (rs.start ?? null) as number | null;
+  const rowEnd = (rs.end ?? null) as number | null;
+  const rowStep = (rs.step ?? 1) as number | null;
+  const colStart = (cs.start ?? null) as number | null;
+  const colEnd = (cs.end ?? null) as number | null;
+  const colStep = (cs.step ?? 1) as number | null;
+  const handle = fn(
+    getHandle(matrix),
+    rowStart,
+    rowEnd,
+    rowStep,
+    colStart,
+    colEnd,
+    colStep
+  );
+  const meta = matrix.dtype === "fixed64" ? { fixedScale: matrix.fixedScale } : undefined;
+  return Matrix.fromHandleWithDType(handle, matrix.dtype, meta);
+}export function clip(matrix: Matrix, min: number, max: number): Matrix {
   if (matrix.dtype === "fixed64") {
     throw new Error("clip does not support fixed64 matrices; cast to float64 before clipping");
   }
@@ -1381,7 +1447,44 @@ export function clip(matrix: Matrix, min: number, max: number): Matrix {
   return Matrix.fromHandleWithDType(result, matrix.dtype);
 }
 
-export function where(
+
+export function compress(mask: Matrix, matrix: Matrix): Matrix {
+  const backend = ensureBackend();
+  const fn = (backend as any).compress ?? (backend as any).Compress;
+  if (typeof fn === "function") {
+    const shape = computeBroadcastShape([mask], [matrix], null);
+    const maskB = broadcastTo(mask.astype("bool", { copy: false }), shape.rows, shape.cols);
+    const dataB = broadcastTo(matrix, shape.rows, shape.cols);
+    const handle = fn(getHandle(maskB), getHandle(dataB));
+    const meta = matrix.dtype === "fixed64" ? { fixedScale: matrix.fixedScale } : undefined;
+    return Matrix.fromHandleWithDType(handle, matrix.dtype, meta);
+  }
+  const shape = computeBroadcastShape([mask], [matrix], null);
+  const maskB = broadcastTo(mask.astype("bool", { copy: false }), shape.rows, shape.cols);
+  const dataB = broadcastTo(matrix, shape.rows, shape.cols);
+  const maskArr = maskB.toArray() as ArrayLike<boolean | number>;
+  const vals = dataB.toArray() as any;
+  let count = 0;
+  for (let i = 0; i < maskArr.length; i++) {
+    if (maskArr[i] as any) count++;
+  }
+  const dtype = matrix.dtype;
+  if (dtype === "fixed64") {
+    const out = new BigInt64Array(count);
+    let w = 0;
+    for (let i = 0; i < maskArr.length; i++) {
+      if (maskArr[i] as any) out[w++] = (vals as BigInt64Array | bigint[])[i] as bigint;
+    }
+    const scale = matrix.fixedScale ?? 0;
+    return Matrix.fromFixed(out, count, 1, scale);
+  }
+  const out = allocateArrayForDType(dtype, count) as any;
+  let w = 0;
+  for (let i = 0; i < maskArr.length; i++) {
+    if (maskArr[i] as any) out[w++] = (vals as any)[i];
+  }
+  return new Matrix(out, count, 1, { dtype });
+}export function where(
   condition: Matrix | Matrix[],
   truthy: Matrix | Matrix[],
   falsy?: Matrix,
@@ -2581,6 +2684,10 @@ export function writeNpz(entries: NamedMatrix[]): Uint8Array {
   }
   return zipSync(archive);
 }
+
+
+
+
 
 
 

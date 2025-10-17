@@ -1,4 +1,5 @@
-use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer};
+use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
+use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
@@ -230,6 +231,58 @@ pub fn broadcast_to(matrix: &Matrix, rows: usize, cols: usize) -> Result<Matrix,
 }
 
 #[wasm_bindgen]
+pub fn row(matrix: &Matrix, index: i32) -> Result<Matrix, JsValue> {
+    matrix
+        .buffer()
+        .row(index as isize)
+        .map(Matrix::from_buffer)
+        .map_err(|err| JsValue::from_str(&err))
+}
+
+#[wasm_bindgen]
+pub fn column(matrix: &Matrix, index: i32) -> Result<Matrix, JsValue> {
+    matrix
+        .buffer()
+        .column(index as isize)
+        .map(Matrix::from_buffer)
+        .map_err(|err| JsValue::from_str(&err))
+}
+
+#[wasm_bindgen]
+pub fn slice(
+    matrix: &Matrix,
+    row_start: Option<i32>,
+    row_end: Option<i32>,
+    row_step: Option<i32>,
+    col_start: Option<i32>,
+    col_end: Option<i32>,
+    col_step: Option<i32>,
+) -> Result<Matrix, JsValue> {
+    let rows = SliceSpec::new(
+        row_start.map(|v| v as isize),
+        row_end.map(|v| v as isize),
+        row_step.unwrap_or(1) as isize,
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
+    let cols = SliceSpec::new(
+        col_start.map(|v| v as isize),
+        col_end.map(|v| v as isize),
+        col_step.unwrap_or(1) as isize,
+    )
+    .map_err(|e| JsValue::from_str(&e))?;
+    matrix
+        .buffer()
+        .slice(rows, cols)
+        .map(Matrix::from_buffer)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn compress(mask: &Matrix, matrix: &Matrix) -> Result<Matrix, JsValue> {
+    core_compress(mask.buffer(), matrix.buffer())
+        .map(Matrix::from_buffer)
+        .map_err(|e| JsValue::from_str(&e))
+}
 pub fn take(matrix: &Matrix, axis: usize, indices: Vec<i32>) -> Result<Matrix, JsValue> {
     let converted = convert_indices(&indices)?;
     map_matrix(core_take(matrix.buffer(), axis, &converted))
@@ -351,3 +404,7 @@ mod tests {
         assert_eq!(combined.fixed_scale(), Some(2));
     }
 }
+
+
+
+
