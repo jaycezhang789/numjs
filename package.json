@@ -8,6 +8,9 @@
     "build:backends": "npm run build:napi && npm run build:wasm",
     "build:js": "npm --prefix packages/js run build",
     "build:napi": "npm --prefix packages/napi run build",
+    "build:napi:cuda": "npm --prefix packages/napi run build:cuda",
+    "build:backends:cuda": "npm run build:napi:cuda && npm run build:wasm",
+    "build:gpu": "npm run build:backends:cuda && npm run build:js",
     "build:wasm": "npm --prefix packages/wasm run build"
   },
   "workspaces": [

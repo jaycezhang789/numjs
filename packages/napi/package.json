@@ -2,6 +2,7 @@
   "name": "@jayce789/numjs-napi",
   "private": true,
   "scripts": {
-    "build": "npx @napi-rs/cli@2.16.4 build --release --js false"
+    "build": "npx @napi-rs/cli@2.16.4 build --release --js false",
+    "build:cuda": "npx @napi-rs/cli@2.16.4 build --release --js false --features gpu-cuda"
   }
 }
