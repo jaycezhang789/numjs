@@ -37,20 +37,20 @@ impl Matrix {
         let data: Vec<f64> = data.to_vec();
         MatrixBuffer::from_vec(data, rows as usize, cols as usize)
             .map(|buffer| Matrix { buffer })
-            .map_err(|e| Error::from_reason(e))
+            .map_err(map_core_error)
     }
 
     #[napi(factory)]
     pub fn from_bytes(data: Buffer, rows: u32, cols: u32, dtype: String) -> Result<Self> {
-        let dtype: DType = dtype.parse().map_err(Error::from_reason)?;
+        let dtype: DType = dtype.parse().map_err(map_core_error)?;
         if dtype == DType::Fixed64 {
-            return Err(Error::from_reason(
+            return Err(map_core_error(
                 "from_bytes(Fixed64): supply scaled bigint data via Matrix.from_fixed_i64",
             ));
         }
         MatrixBuffer::from_bytes(dtype, rows as usize, cols as usize, data.to_vec())
             .map(Matrix::from_buffer)
-            .map_err(|e| Error::from_reason(e))
+            .map_err(map_core_error)
     }
 
     #[napi(factory)]
@@ -58,7 +58,7 @@ impl Matrix {
         let vec = data.to_vec();
         MatrixBuffer::from_fixed_i64_vec(vec, rows as usize, cols as usize, scale)
             .map(Matrix::from_buffer)
-            .map_err(Error::from_reason)
+            .map_err(map_core_error)
     }
 
     #[napi(getter)]
@@ -88,15 +88,15 @@ impl Matrix {
         copy: Option<bool>,
         casting: Option<String>,
     ) -> Result<Self> {
-        let dtype: DType = dtype.parse().map_err(Error::from_reason)?;
+        let dtype: DType = dtype.parse().map_err(map_core_error)?;
         let copy = copy.unwrap_or(false);
-        let options = CastOptions::parse(casting.as_deref()).map_err(Error::from_reason)?;
+        let options = CastOptions::parse(casting.as_deref()).map_err(map_core_error)?;
         if dtype == self.buffer.dtype() {
             if copy {
                 let buffer = self
                     .buffer
                     .clone_with_dtype(dtype)
-                    .map_err(Error::from_reason)?;
+                    .map_err(map_core_error)?;
                 return Ok(Matrix::from_buffer(buffer));
             }
             return Ok(Matrix::from_buffer(self.buffer.clone()));
@@ -105,13 +105,13 @@ impl Matrix {
             && matches!(options.casting(), CastingKind::Unsafe)
             && dtype.size_of() == self.buffer.dtype().size_of()
         {
-            let buffer = self.buffer.reinterpret(dtype).map_err(Error::from_reason)?;
+            let buffer = self.buffer.reinterpret(dtype).map_err(map_core_error)?;
             return Ok(Matrix::from_buffer(buffer));
         }
         let buffer = self
             .buffer
             .cast_with_options(dtype, &options)
-            .map_err(Error::from_reason)?;
+            .map_err(map_core_error)?;
         Ok(Matrix::from_buffer(buffer))
     }
 
@@ -164,8 +164,22 @@ impl Matrix {
 }
 
 fn map_matrix(res: num_rs_core::CoreResult<MatrixBuffer>) -> Result<Matrix> {
-    res.map(Matrix::from_buffer)
-        .map_err(|err| Error::from_reason(err))
+    res.map(Matrix::from_buffer).map_err(map_core_error)
+}
+
+fn map_core_error<T: Into<String>>(err: T) -> Error {
+    let text: String = err.into();
+    if let Some((code, message)) = text.split_once(": ") {
+        let status = match code {
+            num_rs_core::codes::SHAPE_MISMATCH => napi::Status::InvalidArg,
+            num_rs_core::codes::NUMERIC_ISSUE => napi::Status::GenericFailure,
+            num_rs_core::codes::CHOLESKY_NOT_SPD => napi::Status::InvalidArg,
+            _ => napi::Status::GenericFailure,
+        };
+        Error::new(status, format!("{code}: {message}"))
+    } else {
+        Error::from_reason(text)
+    }
 }
 
 #[napi]
@@ -351,7 +365,7 @@ pub fn scatter_pairs(
 #[cfg(feature = "linalg")]
 #[napi]
 pub fn svd(env: Env, matrix: &Matrix) -> Result<JsObject> {
-    let (u, s, vt) = core_svd(matrix.buffer()).map_err(|e| Error::from_reason(e))?;
+    let (u, s, vt) = core_svd(matrix.buffer()).map_err(map_core_error)?;
     let mut obj = env.create_object()?;
     obj.set("u", Matrix::from_buffer(u))?;
     obj.set("s", Float64Array::from(s.to_f64_vec()))?;
@@ -362,7 +376,7 @@ pub fn svd(env: Env, matrix: &Matrix) -> Result<JsObject> {
 #[cfg(feature = "linalg")]
 #[napi]
 pub fn qr(env: Env, matrix: &Matrix) -> Result<JsObject> {
-    let (q, r) = core_qr(matrix.buffer()).map_err(|e| Error::from_reason(e))?;
+    let (q, r) = core_qr(matrix.buffer()).map_err(map_core_error)?;
     let mut obj = env.create_object()?;
     obj.set("q", Matrix::from_buffer(q))?;
     obj.set("r", Matrix::from_buffer(r))?;
@@ -374,13 +388,13 @@ pub fn qr(env: Env, matrix: &Matrix) -> Result<JsObject> {
 pub fn solve(a: &Matrix, b: &Matrix) -> Result<Matrix> {
     core_solve(a.buffer(), b.buffer())
         .map(Matrix::from_buffer)
-        .map_err(|e| Error::from_reason(e))
+        .map_err(map_core_error)
 }
 
 #[cfg(feature = "linalg")]
 #[napi]
 pub fn eigen(env: Env, matrix: &Matrix) -> Result<JsObject> {
-    let (values, vectors) = core_eigen(matrix.buffer()).map_err(|e| Error::from_reason(e))?;
+    let (values, vectors) = core_eigen(matrix.buffer()).map_err(map_core_error)?;
     let mut obj = env.create_object()?;
     obj.set("values", Float64Array::from(values.to_f64_vec()))?;
     obj.set("vectors", Matrix::from_buffer(vectors))?;
@@ -391,14 +405,14 @@ pub fn eigen(env: Env, matrix: &Matrix) -> Result<JsObject> {
 pub fn read_npy(buffer: Buffer) -> Result<Matrix> {
     read_npy_matrix(&buffer)
         .map(Matrix::from_buffer)
-        .map_err(|e| Error::from_reason(e))
+        .map_err(map_core_error)
 }
 
 #[napi]
 pub fn write_npy(matrix: &Matrix) -> Result<Buffer> {
     write_npy_matrix(matrix.buffer())
         .map(Buffer::from)
-        .map_err(|e| Error::from_reason(e))
+        .map_err(map_core_error)
 }
 
 #[napi]
@@ -423,7 +437,7 @@ pub fn reset_copy_bytes() {
 #[napi]
 pub fn sum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
     let target = match dtype {
-        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        Some(value) => Some(value.parse::<DType>().map_err(map_core_error)?),
         None => None,
     };
     map_matrix(core_sum(matrix.buffer(), target))
@@ -432,7 +446,7 @@ pub fn sum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
 #[napi]
 pub fn nansum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
     let target = match dtype {
-        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        Some(value) => Some(value.parse::<DType>().map_err(map_core_error)?),
         None => None,
     };
     map_matrix(core_nansum(matrix.buffer(), target))
@@ -441,7 +455,7 @@ pub fn nansum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
 #[napi]
 pub fn nanmean(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
     let target = match dtype {
-        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        Some(value) => Some(value.parse::<DType>().map_err(map_core_error)?),
         None => None,
     };
     map_matrix(core_nanmean(matrix.buffer(), target))
@@ -450,7 +464,7 @@ pub fn nanmean(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
 #[napi]
 pub fn median(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
     let target = match dtype {
-        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        Some(value) => Some(value.parse::<DType>().map_err(map_core_error)?),
         None => None,
     };
     map_matrix(core_median(matrix.buffer(), target))
@@ -459,7 +473,7 @@ pub fn median(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
 #[napi]
 pub fn quantile(matrix: &Matrix, q: f64, dtype: Option<String>) -> Result<Matrix> {
     let target = match dtype {
-        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        Some(value) => Some(value.parse::<DType>().map_err(map_core_error)?),
         None => None,
     };
     map_matrix(core_quantile(matrix.buffer(), q, target))
@@ -468,7 +482,7 @@ pub fn quantile(matrix: &Matrix, q: f64, dtype: Option<String>) -> Result<Matrix
 #[napi]
 pub fn percentile(matrix: &Matrix, p: f64, dtype: Option<String>) -> Result<Matrix> {
     let target = match dtype {
-        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        Some(value) => Some(value.parse::<DType>().map_err(map_core_error)?),
         None => None,
     };
     map_matrix(core_percentile(matrix.buffer(), p, target))
@@ -477,7 +491,7 @@ pub fn percentile(matrix: &Matrix, p: f64, dtype: Option<String>) -> Result<Matr
 #[napi]
 pub fn dot(a: &Matrix, b: &Matrix, dtype: Option<String>) -> Result<Matrix> {
     let target = match dtype {
-        Some(value) => Some(value.parse::<DType>().map_err(Error::from_reason)?),
+        Some(value) => Some(value.parse::<DType>().map_err(map_core_error)?),
         None => None,
     };
     map_matrix(core_dot(a.buffer(), b.buffer(), target))
@@ -493,7 +507,7 @@ pub fn row(matrix: &Matrix, index: i32) -> Result<Matrix> {
         .buffer()
         .row(index as isize)
         .map(Matrix::from_buffer)
-        .map_err(Error::from_reason)
+        .map_err(map_core_error)
 }
 
 #[napi]
@@ -502,7 +516,7 @@ pub fn column(matrix: &Matrix, index: i32) -> Result<Matrix> {
         .buffer()
         .column(index as isize)
         .map(Matrix::from_buffer)
-        .map_err(Error::from_reason)
+        .map_err(map_core_error)
 }
 
 #[napi]
@@ -520,18 +534,18 @@ pub fn slice(
         row_end.map(|v| v as isize),
         row_step.unwrap_or(1) as isize,
     )
-    .map_err(Error::from_reason)?;
+    .map_err(map_core_error)?;
     let cols = SliceSpec::new(
         col_start.map(|v| v as isize),
         col_end.map(|v| v as isize),
         col_step.unwrap_or(1) as isize,
     )
-    .map_err(Error::from_reason)?;
+    .map_err(map_core_error)?;
     matrix
         .buffer()
         .slice(rows, cols)
         .map(Matrix::from_buffer)
-        .map_err(Error::from_reason)
+        .map_err(map_core_error)
 }
 
 fn convert_indices(indices: &[i64]) -> Result<Vec<isize>> {
@@ -539,7 +553,7 @@ fn convert_indices(indices: &[i64]) -> Result<Vec<isize>> {
         .iter()
         .map(|value| {
             isize::try_from(*value)
-                .map_err(|_| Error::from_reason(format!("index {value} exceeds platform limits")))
+                .map_err(|_| map_core_error(format!("index {value} exceeds platform limits")))
         })
         .collect()
 }
@@ -552,7 +566,7 @@ fn convert_indices(indices: &[i64]) -> Result<Vec<isize>> {
 pub fn compress(mask: &Matrix, matrix: &Matrix) -> Result<Matrix> {
     core_compress(mask.buffer(), matrix.buffer())
         .map(Matrix::from_buffer)
-        .map_err(Error::from_reason)
+        .map_err(map_core_error)
 }
 
 #[cfg(test)]

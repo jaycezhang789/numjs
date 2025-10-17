@@ -1,4 +1,5 @@
 use crate::dtype::DType;
+use crate::error;
 use crate::element::Element;
 use crate::metrics::record_copy_bytes;
 use num_traits::{Bounded, Float, NumCast, PrimInt, Signed, Unsigned};
@@ -210,7 +211,7 @@ impl MatrixBuffer {
         cols: usize,
     ) -> Result<Self, String> {
         if data.len() != rows * cols {
-            return Err("data length does not match shape".into());
+            return Err(error::shape_mismatch("data length does not match shape"));
         }
         let dtype = T::DTYPE;
         let byte_len = data.len() * dtype.size_of();
@@ -241,9 +242,9 @@ impl MatrixBuffer {
         let expected = rows
             .checked_mul(cols)
             .and_then(|n| n.checked_mul(dtype.size_of()))
-            .ok_or_else(|| "shape is too large".to_string())?;
+            .ok_or_else(|| error::shape_mismatch("shape is too large"))?;
         if expected != data.len() {
-            return Err("byte length does not match shape".into());
+            return Err(error::shape_mismatch("byte length does not match shape"));
         }
         MatrixBuffer::new_internal_with_scale(
             dtype,
@@ -330,7 +331,7 @@ impl MatrixBuffer {
         scale: i32,
     ) -> Result<Self, String> {
         if data.len() != rows * cols {
-            return Err("data length does not match shape".into());
+            return Err(error::shape_mismatch("data length does not match shape"));
         }
         let dtype = DType::Fixed64;
         let byte_len = data.len() * dtype.size_of();
@@ -662,7 +663,9 @@ impl MatrixBuffer {
 
     pub fn broadcast_to(&self, rows: usize, cols: usize) -> Result<Self, String> {
         if rows == 0 || cols == 0 {
-            return Err("broadcast target shape must be non-zero".into());
+            return Err(error::shape_mismatch(
+                "broadcast target shape must be non-zero",
+            ));
         }
         if self.rows == rows && self.cols == cols {
             return Ok(self.clone());
@@ -876,7 +879,9 @@ impl MatrixBuffer {
             Ok(base)
         } else {
             if values.rows != row_indices.len() || values.cols != col_indices.len() {
-                return Err("scatter outer expects values shape to match indices".into());
+                return Err(error::shape_mismatch(
+                    "scatter outer expects values shape to match indices",
+                ));
             }
             let value_bytes = values.to_contiguous_bytes_vec();
             for (row_out, &row_raw) in row_indices.iter().enumerate() {

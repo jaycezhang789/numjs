@@ -2,6 +2,9 @@ import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
 
 type BackendKind = "napi" | "wasm";
 
+export const DEFAULT_RTOL = 1e-12;
+export const DEFAULT_ATOL = 0;
+
 export type DType =
   | "bool"
   | "int8"
@@ -489,14 +492,14 @@ async function loadBackend(): Promise<void> {
   if (isNode) {
     const napi = await loadNapiBackend();
     if (napi) {
-      activeBackend = napi;
+      activeBackend = wrapBackendErrors(napi);
       activeKind = "napi";
       return;
     }
   }
 
   const wasm = await loadWasmBackend();
-  activeBackend = wasm;
+  activeBackend = wrapBackendErrors(wasm);
   activeKind = "wasm";
 }
 
@@ -538,6 +541,86 @@ function ensureBackend(): BackendModule {
     throw new Error("Backend not initialised. Call init() first.");
   }
   return activeBackend;
+}
+
+function wrapBackendErrors(module: BackendModule): BackendModule {
+  return new Proxy(module, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (prop === "Matrix" || typeof value !== "function") {
+        return value;
+      }
+      const wrapped = function (this: unknown, ...args: unknown[]) {
+        try {
+          const result = (value as (...fnArgs: unknown[]) => unknown).apply(
+            this === undefined ? target : this,
+            args
+          );
+          if (isPromiseLike(result)) {
+            return (result as Promise<unknown>).catch((error) => {
+              throw normalizeBackendError(error);
+            });
+          }
+          return result;
+        } catch (error) {
+          throw normalizeBackendError(error);
+        }
+      };
+      return wrapped as typeof value;
+    },
+  }) as BackendModule;
+}
+
+function normalizeBackendError(error: unknown): Error {
+  if (error instanceof Error) {
+    const existingCode = (error as { code?: unknown }).code;
+    if (typeof existingCode === "string" && existingCode.startsWith("E_")) {
+      return error;
+    }
+    const parsed = parseCoreErrorString(error.message);
+    if (parsed) {
+      error.message = parsed.message;
+      (error as { code?: string }).code = parsed.code;
+    }
+    return error;
+  }
+  if (typeof error === "string") {
+    const parsed = parseCoreErrorString(error);
+    if (parsed) {
+      const normalized = new Error(parsed.message);
+      (normalized as { code?: string }).code = parsed.code;
+      return normalized;
+    }
+    return new Error(error);
+  }
+  const coerced = String(error);
+  const parsed = parseCoreErrorString(coerced);
+  if (parsed) {
+    const normalized = new Error(parsed.message);
+    (normalized as { code?: string }).code = parsed.code;
+    return normalized;
+  }
+  return new Error(coerced);
+}
+
+function parseCoreErrorString(message: string): { code: string; message: string } | null {
+  const separatorIndex = message.indexOf(": ");
+  if (separatorIndex <= 0) {
+    return null;
+  }
+  const code = message.slice(0, separatorIndex);
+  if (!code.startsWith("E_")) {
+    return null;
+  }
+  const detail = message.slice(separatorIndex + 2);
+  return { code, message: detail };
+}
+
+function isPromiseLike(value: unknown): value is Promise<unknown> {
+  if (value === null) return false;
+  const type = typeof value;
+  if (type !== "object" && type !== "function") return false;
+  return typeof (value as { then?: unknown }).then === "function";
 }
 
 function wrapMatrix(handle: BackendMatrixHandle): Matrix {
@@ -2818,7 +2901,11 @@ export async function* iterOutputRows(
 export function isClose(
   a: number,
   b: number,
-  { rtol = 1e-12, atol = 0, equalNaN = false }: { rtol?: number; atol?: number; equalNaN?: boolean } = {}
+  {
+    rtol = DEFAULT_RTOL,
+    atol = DEFAULT_ATOL,
+    equalNaN = false,
+  }: { rtol?: number; atol?: number; equalNaN?: boolean } = {}
 ): boolean {
   if (Number.isNaN(a) || Number.isNaN(b)) {
     return equalNaN && Number.isNaN(a) && Number.isNaN(b);
@@ -2833,7 +2920,11 @@ export function isClose(
 export function allClose(
   a: Matrix,
   b: Matrix,
-  { rtol = 1e-12, atol = 0, equalNaN = false }: { rtol?: number; atol?: number; equalNaN?: boolean } = {}
+  {
+    rtol = DEFAULT_RTOL,
+    atol = DEFAULT_ATOL,
+    equalNaN = false,
+  }: { rtol?: number; atol?: number; equalNaN?: boolean } = {}
 ): boolean {
   if (a.rows !== b.rows || a.cols !== b.cols) return false;
   const aArr = a.astype("float64", { copy: false }).toArray() as Float64Array;

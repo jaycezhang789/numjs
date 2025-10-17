@@ -8,6 +8,12 @@ export declare function sub(a: Matrix, b: Matrix): Matrix
 export declare function mul(a: Matrix, b: Matrix): Matrix
 export declare function div(a: Matrix, b: Matrix): Matrix
 export declare function neg(matrix: Matrix): Matrix
+export declare function exp(matrix: Matrix): Matrix
+export declare function log(matrix: Matrix): Matrix
+export declare function sin(matrix: Matrix): Matrix
+export declare function cos(matrix: Matrix): Matrix
+export declare function tanh(matrix: Matrix): Matrix
+export declare function sigmoid(matrix: Matrix): Matrix
 export declare function matmul(a: Matrix, b: Matrix): Matrix
 export declare function clip(matrix: Matrix, min: number, max: number): Matrix
 export declare function whereSelect(condition: Matrix, truthy: Matrix, falsy: Matrix): Matrix
@@ -32,6 +38,11 @@ export declare function copyBytesTotal(): number
 export declare function takeCopyBytes(): number
 export declare function resetCopyBytes(): void
 export declare function sum(matrix: Matrix, dtype?: string | undefined | null): Matrix
+export declare function nansum(matrix: Matrix, dtype?: string | undefined | null): Matrix
+export declare function nanmean(matrix: Matrix, dtype?: string | undefined | null): Matrix
+export declare function median(matrix: Matrix, dtype?: string | undefined | null): Matrix
+export declare function quantile(matrix: Matrix, q: number, dtype?: string | undefined | null): Matrix
+export declare function percentile(matrix: Matrix, p: number, dtype?: string | undefined | null): Matrix
 export declare function dot(a: Matrix, b: Matrix, dtype?: string | undefined | null): Matrix
 export declare function row(matrix: Matrix, index: number): Matrix
 export declare function column(matrix: Matrix, index: number): Matrix

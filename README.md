@@ -30,6 +30,13 @@ Fixed-point matrices are backed by signed 64-bit integers plus a per-matrix scal
 - `matrix.transpose()` / `transpose(matrix)` provide zero-copy views across dtypes, including fixed64.
 - `broadcastTo(matrix, rows, cols)` expands singleton dimensions with dtype-aware copies and keeps fixed64 scale metadata.
 
+## Error Model & Numeric Tolerances
+
+- Core errors now surface stable codes alongside human-readable messages. The current codes are `E_SHAPE_MISMATCH` (dimension/shape contract failures), `E_NUMERIC_ISSUE` (overflow, NaN/Inf in forbidden contexts), and `E_CHOLESKY_NOT_SPD` (Cholesky factorisation rejected a non-SPD input).
+- Both the WASM and N-API backends normalise these codes: thrown errors expose `error.code` while keeping the descriptive message for display/logging.
+- Default floating-point comparisons share exported constants `DEFAULT_RTOL = 1e-12` and `DEFAULT_ATOL = 0`. These values balance double-precision arithmetic on the native backend with the WebAssembly/JS fallbacks.
+- Minor cross-backend differences remain possible (WebAssembly paths occasionally round through `float32`). When comparing results fetched from different backends, use the shared tolerances or adjust them for tighter/looser acceptance depending on your workload.
+
 ## Licensing and Feedback
 
 The project is currently pre-release. File issues or pull requests if you encounter bugs, missing algorithms, or performance regressions.

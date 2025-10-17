@@ -2,6 +2,7 @@ pub mod buffer;
 pub mod compress;
 pub mod dtype;
 pub mod element;
+pub mod error;
 mod macros;
 pub mod metrics;
 
@@ -26,6 +27,7 @@ use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
 use nalgebra::{DMatrix, SymmetricEigen};
 
 pub use compress::compress;
+pub use error::codes;
 pub use metrics::{copy_bytes_total, reset_copy_bytes, take_copy_bytes};
 pub type CoreResult<T> = Result<T, String>;
 
@@ -68,7 +70,9 @@ fn sum_bool(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
         }
     }
     if total > i64::MAX as i128 {
-        return Err("sum(bool): overflow while counting true values".into());
+        return Err(error::numeric_issue(
+            "sum(bool): overflow while counting true values",
+        ));
     }
     MatrixBuffer::from_vec(vec![total as i64], 1, 1).map_err(Into::into)
 }
@@ -86,7 +90,7 @@ where
             .ok_or_else(|| "sum: failed to convert signed value to i64".to_string())?;
         total = total
             .checked_add(v as i128)
-            .ok_or_else(|| "sum: signed accumulator overflow".to_string())?;
+            .ok_or_else(|| error::numeric_issue("sum: signed accumulator overflow"))?;
     }
     if total < i64::MIN as i128 || total > i64::MAX as i128 {
         return Err("sum: signed result exceeds int64 range".into());
@@ -107,7 +111,7 @@ where
             .ok_or_else(|| "sum: failed to convert unsigned value to u64".to_string())?;
         total = total
             .checked_add(v as u128)
-            .ok_or_else(|| "sum: unsigned accumulator overflow".to_string())?;
+            .ok_or_else(|| error::numeric_issue("sum: unsigned accumulator overflow"))?;
     }
     if total > u64::MAX as u128 {
         return Err("sum: unsigned result exceeds uint64 range".into());
@@ -139,10 +143,10 @@ fn sum_fixed64(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
     for value in data {
         total = total
             .checked_add(value as i128)
-            .ok_or_else(|| "sum(Fixed64): overflow".to_string())?;
+            .ok_or_else(|| error::numeric_issue("sum(Fixed64): overflow"))?;
     }
     if total < i64::MIN as i128 || total > i64::MAX as i128 {
-        return Err("sum(Fixed64): overflow".into());
+        return Err(error::numeric_issue("sum(Fixed64): overflow"));
     }
     MatrixBuffer::from_fixed_i64_vec(vec![total as i64], 1, 1, scale)
 }
@@ -300,7 +304,7 @@ fn dot_bool(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
         if x && y {
             total = total
                 .checked_add(1)
-                .ok_or_else(|| "dot(bool, bool): overflow".to_string())?;
+                .ok_or_else(|| error::numeric_issue("dot(bool, bool): overflow"))?;
         }
     }
     MatrixBuffer::from_vec(vec![total as i64], 1, 1).map_err(Into::into)
@@ -322,7 +326,7 @@ where
             .ok_or_else(|| "dot: failed to convert signed multiplicand".to_string())?;
         total = total
             .checked_add((xi as i128) * (yi as i128))
-            .ok_or_else(|| "dot: signed accumulator overflow".to_string())?;
+            .ok_or_else(|| error::numeric_issue("dot: signed accumulator overflow"))?;
     }
     if total < i64::MIN as i128 || total > i64::MAX as i128 {
         return Err("dot: signed result exceeds int64 range".into());
@@ -346,7 +350,7 @@ where
             .ok_or_else(|| "dot: failed to convert unsigned multiplicand".to_string())?;
         total = total
             .checked_add((xi as u128) * (yi as u128))
-            .ok_or_else(|| "dot: unsigned accumulator overflow".to_string())?;
+            .ok_or_else(|| error::numeric_issue("dot: unsigned accumulator overflow"))?;
     }
     if total > u64::MAX as u128 {
         return Err("dot: unsigned result exceeds uint64 range".into());
@@ -378,7 +382,7 @@ pub fn dot(
     target_dtype: Option<DType>,
 ) -> CoreResult<MatrixBuffer> {
     if a.rows() != b.rows() || a.cols() != b.cols() {
-        return Err("dot: shape mismatch".into());
+        return Err(error::shape_mismatch("dot: shape mismatch"));
     }
     if a.dtype() == DType::Fixed64 || b.dtype() == DType::Fixed64 {
         return Err(
@@ -590,7 +594,7 @@ pub fn add(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
         for (lhs, rhs) in vec_a.into_iter().zip(vec_b.into_iter()) {
             let (sum, overflow) = lhs.overflowing_add(rhs);
             if overflow {
-                return Err("add(Fixed64): overflow".into());
+                return Err(error::numeric_issue("add(Fixed64): overflow"));
             }
             out.push(sum);
         }
@@ -1193,7 +1197,7 @@ fn sub_fixed64(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
     for (lhs, rhs) in vec_a.into_iter().zip(vec_b.into_iter()) {
         let (diff, overflow) = lhs.overflowing_sub(rhs);
         if overflow {
-            return Err("sub(Fixed64): overflow".into());
+            return Err(error::numeric_issue("sub(Fixed64): overflow"));
         }
         out.push(diff);
     }
@@ -1207,7 +1211,7 @@ fn neg_fixed64(matrix: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
     for value in vec.into_iter() {
         let (negated, overflow) = value.overflowing_neg();
         if overflow {
-            return Err("neg(Fixed64): overflow".into());
+            return Err(error::numeric_issue("neg(Fixed64): overflow"));
         }
         out.push(negated);
     }
@@ -1224,9 +1228,9 @@ pub fn matmul(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
     let dtype = promote_pair(a.dtype(), b.dtype()).map_err(|err| format!("where_select: {err}"))?;
 
     let a_matrix = Array2::from_shape_vec((a.rows(), a.cols()), a.to_f64_vec())
-        .map_err(|_| "failed to reshape left matrix")?;
+        .map_err(|_| error::shape_mismatch("matmul: failed to reshape left matrix"))?;
     let b_matrix = Array2::from_shape_vec((b.rows(), b.cols()), b.to_f64_vec())
-        .map_err(|_| "failed to reshape right matrix")?;
+        .map_err(|_| error::shape_mismatch("matmul: failed to reshape right matrix"))?;
     let product = a_matrix.dot(&b_matrix);
 
     MatrixBuffer::from_f64_vec(
@@ -1434,7 +1438,9 @@ pub fn put(
     match axis {
         0 => {
             if values.cols() != matrix.cols() || values.rows() != indices.len() {
-                return Err("put axis 0: values shape must match indices x cols".into());
+                return Err(error::shape_mismatch(
+                    "put axis 0: values shape must match indices x cols",
+                ));
             }
             let col_indices: Vec<isize> = (0..matrix.cols()).map(|c| c as isize).collect();
             matrix
@@ -1443,7 +1449,9 @@ pub fn put(
         }
         1 => {
             if values.rows() != matrix.rows() || values.cols() != indices.len() {
-                return Err("put axis 1: values shape must match rows x indices".into());
+                return Err(error::shape_mismatch(
+                    "put axis 1: values shape must match rows x indices",
+                ));
             }
             let row_indices: Vec<isize> = (0..matrix.rows()).map(|r| r as isize).collect();
             matrix
@@ -1548,7 +1556,9 @@ pub fn solve(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
         return Err("solve: matrix A must be square".into());
     }
     if a.rows() != b.rows() {
-        return Err("solve: RHS has incompatible shape".into());
+        return Err(error::shape_mismatch(
+            "solve: RHS has incompatible shape",
+        ));
     }
     let a_mat = DMatrix::from_row_slice(a.rows(), a.cols(), &a.to_f64_vec());
     let b_mat = DMatrix::from_row_slice(b.rows(), b.cols(), &b.to_f64_vec());
@@ -1892,10 +1902,10 @@ fn parse_npy_header(bytes: &[u8]) -> CoreResult<(usize, DType, usize, usize, boo
                     let mut dims = Vec::with_capacity(tuple.len());
                     for elem in tuple {
                         let int = elem.as_integer().ok_or_else(|| {
-                            "read_npy: shape contains non-integer entries".to_string()
+                            error::shape_mismatch("read_npy: shape contains non-integer entries")
                         })?;
                         let dim = int.to_usize().ok_or_else(|| {
-                            "read_npy: shape dimension does not fit usize".to_string()
+                            error::shape_mismatch("read_npy: shape dimension does not fit usize")
                         })?;
                         dims.push(dim);
                     }
@@ -1922,12 +1932,13 @@ fn parse_npy_header(bytes: &[u8]) -> CoreResult<(usize, DType, usize, usize, boo
     let descr = descr.ok_or_else(|| "read_npy: header missing 'descr' key".to_string())?;
     let fortran_order =
         fortran_order.ok_or_else(|| "read_npy: header missing 'fortran_order' key".to_string())?;
-    let shape = shape.ok_or_else(|| "read_npy: header missing 'shape' key".to_string())?;
+    let shape = shape
+        .ok_or_else(|| error::shape_mismatch("read_npy: header missing 'shape' key"))?;
     if shape.len() != 2 {
-        return Err(format!(
+        return Err(error::shape_mismatch(format!(
             "read_npy: expected 2D array, but header shape is {:?}",
             shape
-        ));
+        )));
     }
     let rows = shape[0];
     let cols = shape[1];
@@ -1949,10 +1960,10 @@ fn decode_matrix_from_bytes(
 ) -> CoreResult<MatrixBuffer> {
     let len = rows
         .checked_mul(cols)
-        .ok_or_else(|| "read_npy: shape would overflow".to_string())?;
+        .ok_or_else(|| error::numeric_issue("read_npy: shape would overflow"))?;
     let expected_bytes = len
         .checked_mul(dtype.size_of())
-        .ok_or_else(|| "read_npy: expected byte count overflowed".to_string())?;
+        .ok_or_else(|| error::numeric_issue("read_npy: expected byte count overflowed"))?;
     if bytes.len() != expected_bytes {
         return Err(format!(
             "read_npy: expected {expected_bytes} data bytes, found {}",
@@ -2176,7 +2187,7 @@ pub fn write_npz_matrices(_entries: &[(&str, MatrixBuffer)]) -> CoreResult<Vec<u
 
 fn ensure_same_shape(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<()> {
     if a.rows() != b.rows() || a.cols() != b.cols() {
-        return Err("shape mismatch".into());
+        return Err(error::shape_mismatch("shape mismatch"));
     }
     Ok(())
 }

@@ -1,4 +1,4 @@
-use js_sys::Uint8Array;
+use js_sys::{Error as JsError, Reflect, Uint8Array};
 use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
 use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
@@ -149,7 +149,17 @@ impl Matrix {
 
 fn map_matrix(res: num_rs_core::CoreResult<MatrixBuffer>) -> Result<Matrix, JsValue> {
     res.map(Matrix::from_buffer)
-        .map_err(|err| JsValue::from_str(&err))
+        .map_err(|err| map_core_error(&err))
+}
+
+fn map_core_error(err: &str) -> JsValue {
+    if let Some((code, message)) = err.split_once(": ") {
+        let js_error = JsError::new(message);
+        let _ = Reflect::set(&js_error, &JsValue::from_str("code"), &JsValue::from_str(code));
+        js_error.into()
+    } else {
+        JsError::new(err).into()
+    }
 }
 
 fn convert_indices(indices: &[i32]) -> Result<Vec<isize>, JsValue> {
