@@ -5,6 +5,19 @@ import {
   WebGpuEngine,
 } from "./gpu/webgpu";
 import { LazyArray, LazyScalar, constant as lazyConstant } from "./lazy";
+import {
+  arrowTableToMatrix,
+  matrixToArrowTable,
+  type ArrowTableLike,
+  type ArrowToMatrixOptions,
+  type ArrowConversionResult,
+} from "./io/arrow";
+import {
+  polarsDataFrameToMatrix,
+  matrixToPolarsDataFrame,
+  type PolarsToMatrixOptions,
+  type MatrixToPolarsOptions,
+} from "./io/polars";
 
 type BackendKind = "napi" | "wasm";
 
@@ -3547,8 +3560,19 @@ export function lazyScalar(value: number): LazyScalar {
 }
 
 export { LazyArray, LazyScalar, lazyConstant };
-
-
+export {
+  arrowTableToMatrix,
+  matrixToArrowTable,
+  polarsDataFrameToMatrix,
+  matrixToPolarsDataFrame,
+};
+export type {
+  ArrowTableLike,
+  ArrowToMatrixOptions,
+  ArrowConversionResult,
+  PolarsToMatrixOptions,
+  MatrixToPolarsOptions,
+};
 
 
 

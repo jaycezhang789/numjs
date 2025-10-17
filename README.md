@@ -77,6 +77,16 @@ Fixed-point matrices are backed by signed 64-bit integers plus a per-matrix scal
 
 - **Fallback guarantees.** Both the WebGPU and CUDA paths are optional. When a GPU path fails initialisation or throws, the library reverts to the existing WASM/native implementations without changing return types or throwing additional errors.
 
+## Arrow & Polars Interop (Preview)
+
+- **Current behaviour.** The newly added bridges in `packages/js/src/io` let you convert between `Matrix` instances and Apache Arrow (browser/Node) or Polars DataFrames (Node). Right now the helpers materialise intermediate row-major buffers when moving from columnar Arrow/Polars data into NumJS matrices. As a result, these conversions are **not** zero-copy yet.
+- **Zero-copy roadmap.** The Rust core already stores row/column strides, but to avoid copies we need a stride-aware `Matrix` view pipeline that can stitch together Arrow column buffers without re-packing them. That work is tracked and will land before we stabilise the IO API.
+- **Optional dependencies.** These bridges rely on external packages which are not bundled by default:
+  - Browser/Node: install `apache-arrow` alongside `@jayce789/numjs`.
+  - Node (Polars): install `nodejs-polars` (preferred) or the pure JS `polars` package.
+  If the modules are missing, the helpers throw informative errors explaining which dependency to add.
+- **CI follow-up.** Our GitHub Actions matrix will gain conditional jobs that install these optional dependencies and run interop smoke tests once the zero-copy pipeline lands. Until then the code paths remain best-effort and are guarded by runtime type-checks.
+
 ## Licensing and Feedback
 
 The project is currently pre-release. File issues or pull requests if you encounter bugs, missing algorithms, or performance regressions.

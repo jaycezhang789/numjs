@@ -1,25 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
-
-const originalFetch = globalThis.fetch;
-globalThis.fetch = async (resource, options) => {
-  if (resource instanceof URL && resource.protocol === "file:") {
-    const path = fileURLToPath(resource);
-    const bytes = await readFile(path);
-    return new Response(bytes);
-  }
-  if (typeof resource === "string" && resource.startsWith("file://")) {
-    const path = fileURLToPath(new URL(resource));
-    const bytes = await readFile(path);
-    return new Response(bytes);
-  }
-  if (originalFetch) {
-    return originalFetch(resource, options);
-  }
-  throw new Error("No fetch implementation available");
-};
+import "./helpers/polyfill-fetch.mjs";
 
 import {
   init,
@@ -221,7 +202,7 @@ test("mul saturates integer overflow and applies boolean AND", () => {
   assert.deepEqual(Array.from(boolAnd.toArray()).map(Boolean), [true, false, false]);
 
   const fixed = Matrix.fromFixed(new BigInt64Array([100n]), 1, 1, 1);
-  assert.throws(() => mul(fixed, fixed), /mul\(Fixed64\)/);
+  assert.throws(() => mul(fixed, fixed), /convert operands to float64/i);
 });
 
 test("div truncates integer quotients and validates divisors", () => {
@@ -245,7 +226,7 @@ test("div truncates integer quotients and validates divisors", () => {
 
   const fixedA = Matrix.fromFixed(new BigInt64Array([100n]), 1, 1, 1);
   const fixedB = Matrix.fromFixed(new BigInt64Array([200n]), 1, 1, 1);
-  assert.throws(() => div(fixedA, fixedB), /div\(Fixed64\)/);
+  assert.throws(() => div(fixedA, fixedB), /convert operands to float64/i);
 });
 
 test("neg negates supported dtypes and preserves fixed64 metadata", () => {
@@ -588,4 +569,3 @@ test("matrixFromBytes constructs matrices from raw buffers", (t) => {
   assert.equal(matrix.dtype, "uint32");
   assert.deepEqual(Array.from(matrix.toArray()), [10, 20, 30, 40]);
 });
-
