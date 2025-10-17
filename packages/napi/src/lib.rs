@@ -18,6 +18,7 @@ use num_rs_core::{
     sigmoid as core_sigmoid, sin as core_sin, stack as core_stack, sub as core_sub,
     sum as core_sum, take as core_take, tanh as core_tanh, transpose as core_transpose,
     where_select as core_where, where_select_multi as core_where_multi, write_npy_matrix,
+    fft_axis as core_fft_axis, ifft_axis as core_ifft_axis, fft2d as core_fft2d, ifft2d as core_ifft2d,
 };
 #[cfg(feature = "linalg")]
 use num_rs_core::{eigen as core_eigen, qr as core_qr, solve as core_solve, svd as core_svd};
@@ -30,6 +31,7 @@ use std::sync::Arc;
 pub struct Matrix {
     buffer: MatrixBuffer,
 }
+
 
 #[napi]
 impl Matrix {
@@ -481,6 +483,43 @@ pub fn sum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
         None => None,
     };
     map_matrix(core_sum(matrix.buffer(), target))
+}
+
+#[napi]
+pub fn fft_axis(env: Env, matrix: &Matrix, axis: u32) -> Result<JsObject> {
+    let (real, imag) = core_fft_axis(matrix.buffer(), axis as usize).map_err(map_core_error)?;
+    let mut obj = env.create_object()?;
+    obj.set_named_property("real", Matrix::from_buffer(real))?;
+    obj.set_named_property("imag", Matrix::from_buffer(imag))?;
+    Ok(obj)
+}
+
+#[napi]
+pub fn fft2d(env: Env, matrix: &Matrix) -> Result<JsObject> {
+    let (real, imag) = core_fft2d(matrix.buffer()).map_err(map_core_error)?;
+    let mut obj = env.create_object()?;
+    obj.set_named_property("real", Matrix::from_buffer(real))?;
+    obj.set_named_property("imag", Matrix::from_buffer(imag))?;
+    Ok(obj)
+}
+
+#[napi]
+pub fn ifft_axis(env: Env, real: &Matrix, imag: &Matrix, axis: u32) -> Result<JsObject> {
+    let (real_buf, imag_buf) = core_ifft_axis(real.buffer(), imag.buffer(), axis as usize)
+        .map_err(map_core_error)?;
+    let mut obj = env.create_object()?;
+    obj.set_named_property("real", Matrix::from_buffer(real_buf))?;
+    obj.set_named_property("imag", Matrix::from_buffer(imag_buf))?;
+    Ok(obj)
+}
+
+#[napi]
+pub fn ifft2d(env: Env, real: &Matrix, imag: &Matrix) -> Result<JsObject> {
+    let (real_buf, imag_buf) = core_ifft2d(real.buffer(), imag.buffer()).map_err(map_core_error)?;
+    let mut obj = env.create_object()?;
+    obj.set_named_property("real", Matrix::from_buffer(real_buf))?;
+    obj.set_named_property("imag", Matrix::from_buffer(imag_buf))?;
+    Ok(obj)
 }
 
 #[napi]

@@ -11,6 +11,7 @@ use num_rs_core::{
     scatter as core_scatter, scatter_pairs as core_scatter_pairs, sigmoid as core_sigmoid,
     sin as core_sin, stack as core_stack, sub as core_sub, sum as core_sum, take as core_take,
     tanh as core_tanh, transpose as core_transpose, where_select as core_where,
+    fft_axis as core_fft_axis, ifft_axis as core_ifft_axis, fft2d as core_fft2d, ifft2d as core_ifft2d,
 };
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -26,6 +27,26 @@ static THREAD_POOL: OnceLock<()> = OnceLock::new();
 #[derive(Clone)]
 pub struct Matrix {
     buffer: MatrixBuffer,
+}
+
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct ComplexPair {
+    real: Matrix,
+    imag: Matrix,
+}
+
+#[wasm_bindgen]
+impl ComplexPair {
+    #[wasm_bindgen(getter)]
+    pub fn real(&self) -> Matrix {
+        self.real.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn imag(&self) -> Matrix {
+        self.imag.clone()
+    }
 }
 
 #[wasm_bindgen]
@@ -207,6 +228,13 @@ fn map_core_error(err: &str) -> JsValue {
         js_error.into()
     } else {
         JsError::new(err).into()
+    }
+}
+
+fn complex_pair_from_buffers(real: MatrixBuffer, imag: MatrixBuffer) -> ComplexPair {
+    ComplexPair {
+        real: Matrix::from_buffer(real),
+        imag: Matrix::from_buffer(imag),
     }
 }
 
@@ -453,6 +481,34 @@ pub fn take_copy_bytes() -> f64 {
 #[wasm_bindgen]
 pub fn reset_copy_bytes() {
     num_rs_core::reset_copy_bytes();
+}
+
+#[wasm_bindgen(js_name = "fft_axis")]
+pub fn fft_axis_wasm(matrix: &Matrix, axis: usize) -> Result<ComplexPair, JsValue> {
+    core_fft_axis(matrix.buffer(), axis)
+        .map(|(real, imag)| complex_pair_from_buffers(real, imag))
+        .map_err(|err| map_core_error(&err))
+}
+
+#[wasm_bindgen(js_name = "ifft_axis")]
+pub fn ifft_axis_wasm(real: &Matrix, imag: &Matrix, axis: usize) -> Result<ComplexPair, JsValue> {
+    core_ifft_axis(real.buffer(), imag.buffer(), axis)
+        .map(|(real_buf, imag_buf)| complex_pair_from_buffers(real_buf, imag_buf))
+        .map_err(|err| map_core_error(&err))
+}
+
+#[wasm_bindgen(js_name = "fft2d")]
+pub fn fft2d_wasm(matrix: &Matrix) -> Result<ComplexPair, JsValue> {
+    core_fft2d(matrix.buffer())
+        .map(|(real, imag)| complex_pair_from_buffers(real, imag))
+        .map_err(|err| map_core_error(&err))
+}
+
+#[wasm_bindgen(js_name = "ifft2d")]
+pub fn ifft2d_wasm(real: &Matrix, imag: &Matrix) -> Result<ComplexPair, JsValue> {
+    core_ifft2d(real.buffer(), imag.buffer())
+        .map(|(real_buf, imag_buf)| complex_pair_from_buffers(real_buf, imag_buf))
+        .map_err(|err| map_core_error(&err))
 }
 
 #[cfg(feature = "threads")]

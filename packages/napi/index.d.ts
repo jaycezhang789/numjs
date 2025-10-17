@@ -41,6 +41,10 @@ export declare function copyBytesTotal(): number
 export declare function takeCopyBytes(): number
 export declare function resetCopyBytes(): void
 export declare function sum(matrix: Matrix, dtype?: string | undefined | null): Matrix
+export declare function fftAxis(matrix: Matrix, axis: number): object
+export declare function fft2D(matrix: Matrix): object
+export declare function ifftAxis(real: Matrix, imag: Matrix, axis: number): object
+export declare function ifft2D(real: Matrix, imag: Matrix): object
 export declare function gpuSum(matrix: Matrix, dtype?: string | undefined | null): Matrix
 export declare function nansum(matrix: Matrix, dtype?: string | undefined | null): Matrix
 export declare function nanmean(matrix: Matrix, dtype?: string | undefined | null): Matrix

@@ -94,6 +94,11 @@ Fixed-point matrices are backed by signed 64-bit integers plus a per-matrix scal
 - **Parquet helpers.** On Node, `readParquetDataFrame` / `writeParquetDataFrame` integrate with Polars. Install `nodejs-polars` (or `polars`) and the helpers will bridge through the existing Polars converters. Without the dependency the functions raise clear guidance.
 - **Interoperability.** `DataFrameView` cooperates with the Arrow/Polars bridges, so you can move between CSV ↔︎ DataFrameView ↔︎ Arrow/Parquet with minimal glue. The class deliberately keeps the underlying `Matrix` in `float64`; dtype hints drive conversions when you request individual columns.
 
+## Image & Signal Processing (Preview)
+
+- **Spatial kernels.** `im2col`, `maxPool`, and `avgPool` provide the building blocks for classic convolution pipelines and pooling layers. `sobelFilter` (returns gradient X/Y plus optional magnitude) and `gaussianBlur` (kernel derived from `sigma`) wrap the existing `conv2d` accelerator so they benefit from WebGPU in the browser or CUDA on Node.
+- **FFT utilities.** New helpers `fftAxis`, `fft2d`, `ifftAxis`, `ifft2d`, and `powerSpectrum` expose the Rust `rustfft` backend through both the WASM and N-API backends. They return complex-valued pairs (`real`/`imag` matrices) so you can hop between spatial and frequency domains without leaving the NumJS API.
+
 ## Licensing and Feedback
 
 The project is currently pre-release. File issues or pull requests if you encounter bugs, missing algorithms, or performance regressions.

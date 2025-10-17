@@ -35,3 +35,4 @@ intel-mkl-src = { version = "0.8", optional = true, default-features = false }
 rayon = { version = "1.10", optional = true }
 cudarc = { version = "0.11", optional = true, default-features = false, features = ["driver", "nvrtc"] }
 once_cell = { version = "1.19", optional = true }
+rustfft = "6"

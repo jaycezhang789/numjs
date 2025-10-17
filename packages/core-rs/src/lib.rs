@@ -3,6 +3,7 @@ pub mod compress;
 #[cfg(any(feature = "cpu-openblas", feature = "cpu-blis", feature = "cpu-mkl"))]
 mod cpu;
 pub mod dtype;
+pub mod fft;
 pub mod element;
 pub mod error;
 pub mod gpu;
@@ -2355,6 +2356,32 @@ pub fn read_npz_matrices(_data: &[u8]) -> CoreResult<Vec<(String, MatrixBuffer)>
 #[cfg(not(feature = "npy"))]
 pub fn write_npz_matrices(_entries: &[(&str, MatrixBuffer)]) -> CoreResult<Vec<u8>> {
     Err("npz support is disabled".into())
+}
+
+pub fn fft_axis(
+    matrix: &MatrixBuffer,
+    axis: usize,
+) -> CoreResult<(MatrixBuffer, MatrixBuffer)> {
+    fft::fft1d(matrix, axis)
+}
+
+pub fn ifft_axis(
+    real: &MatrixBuffer,
+    imag: &MatrixBuffer,
+    axis: usize,
+) -> CoreResult<(MatrixBuffer, MatrixBuffer)> {
+    fft::ifft1d(real, imag, axis)
+}
+
+pub fn fft2d(matrix: &MatrixBuffer) -> CoreResult<(MatrixBuffer, MatrixBuffer)> {
+    fft::fft2d(matrix)
+}
+
+pub fn ifft2d(
+    real: &MatrixBuffer,
+    imag: &MatrixBuffer,
+) -> CoreResult<(MatrixBuffer, MatrixBuffer)> {
+    fft::ifft2d(real, imag)
 }
 
 fn ensure_same_shape(a: &MatrixBuffer, b: &MatrixBuffer) -> CoreResult<()> {

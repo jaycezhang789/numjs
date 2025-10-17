@@ -60,6 +60,11 @@ export type Conv2DOptions = {
   mode?: GpuExecutionMode;
 };
 
+export type FftResult = {
+  real: Matrix;
+  imag: Matrix;
+};
+
 export type DataFrameInitOptions = {
   columns?: readonly string[];
   columnDTypes?: Record<string, DType>;
@@ -216,6 +221,22 @@ type BackendModule = {
     b: BackendMatrixHandle,
     axis: number
   ): BackendMatrixHandle;
+  fft_axis?(
+    matrix: BackendMatrixHandle,
+    axis: number
+  ): { real: BackendMatrixHandle; imag: BackendMatrixHandle };
+  fft2d?(
+    matrix: BackendMatrixHandle
+  ): { real: BackendMatrixHandle; imag: BackendMatrixHandle };
+  ifft_axis?(
+    real: BackendMatrixHandle,
+    imag: BackendMatrixHandle,
+    axis: number
+  ): { real: BackendMatrixHandle; imag: BackendMatrixHandle };
+  ifft2d?(
+    real: BackendMatrixHandle,
+    imag: BackendMatrixHandle
+  ): { real: BackendMatrixHandle; imag: BackendMatrixHandle };
   transpose?(matrix: BackendMatrixHandle): BackendMatrixHandle;
   broadcast_to?(
     matrix: BackendMatrixHandle,
@@ -2022,6 +2043,203 @@ export async function conv2d(
     pad
   );
   return new Matrix(cpuResult, outRows, outCols, { dtype: "float32" });
+}
+
+export function im2col(
+  input: Matrix,
+  kernelRows: number,
+  kernelCols: number,
+  options: Conv2DOptions = {}
+): Matrix {
+  if (kernelRows <= 0 || kernelCols <= 0) {
+    throw new Error("im2col: kernel dimensions must be positive");
+  }
+  const stride = options.stride ?? 1;
+  const pad = options.pad ?? 0;
+  if (stride <= 0) {
+    throw new Error("im2col: stride must be positive");
+  }
+  const view = toFloat32View(input);
+  const outRows = Math.floor((view.rows + 2 * pad - kernelRows) / stride + 1);
+  const outCols = Math.floor((view.cols + 2 * pad - kernelCols) / stride + 1);
+  if (outRows <= 0 || outCols <= 0) {
+    throw new Error("im2col: output dimensions are non-positive; adjust stride/padding");
+  }
+  const columns = outRows * outCols;
+  const rows = kernelRows * kernelCols;
+  const data = new Float32Array(rows * columns);
+  let colIndex = 0;
+  for (let outRow = 0; outRow < outRows; outRow += 1) {
+    for (let outCol = 0; outCol < outCols; outCol += 1) {
+      for (let kRow = 0; kRow < kernelRows; kRow += 1) {
+        for (let kCol = 0; kCol < kernelCols; kCol += 1) {
+          const sourceRow = outRow * stride + kRow - pad;
+          const sourceCol = outCol * stride + kCol - pad;
+          const rowIndex = kRow * kernelCols + kCol;
+          const destIndex = rowIndex * columns + colIndex;
+          if (
+            sourceRow < 0 ||
+            sourceRow >= view.rows ||
+            sourceCol < 0 ||
+            sourceCol >= view.cols
+          ) {
+            data[destIndex] = 0;
+          } else {
+            data[destIndex] = view.array[sourceRow * view.cols + sourceCol];
+          }
+        }
+      }
+      colIndex += 1;
+    }
+  }
+  return new Matrix(data, rows, columns, { dtype: "float32" });
+}
+
+function pool2d(
+  input: Matrix,
+  kernelRows: number,
+  kernelCols: number,
+  reducer: (acc: number, value: number) => number,
+  initial: number,
+  finalize: (acc: number, count: number) => number,
+  options: Conv2DOptions = {}
+): Matrix {
+  if (kernelRows <= 0 || kernelCols <= 0) {
+    throw new Error("pool2d: kernel dimensions must be positive");
+  }
+  const stride = options.stride ?? kernelRows;
+  const pad = options.pad ?? 0;
+  if (stride <= 0) {
+    throw new Error("pool2d: stride must be positive");
+  }
+  const view = toFloat32View(input);
+  const outRows = Math.floor((view.rows + 2 * pad - kernelRows) / stride + 1);
+  const outCols = Math.floor((view.cols + 2 * pad - kernelCols) / stride + 1);
+  if (outRows <= 0 || outCols <= 0) {
+    throw new Error("pool2d: output dimensions are non-positive; adjust stride/padding");
+  }
+  const result = new Float32Array(outRows * outCols);
+  let index = 0;
+  for (let outRow = 0; outRow < outRows; outRow += 1) {
+    for (let outCol = 0; outCol < outCols; outCol += 1) {
+      let acc = initial;
+      let count = 0;
+      for (let kRow = 0; kRow < kernelRows; kRow += 1) {
+        for (let kCol = 0; kCol < kernelCols; kCol += 1) {
+          const sourceRow = outRow * stride + kRow - pad;
+          const sourceCol = outCol * stride + kCol - pad;
+          if (
+            sourceRow < 0 ||
+            sourceRow >= view.rows ||
+            sourceCol < 0 ||
+            sourceCol >= view.cols
+          ) {
+            continue;
+          }
+          const value = view.array[sourceRow * view.cols + sourceCol];
+          acc = reducer(acc, value);
+          count += 1;
+        }
+      }
+      result[index++] = finalize(acc, count);
+    }
+  }
+  return new Matrix(result, outRows, outCols, { dtype: "float32" });
+}
+
+export function maxPool(
+  input: Matrix,
+  kernelRows: number,
+  kernelCols: number,
+  options: Conv2DOptions = {}
+): Matrix {
+  return pool2d(
+    input,
+    kernelRows,
+    kernelCols,
+    (acc, value) => (acc > value ? acc : value),
+    Number.NEGATIVE_INFINITY,
+    (acc) => acc,
+    options
+  );
+}
+
+export function avgPool(
+  input: Matrix,
+  kernelRows: number,
+  kernelCols: number,
+  options: Conv2DOptions = {}
+): Matrix {
+  return pool2d(
+    input,
+    kernelRows,
+    kernelCols,
+    (acc, value) => acc + value,
+    0,
+    (acc, count) => (count === 0 ? 0 : acc / count),
+    options
+  );
+}
+
+export async function sobelFilter(
+  input: Matrix,
+  options: { mode?: Conv2DOptions; magnitude?: boolean } = {}
+): Promise<{ gx: Matrix; gy: Matrix; magnitude?: Matrix }> {
+  const kx = new Matrix(
+    new Float32Array([1, 0, -1, 2, 0, -2, 1, 0, -1]),
+    3,
+    3,
+    { dtype: "float32" }
+  );
+  const ky = new Matrix(
+    new Float32Array([1, 2, 1, 0, 0, 0, -1, -2, -1]),
+    3,
+    3,
+    { dtype: "float32" }
+  );
+  const gx = await conv2d(input, kx, options.mode ?? {});
+  const gy = await conv2d(input, ky, options.mode ?? {});
+  let magnitude: Matrix | undefined;
+  if (options.magnitude !== false) {
+    const gxArr = gx.astype("float64", { copy: false }).toArray() as Float64Array;
+    const gyArr = gy.astype("float64", { copy: false }).toArray() as Float64Array;
+    const mag = new Float64Array(gxArr.length);
+    for (let i = 0; i < gxArr.length; i += 1) {
+      const x = gxArr[i];
+      const y = gyArr[i];
+      mag[i] = Math.hypot(x, y);
+    }
+    magnitude = new Matrix(mag, gx.rows, gx.cols, { dtype: "float64" });
+  }
+  return { gx, gy, magnitude };
+}
+
+export async function gaussianBlur(
+  input: Matrix,
+  options: { sigma?: number; size?: number; mode?: Conv2DOptions } = {}
+): Promise<Matrix> {
+  const sigma = options.sigma ?? 1;
+  const sizeInput = options.size ?? Math.ceil(sigma * 6);
+  let size = sizeInput | 1;
+  if (size < 3) size = 3;
+  if (size % 2 === 0) size += 1;
+  const radius = (size - 1) / 2;
+  const kernel = new Float32Array(size * size);
+  const sigmaSq = sigma * sigma;
+  let sum = 0;
+  for (let y = -radius; y <= radius; y += 1) {
+    for (let x = -radius; x <= radius; x += 1) {
+      const idx = (y + radius) * size + (x + radius);
+      const value = Math.exp(-(x * x + y * y) / (2 * sigmaSq));
+      kernel[idx] = value;
+      sum += value;
+    }
+  }
+  for (let i = 0; i < kernel.length; i += 1) {
+    kernel[i] /= sum;
+  }
+  const kernelMatrix = new Matrix(kernel, size, size, { dtype: "float32" });
+  return conv2d(input, kernelMatrix, options.mode ?? {});
 }
 
 
@@ -4045,6 +4263,101 @@ function escapeCsvValue(value: string, delimiter: string): string {
     return `"${value}"`;
   }
   return value;
+}
+
+type BackendFftResult = {
+  real: BackendMatrixHandle;
+  imag: BackendMatrixHandle;
+};
+
+function convertBackendFftResult(result: BackendFftResult): FftResult {
+  const real = Matrix.fromHandleWithDType(result.real, "float64");
+  const imag = Matrix.fromHandleWithDType(result.imag, "float64");
+  return { real, imag };
+}
+
+function resolveFftBackendFn(
+  backend: BackendModule,
+  name: "fft_axis" | "fft2d" | "ifft_axis" | "ifft2d"
+): ((...args: unknown[]) => BackendFftResult) | null {
+  const candidate = (backend as any)[name] ?? (backend as any)[toCamelCase(name)];
+  return typeof candidate === "function" ? (candidate as (...args: unknown[]) => BackendFftResult) : null;
+}
+
+function toCamelCase(name: string): string {
+  return name.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+}
+
+function ensureFftAxis(axis: number, matrix: Matrix): number {
+  if (axis !== 0 && axis !== 1) {
+    throw new Error("fftAxis: axis must be 0 (columns) or 1 (rows)");
+  }
+  if (axis === 0 && matrix.rows < 1) {
+    throw new Error("fftAxis: matrix must have at least one row");
+  }
+  if (axis === 1 && matrix.cols < 1) {
+    throw new Error("fftAxis: matrix must have at least one column");
+  }
+  return axis;
+}
+
+export function fftAxis(matrix: Matrix, axis = 1): FftResult {
+  const normalizedAxis = ensureFftAxis(axis, matrix);
+  const backend = ensureBackend();
+  const fn = resolveFftBackendFn(backend, "fft_axis");
+  if (!fn) {
+    throw new Error("fftAxis: current backend does not expose FFT support");
+  }
+  const result = fn(getHandle(matrix), normalizedAxis);
+  return convertBackendFftResult(result);
+}
+
+export function ifftAxis(real: Matrix, imag: Matrix, axis = 1): FftResult {
+  const normalizedAxis = ensureFftAxis(axis, real);
+  if (real.rows !== imag.rows || real.cols !== imag.cols) {
+    throw new Error("ifftAxis: real and imaginary matrices must have identical shapes");
+  }
+  const backend = ensureBackend();
+  const fn = resolveFftBackendFn(backend, "ifft_axis");
+  if (!fn) {
+    throw new Error("ifftAxis: current backend does not expose inverse FFT support");
+  }
+  const result = fn(getHandle(real), getHandle(imag), normalizedAxis);
+  return convertBackendFftResult(result);
+}
+
+export function fft2d(matrix: Matrix): FftResult {
+  const backend = ensureBackend();
+  const fn = resolveFftBackendFn(backend, "fft2d");
+  if (!fn) {
+    throw new Error("fft2d: current backend does not expose 2D FFT support");
+  }
+  const result = fn(getHandle(matrix));
+  return convertBackendFftResult(result);
+}
+
+export function ifft2d(real: Matrix, imag: Matrix): FftResult {
+  if (real.rows !== imag.rows || real.cols !== imag.cols) {
+    throw new Error("ifft2d: real and imaginary matrices must have identical shapes");
+  }
+  const backend = ensureBackend();
+  const fn = resolveFftBackendFn(backend, "ifft2d");
+  if (!fn) {
+    throw new Error("ifft2d: current backend does not expose 2D inverse FFT support");
+  }
+  const result = fn(getHandle(real), getHandle(imag));
+  return convertBackendFftResult(result);
+}
+
+export function powerSpectrum(matrix: Matrix, axis = 1): Matrix {
+  const { real, imag } = fftAxis(matrix, axis);
+  const realArr = real.astype("float64", { copy: false }).toArray() as Float64Array;
+  const imagArr = imag.astype("float64", { copy: false }).toArray() as Float64Array;
+  const spectrum = new Float64Array(realArr.length);
+  for (let i = 0; i < realArr.length; i += 1) {
+    spectrum[i] = Math.hypot(realArr[i], imagArr[i]);
+  }
+  return new Matrix(spectrum, real.rows, real.cols, { dtype: "float64" });
 }
 
 export function lazyFromMatrix(matrix: Matrix): LazyArray {

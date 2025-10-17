@@ -19,6 +19,12 @@ const {
   readCsvDataFrameFromStream,
   readParquetDataFrame,
   writeParquetDataFrame,
+  im2col,
+  maxPool,
+  avgPool,
+  fftAxis,
+  ifftAxis,
+  powerSpectrum,
 } =
   await import("../dist/index.js");
 
@@ -103,4 +109,67 @@ test("Parquet helpers inform about missing Polars", async () => {
   const matrix = new Matrix(new Float64Array([1, 2, 3, 4]), 2, 2, { dtype: "float64" });
   const frame = DataFrameView.fromMatrix(matrix, { columns: ["a", "b"] });
   await assert.rejects(writeParquetDataFrame(frame, "/tmp/does-not-exist.parquet"), /polars/i);
+});
+
+test("im2col expands patches into columns", () => {
+  const input = new Matrix(new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9]), 3, 3, {
+    dtype: "float32",
+  });
+  const colsMatrix = im2col(input, 2, 2);
+  assert.equal(colsMatrix.rows, 4);
+  assert.equal(colsMatrix.cols, 4);
+  const expected = [
+    [1, 2, 4, 5],
+    [2, 3, 5, 6],
+    [4, 5, 7, 8],
+    [5, 6, 8, 9],
+  ];
+  const actual = colsMatrix.toArray();
+  for (let col = 0; col < colsMatrix.cols; col += 1) {
+    for (let row = 0; row < colsMatrix.rows; row += 1) {
+      assert.equal(actual[row * colsMatrix.cols + col], expected[row][col]);
+    }
+  }
+});
+
+test("maxPool and avgPool reduce windows", () => {
+  const input = new Matrix(
+    new Float32Array([
+      1, 2, 3, 4,
+      5, 6, 7, 8,
+      9, 10, 11, 12,
+      13, 14, 15, 16,
+    ]),
+    4,
+    4,
+    {
+    dtype: "float32",
+  }
+  );
+  const maxed = maxPool(input, 2, 2, { stride: 2 });
+  const avged = avgPool(input, 2, 2, { stride: 2 });
+  assert.deepEqual(Array.from(maxed.toArray()), [6, 8, 14, 16]);
+  assert.deepEqual(Array.from(avged.toArray()), [3.5, 5.5, 11.5, 13.5]);
+});
+
+test("fftAxis and ifftAxis round-trip real signals", () => {
+  const signal = new Matrix(new Float64Array([1, 0, 0, 0]), 1, 4, { dtype: "float64" });
+  const spectrum = fftAxis(signal, 1);
+  assert.deepEqual(Array.from(spectrum.real.toArray()), [1, 1, 1, 1]);
+  assert.deepEqual(Array.from(spectrum.imag.toArray()), [0, 0, 0, 0]);
+  const inverted = ifftAxis(spectrum.real, spectrum.imag, 1);
+  const recovered = inverted.real.toArray();
+  assert.ok(
+    Array.from(recovered).every((value, index) =>
+      Math.abs(value - (index === 0 ? 1 : 0)) < 1e-6
+    )
+  );
+});
+
+test("powerSpectrum computes magnitude", () => {
+  const signal = new Matrix(new Float64Array([0, 1, 0, -1]), 1, 4, { dtype: "float64" });
+  const spectrum = powerSpectrum(signal, 1);
+  const values = spectrum.toArray();
+  assert.equal(values.length, 4);
+  assert.ok(values.every((v) => v >= 0));
 });
