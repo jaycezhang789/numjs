@@ -25,6 +25,9 @@ const {
   fftAxis,
   ifftAxis,
   powerSpectrum,
+  runPythonScript,
+  pythonTransformMatrix,
+  loadOnnxModel,
 } =
   await import("../dist/index.js");
 
@@ -172,4 +175,23 @@ test("powerSpectrum computes magnitude", () => {
   const values = spectrum.toArray();
   assert.equal(values.length, 4);
   assert.ok(values.every((v) => v >= 0));
+});
+
+test("runPythonScript surfaces interpreter errors", async () => {
+  await assert.rejects(
+    runPythonScript("print('hello')", { pythonPath: "__nonexistent_python__" }),
+    /requires a functional Python interpreter/
+  );
+});
+
+test("pythonTransformMatrix propagates run errors", async () => {
+  const matrix = new Matrix(new Float64Array([1, 2, 3, 4]), 2, 2, { dtype: "float64" });
+  await assert.rejects(
+    pythonTransformMatrix(matrix, "print('noop')", { pythonPath: "__nonexistent_python__" }),
+    /requires a functional Python interpreter/
+  );
+});
+
+test("loadOnnxModel requires onnxruntime-node", async () => {
+  await assert.rejects(loadOnnxModel(join(tmpdir(), `${randomUUID()}.onnx`)), /onnxruntime-node/);
 });

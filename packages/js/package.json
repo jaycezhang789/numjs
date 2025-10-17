@@ -1,6 +1,6 @@
 {
   "name": "@jayce789/numjs",
-  "version": "2.0.6",
+  "version": "2.0.8",
   "description": "NumPy-inspired numerical computing for JavaScript with automatic Node N-API fallback to WebAssembly.",
   "type": "module",
   "main": "dist/index.cjs",
@@ -37,7 +37,9 @@
   "peerDependencies": {
     "apache-arrow": "^15",
     "nodejs-polars": "*",
-    "polars": "*"
+    "polars": "*",
+    "python-shell": "*",
+    "onnxruntime-node": "*"
   },
   "peerDependenciesMeta": {
     "apache-arrow": {
@@ -47,6 +49,12 @@
       "optional": true
     },
     "polars": {
+      "optional": true
+    },
+    "python-shell": {
+      "optional": true
+    },
+    "onnxruntime-node": {
       "optional": true
     }
   },

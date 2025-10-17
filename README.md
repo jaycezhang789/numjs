@@ -99,6 +99,12 @@ Fixed-point matrices are backed by signed 64-bit integers plus a per-matrix scal
 - **Spatial kernels.** `im2col`, `maxPool`, and `avgPool` provide the building blocks for classic convolution pipelines and pooling layers. `sobelFilter` (returns gradient X/Y plus optional magnitude) and `gaussianBlur` (kernel derived from `sigma`) wrap the existing `conv2d` accelerator so they benefit from WebGPU in the browser or CUDA on Node.
 - **FFT utilities.** New helpers `fftAxis`, `fft2d`, `ifftAxis`, `ifft2d`, and `powerSpectrum` expose the Rust `rustfft` backend through both the WASM and N-API backends. They return complex-valued pairs (`real`/`imag` matrices) so you can hop between spatial and frequency domains without leaving the NumJS API.
 
+## Python & ONNX Interop (Preview)
+
+- **Python bridge.** `runPythonScript` executes inline Python via the system interpreter (configurable `pythonPath`/`env`/`args`) and returns captured stdout/stderr. `pythonTransformMatrix` streams a matrix as JSON into Python and expects JSON back, making it easy to validate kernels against NumPy/SciPy. Install CPython and author scripts that read from stdin; if Python is missing, the helpers throw guidance.
+- **ONNX Runtime.** `loadOnnxModel` dynamically imports `onnxruntime-node`, creates an inference session, and exposes a lightweight `OnnxModel` wrapper. Feed `Matrix` or typed arrays to `model.run` and receive output matrices. The dependency is optional—if it’s absent the helper raises an informative error.
+- **Safety defaults.** Both bridges are Node-only and lazy-load their optional dependencies. No extra code ships to the browser bundles unless you explicitly call the APIs.
+
 ## Licensing and Feedback
 
 The project is currently pre-release. File issues or pull requests if you encounter bugs, missing algorithms, or performance regressions.

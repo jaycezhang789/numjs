@@ -97,6 +97,40 @@ export type ParquetWriteOptions = {
   compression?: string;
 };
 
+export type PythonBridgeOptions = {
+  pythonPath?: string;
+  args?: readonly string[];
+  env?: Record<string, string>;
+  stdin?: string;
+};
+
+export type PythonExecutionResult = {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+};
+
+export type PythonMatrixTransformOptions = PythonBridgeOptions & {
+  parser?: (output: string) => {
+    rows: number;
+    cols: number;
+    data: ArrayLike<number>;
+    dtype?: DType;
+  };
+};
+
+export type OnnxLoadOptions = {
+  executionProviders?: readonly string[];
+  logSeverityLevel?: number;
+  module?: unknown;
+};
+
+export type OnnxRunOptions = {
+  fetches?: readonly string[];
+};
+
+export type OnnxRunResult = Record<string, Matrix>;
+
 type BackendMatrixHandle = {
   readonly rows: number;
   readonly cols: number;
@@ -4358,6 +4392,225 @@ export function powerSpectrum(matrix: Matrix, axis = 1): Matrix {
     spectrum[i] = Math.hypot(realArr[i], imagArr[i]);
   }
   return new Matrix(spectrum, real.rows, real.cols, { dtype: "float64" });
+}
+
+const PYTHON_ERROR_HINT =
+  'runPythonScript requires a functional Python interpreter. Install Python or supply options.pythonPath to point to the executable.';
+
+export async function runPythonScript(
+  script: string,
+  options: PythonBridgeOptions = {}
+): Promise<PythonExecutionResult> {
+  ensureNodeEnvironment("runPythonScript");
+  const { spawn } = await import("node:child_process");
+  const pythonPath = options.pythonPath ?? "python";
+  const args = ["-c", script, ...(options.args ?? [])];
+  return await new Promise<PythonExecutionResult>((resolve, reject) => {
+    const child = spawn(pythonPath, args, {
+      env: { ...process.env, ...(options.env ?? {}) },
+      stdio: "pipe",
+    });
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => stdout.push(String(chunk)));
+    child.stderr.on("data", (chunk) => stderr.push(String(chunk)));
+    child.on("error", (err) => {
+      reject(
+        new Error(
+          `${PYTHON_ERROR_HINT} (attempted executable: ${pythonPath})`,
+          { cause: err }
+        )
+      );
+    });
+    child.on("close", (code) => {
+      resolve({
+        stdout: stdout.join(""),
+        stderr: stderr.join(""),
+        exitCode: code,
+      });
+    });
+    if (options.stdin !== undefined) {
+      child.stdin.write(options.stdin);
+    }
+    child.stdin.end();
+  });
+}
+
+export async function pythonTransformMatrix(
+  matrix: Matrix,
+  script: string,
+  options: PythonMatrixTransformOptions = {}
+): Promise<Matrix> {
+  const input = matrix.astype("float64", { copy: false });
+  const payload = JSON.stringify({
+    rows: input.rows,
+    cols: input.cols,
+    dtype: "float64",
+    data: Array.from(input.toArray() as Float64Array),
+  });
+  const result = await runPythonScript(script, { ...options, stdin: payload });
+  const parser =
+    options.parser ??
+    ((text: string) => {
+      const trimmed = text.trim();
+      const lines = trimmed.split(/\r?\n/).filter((line) => line.length > 0);
+      if (lines.length === 0) {
+        throw new Error("pythonTransformMatrix: Python script did not produce output");
+      }
+      return JSON.parse(lines[lines.length - 1]);
+    });
+  const parsed = parser(result.stdout);
+  if (
+    !parsed ||
+    typeof parsed.rows !== "number" ||
+    typeof parsed.cols !== "number" ||
+    !parsed.data
+  ) {
+    throw new Error(
+      "pythonTransformMatrix: expected parser to return { rows, cols, data }"
+    );
+  }
+  const dtype = (parsed.dtype as DType | undefined) ?? "float64";
+  const array = Array.from(parsed.data as ArrayLike<number>);
+  if (array.length !== parsed.rows * parsed.cols) {
+    throw new Error(
+      `pythonTransformMatrix: parsed data length (${array.length}) does not match shape (${parsed.rows} x ${parsed.cols})`
+    );
+  }
+  const buffer =
+    dtype === "float32"
+      ? Float32Array.from(array)
+      : Float64Array.from(array);
+  return new Matrix(buffer, parsed.rows, parsed.cols, { dtype });
+}
+
+type OnnxRuntimeModule = {
+  InferenceSession: {
+    create(path: string, options?: Record<string, unknown>): Promise<any>;
+  };
+  Tensor: new (type: string, data: Float32Array | Float64Array, dims: readonly number[]) => any;
+};
+
+export class OnnxModel {
+  private readonly ort: OnnxRuntimeModule;
+  private readonly session: any;
+  readonly inputNames: readonly string[];
+  readonly outputNames: readonly string[];
+
+  constructor(session: any, ort: OnnxRuntimeModule) {
+    this.session = session;
+    this.ort = ort;
+    this.inputNames = session.inputNames ?? [];
+    this.outputNames = session.outputNames ?? [];
+  }
+
+  async run(
+    feeds: Record<
+      string,
+      Matrix | Float32Array | Float64Array | number[]
+    >,
+    options: OnnxRunOptions = {}
+  ): Promise<OnnxRunResult> {
+    if (!feeds || Object.keys(feeds).length === 0) {
+      throw new Error("OnnxModel.run requires at least one feed");
+    }
+    const prepared: Record<string, any> = {};
+    for (const [name, value] of Object.entries(feeds)) {
+      if (value instanceof Matrix) {
+        const view = toFloat32View(value);
+        prepared[name] = new this.ort.Tensor(
+          "float32",
+          view.array,
+          [view.rows, view.cols]
+        );
+      } else if (value instanceof Float32Array) {
+        prepared[name] = new this.ort.Tensor("float32", value, [value.length]);
+      } else if (value instanceof Float64Array) {
+        prepared[name] = new this.ort.Tensor("float64", value, [value.length]);
+      } else if (Array.isArray(value)) {
+        const tensorData = Float32Array.from(value);
+        prepared[name] = new this.ort.Tensor("float32", tensorData, [tensorData.length]);
+      } else {
+        throw new Error(
+          `OnnxModel.run: unsupported feed value for "${name}". Supply Matrix, Float32Array, Float64Array, or number[].`
+        );
+      }
+    }
+    let fetches: string[] | undefined;
+    if (options.fetches && options.fetches.length > 0) {
+      fetches = Array.from(options.fetches);
+    }
+    const outputs = (await this.session.run(prepared, fetches)) as Record<string, any>;
+    const result: Record<string, Matrix> = {};
+    for (const [name, tensor] of Object.entries(outputs)) {
+      const dims: number[] =
+        (tensor.dims as number[]) ??
+        (tensor.shape as number[]) ??
+        [];
+      if (dims.length === 0) {
+        throw new Error(`OnnxModel.run: output "${name}" has no dimensions`);
+      }
+      let rows: number;
+      let cols: number;
+      if (dims.length === 1) {
+        rows = dims[0];
+        cols = 1;
+      } else if (dims.length === 2) {
+        [rows, cols] = dims;
+      } else {
+        rows = dims.slice(0, -1).reduce((acc, value) => acc * value, 1);
+        cols = dims[dims.length - 1];
+      }
+      const type = (tensor.type ?? tensor.dataType ?? "float32").toString().toLowerCase();
+      if (type === "float64" || type === "double") {
+        const data = Float64Array.from(tensor.data as Float64Array | number[]);
+        result[name] = new Matrix(data, rows, cols, { dtype: "float64" });
+      } else if (type === "float32" || type === "float") {
+        const data = Float32Array.from(tensor.data as Float32Array | number[]);
+        result[name] = new Matrix(data, rows, cols, { dtype: "float32" });
+      } else {
+        throw new Error(
+          `OnnxModel.run: unsupported tensor type "${tensor.type ?? tensor.dataType}" for output "${name}"`
+        );
+      }
+    }
+    return result;
+  }
+}
+
+async function ensureOnnxRuntime(moduleOverride?: unknown): Promise<OnnxRuntimeModule> {
+  if (moduleOverride) {
+    return moduleOverride as OnnxRuntimeModule;
+  }
+  try {
+    const dynamicImport = new Function("specifier", "return import(specifier);");
+    const ort = await dynamicImport("onnxruntime-node");
+    return ort as OnnxRuntimeModule;
+  } catch (error) {
+    throw new Error(
+      'loadOnnxModel requires the optional dependency "onnxruntime-node". Install it in your project to enable ONNX support.',
+      { cause: error }
+    );
+  }
+}
+
+export async function loadOnnxModel(
+  path: string,
+  options: OnnxLoadOptions = {}
+): Promise<OnnxModel> {
+  ensureNodeEnvironment("loadOnnxModel");
+  const ort = (await ensureOnnxRuntime(options.module)) as OnnxRuntimeModule;
+  const sessionOptions: Record<string, unknown> = {};
+  if (options.executionProviders) {
+    sessionOptions.executionProviders = Array.from(options.executionProviders);
+  }
+  if (typeof options.logSeverityLevel === "number") {
+    sessionOptions.logSeverityLevel = options.logSeverityLevel;
+  }
+  const session = await ort.InferenceSession.create(path, sessionOptions);
+  return new OnnxModel(session, ort);
 }
 
 export function lazyFromMatrix(matrix: Matrix): LazyArray {
