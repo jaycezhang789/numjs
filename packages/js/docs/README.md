@@ -6,5 +6,6 @@
 - **后端原理与选择**：[`WASM 与 N-API 后端选择与原理`](./tutorials/backends.md) 解释双后端架构的设计哲学、加载流程与手动控制策略。
 - **WebGPU 加速篇**：[`WebGPU 加速篇`](./tutorials/webgpu.md) 展示如何结合浏览器/Node.js 的 GPU 能力提升矩阵算子吞吐。
 - **交互式文档**：在 [`StackBlitz/CodeSandbox 指南`](./interactive/README.md) 中体验在线 playground，并获取复制即跑的 demo 代码。
+- **锦上添花与未来探索**：[`Autograd 与随机分布路线图`](./future.md) 描述计划中的自动微分与随机分布功能。
 
 > 文档建议与勘误欢迎通过 Issues 或 PR 提交，我们会在发版前统一校验。每篇教程下方也提供了与 `examples/` 目录对应的示例入口。

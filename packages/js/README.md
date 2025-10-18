@@ -74,6 +74,7 @@ Refer to the generated TypeScript declarations in `dist/index.d.ts` for the comp
 - [WASM 与 N-API 后端选择与原理](docs/tutorials/backends.md)：剖析双后端加载流程、手动控制与常见故障排查。
 - [WebGPU 加速篇](docs/tutorials/webgpu.md)：介绍如何启用 GPU 管线与性能调优策略。
 - [StackBlitz/CodeSandbox 交互式文档](docs/interactive/README.md)：在线运行 Playground，附复制即跑 Demo。
+- [锦上添花与未来探索](docs/future.md)：概述计划中的自动微分与随机分布增强路线。
 
 ## Backend Strategy
 `init()` negotiates the backend in the following order:
