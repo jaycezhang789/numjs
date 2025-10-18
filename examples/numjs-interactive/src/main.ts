@@ -1,5 +1,6 @@
 import { init, Matrix, add, matmul, backendKind } from "@jayce789/numjs";
 import { logBackendSupport } from "./backends";
+import { runAutogradDemo } from "./autograd";
 import { runMigrationSample } from "./migration";
 
 const output = document.querySelector<HTMLPreElement>("#output");
@@ -26,6 +27,7 @@ async function main() {
 
   await logBackendSupport(append);
   await runMigrationSample(append);
+  await runAutogradDemo(append);
 
   append("ℹ️ 试着修改 src/*.ts 查看实时结果。");
 }

@@ -4731,6 +4731,437 @@ export function lazyScalar(value: number): LazyScalar {
 }
 
 export { LazyArray, LazyScalar, lazyConstant };
+
+// -----------------------------
+// Autograd (phase 1 scaffolding)
+// -----------------------------
+
+type TensorDependency = {
+  tensor: Tensor;
+  gradFn: (upstream: Matrix) => Matrix;
+};
+
+export type TensorOptions = MatrixOptions & {
+  requiresGrad?: boolean;
+  name?: string;
+};
+
+function gradDTypeFor(valueDType: DType): DType {
+  switch (valueDType) {
+    case "float32":
+      return "float32";
+    case "float64":
+    case "fixed64":
+      return "float64";
+    default:
+      return "float64";
+  }
+}
+
+function ensureGradDType(matrix: Matrix, dtype: DType): Matrix {
+  if (matrix.dtype === dtype) {
+    return matrix;
+  }
+  return matrix.astype(dtype, { copy: false });
+}
+
+function createFilledLike(
+  reference: Matrix,
+  fill: number,
+  dtype = gradDTypeFor(reference.dtype),
+  targetShape?: { rows: number; cols: number }
+): Matrix {
+  const rows = targetShape?.rows ?? reference.rows;
+  const cols = targetShape?.cols ?? reference.cols;
+  const length = rows * cols;
+  switch (dtype) {
+    case "float32": {
+      const data = new Float32Array(length);
+      data.fill(fill);
+      return new Matrix(data, rows, cols, { dtype: "float32" });
+    }
+    default: {
+      const data = new Float64Array(length);
+      data.fill(fill);
+      return new Matrix(data, rows, cols, { dtype: "float64" });
+    }
+  }
+}
+
+function sumRowsMatrix(matrix: Matrix, dtype: DType): Matrix {
+  const source =
+    matrix.dtype === dtype ? matrix : matrix.astype(dtype, { copy: true });
+  const rows = source.rows;
+  const cols = source.cols;
+  const data = source.toArray() as Float32Array | Float64Array;
+  const result =
+    dtype === "float32" ? new Float32Array(cols) : new Float64Array(cols);
+  for (let row = 0; row < rows; row += 1) {
+    const offset = row * cols;
+    for (let col = 0; col < cols; col += 1) {
+      result[col] += data[offset + col];
+    }
+  }
+  return new Matrix(result, 1, cols, { dtype });
+}
+
+function sumColsMatrix(matrix: Matrix, dtype: DType): Matrix {
+  const source =
+    matrix.dtype === dtype ? matrix : matrix.astype(dtype, { copy: true });
+  const rows = source.rows;
+  const cols = source.cols;
+  const data = source.toArray() as Float32Array | Float64Array;
+  const result =
+    dtype === "float32" ? new Float32Array(rows) : new Float64Array(rows);
+  for (let row = 0; row < rows; row += 1) {
+    let total = 0;
+    const offset = row * cols;
+    for (let col = 0; col < cols; col += 1) {
+      total += data[offset + col];
+    }
+    result[row] = total;
+  }
+  return new Matrix(result, rows, 1, { dtype });
+}
+
+function matchGradientShape(grad: Matrix, tensor: Tensor): Matrix {
+  const target = tensor.value;
+  const dtype = gradDTypeFor(target.dtype);
+  let adjusted = ensureGradDType(grad, dtype);
+
+  if (adjusted.rows !== target.rows) {
+    if (target.rows === 1 && adjusted.rows > 1) {
+      adjusted = sumRowsMatrix(adjusted, dtype);
+    } else if (adjusted.rows === 1 && target.rows > 1) {
+      adjusted = broadcastTo(adjusted, target.rows, adjusted.cols);
+    }
+  }
+
+  if (adjusted.cols !== target.cols) {
+    if (target.cols === 1 && adjusted.cols > 1) {
+      adjusted = sumColsMatrix(adjusted, dtype);
+    } else if (adjusted.cols === 1 && target.cols > 1) {
+      adjusted = broadcastTo(adjusted, adjusted.rows, target.cols);
+    }
+  }
+
+  if (adjusted.rows !== target.rows || adjusted.cols !== target.cols) {
+    adjusted = broadcastTo(adjusted, target.rows, target.cols);
+  }
+  return adjusted;
+}
+
+export class Tensor {
+  readonly value: Matrix;
+  readonly requiresGrad: boolean;
+  readonly name?: string;
+  grad: Matrix | null = null;
+  private readonly dependencies: TensorDependency[] = [];
+
+  constructor(
+    value: Matrix | MatrixInputData,
+    rowsOrOptions?: number | TensorOptions,
+    colsMaybe?: number,
+    maybeOptions?: TensorOptions
+  ) {
+    let tensorOptions: TensorOptions | undefined;
+    let rows: number | undefined;
+    let cols: number | undefined;
+
+    if (typeof rowsOrOptions === "number") {
+      rows = rowsOrOptions;
+      cols = colsMaybe;
+      tensorOptions = maybeOptions;
+    } else {
+      tensorOptions = rowsOrOptions;
+    }
+
+    const opts = tensorOptions ?? {};
+    const { requiresGrad = false, name, ...matrixOpts } = opts;
+    this.requiresGrad = requiresGrad;
+    this.name = name;
+
+    if (value instanceof Matrix) {
+      this.value = value;
+    } else {
+      if (rows === undefined || cols === undefined) {
+        throw new Error("Tensor constructor requires rows and cols when value is raw data");
+      }
+      this.value = new Matrix(value, rows, cols, matrixOpts);
+    }
+  }
+
+  registerDependency(tensor: Tensor, gradFn: (upstream: Matrix) => Matrix): void {
+    if (!this.requiresGrad) {
+      return;
+    }
+    this.dependencies.push({ tensor, gradFn });
+  }
+
+  zeroGrad(): void {
+    this.grad = null;
+  }
+
+  detach(): Tensor {
+    return new Tensor(this.value, { requiresGrad: false, name: this.name });
+  }
+
+  backward(gradient?: Matrix): void {
+    if (!this.requiresGrad) {
+      throw new Error("backward() called on a tensor that does not require gradients");
+    }
+
+    const initialGrad =
+      gradient ??
+      createFilledLike(this.value, 1, gradDTypeFor(this.value.dtype));
+
+    const topo: Tensor[] = [];
+    const visited = new Set<Tensor>();
+    const buildTopo = (tensor: Tensor) => {
+      if (visited.has(tensor)) {
+        return;
+      }
+      visited.add(tensor);
+      for (const dep of tensor.dependencies) {
+        buildTopo(dep.tensor);
+      }
+      topo.push(tensor);
+    };
+    buildTopo(this);
+
+    const accumulated = new Map<Tensor, Matrix>();
+    accumulated.set(this, ensureGradDType(initialGrad, gradDTypeFor(this.value.dtype)));
+
+    for (let index = topo.length - 1; index >= 0; index -= 1) {
+      const tensor = topo[index];
+      const currentGrad = accumulated.get(tensor);
+      if (!currentGrad) {
+        continue;
+      }
+      tensor.applyGradient(currentGrad);
+      if (!tensor.requiresGrad) {
+        continue;
+      }
+      for (const dep of tensor.dependencies) {
+        if (!dep.tensor.requiresGrad) {
+          continue;
+        }
+        const propagated = dep.gradFn(currentGrad);
+        const targetDType = gradDTypeFor(dep.tensor.value.dtype);
+        const adjusted = ensureGradDType(propagated, targetDType);
+        const existing = accumulated.get(dep.tensor);
+        if (existing) {
+          accumulated.set(dep.tensor, add(existing, adjusted));
+        } else {
+          accumulated.set(dep.tensor, adjusted);
+        }
+      }
+    }
+  }
+
+  private applyGradient(grad: Matrix): void {
+    const targetDType = gradDTypeFor(this.value.dtype);
+    const converted = ensureGradDType(grad, targetDType);
+    if (this.grad) {
+      this.grad = add(this.grad, converted);
+    } else {
+      this.grad = converted;
+    }
+  }
+
+  static fromMatrix(matrix: Matrix, options: TensorOptions = {}): Tensor {
+    return new Tensor(matrix, options);
+  }
+}
+
+function binaryTensorOp(
+  lhs: Tensor,
+  rhs: Tensor,
+  forward: (a: Matrix, b: Matrix) => Matrix,
+  backwardLhs: (grad: Matrix, a: Tensor, b: Tensor) => Matrix,
+  backwardRhs: (grad: Matrix, a: Tensor, b: Tensor) => Matrix
+): Tensor {
+  const value = forward(lhs.value, rhs.value);
+  const requiresGrad = lhs.requiresGrad || rhs.requiresGrad;
+  const result = new Tensor(value, { requiresGrad });
+  if (requiresGrad) {
+    if (lhs.requiresGrad) {
+      result.registerDependency(lhs, (grad) =>
+        matchGradientShape(backwardLhs(grad, lhs, rhs), lhs)
+      );
+    }
+    if (rhs.requiresGrad) {
+      result.registerDependency(rhs, (grad) =>
+        matchGradientShape(backwardRhs(grad, lhs, rhs), rhs)
+      );
+    }
+  }
+  return result;
+}
+
+export function tensorAdd(lhs: Tensor, rhs: Tensor): Tensor {
+  return binaryTensorOp(
+    lhs,
+    rhs,
+    add,
+    (grad) => grad,
+    (grad) => grad
+  );
+}
+
+export function tensorSub(lhs: Tensor, rhs: Tensor): Tensor {
+  return binaryTensorOp(
+    lhs,
+    rhs,
+    sub,
+    (grad) => grad,
+    (grad) => neg(grad)
+  );
+}
+
+export function tensorMul(lhs: Tensor, rhs: Tensor): Tensor {
+  return binaryTensorOp(
+    lhs,
+    rhs,
+    mul,
+    (grad, _lhs, rhsTensor) => mul(grad, rhsTensor.value),
+    (grad, lhsTensor) => mul(grad, lhsTensor.value)
+  );
+}
+
+export function tensorDiv(lhs: Tensor, rhs: Tensor): Tensor {
+  return binaryTensorOp(
+    lhs,
+    rhs,
+    div,
+    (grad, _lhs, rhsTensor) => div(grad, rhsTensor.value),
+    (grad, lhsTensor, rhsTensor) => {
+      const numerator = mul(lhsTensor.value, grad);
+      const denomSquared = mul(rhsTensor.value, rhsTensor.value);
+      return neg(div(numerator, denomSquared));
+    }
+  );
+}
+
+export function tensorMatmul(lhs: Tensor, rhs: Tensor): Tensor {
+  return binaryTensorOp(
+    lhs,
+    rhs,
+    matmul,
+    (grad, lhsTensor, rhsTensor) => matmul(grad, rhsTensor.value.transpose()),
+    (grad, lhsTensor) => matmul(lhsTensor.value.transpose(), grad)
+  );
+}
+
+export function tensorSum(tensor: Tensor): Tensor {
+  const value = sum(tensor.value);
+  const result = new Tensor(value, { requiresGrad: tensor.requiresGrad });
+  if (tensor.requiresGrad) {
+    result.registerDependency(tensor, (grad) => {
+      const gradArray = ensureGradDType(grad, gradDTypeFor(value.dtype)).toArray();
+      const scalar =
+        gradArray instanceof Float32Array || gradArray instanceof Float64Array
+          ? gradArray[0]
+          : Number(gradArray[0]);
+      const filled = createFilledLike(
+        tensor.value,
+        scalar,
+        gradDTypeFor(tensor.value.dtype)
+      );
+      return filled;
+    });
+  }
+  return result;
+}
+
+export function tensorSumAxis(tensor: Tensor, axis: 0 | 1): Tensor {
+  const valueDType =
+    tensor.value.dtype === "float32" ? "float32" : "float64";
+  const reduced =
+    axis === 0
+      ? sumRowsMatrix(tensor.value, valueDType)
+      : sumColsMatrix(tensor.value, valueDType);
+  const result = new Tensor(reduced, { requiresGrad: tensor.requiresGrad });
+  if (tensor.requiresGrad) {
+    result.registerDependency(tensor, (grad) => {
+      const dtype = gradDTypeFor(tensor.value.dtype);
+      const upstream = ensureGradDType(grad, dtype);
+      const rows = tensor.value.rows;
+      const cols = tensor.value.cols;
+      const data = upstream.toArray() as Float32Array | Float64Array;
+      const out =
+        dtype === "float32"
+          ? new Float32Array(rows * cols)
+          : new Float64Array(rows * cols);
+      if (axis === 0) {
+        for (let row = 0; row < rows; row += 1) {
+          const offset = row * cols;
+          for (let col = 0; col < cols; col += 1) {
+            out[offset + col] = data[col];
+          }
+        }
+      } else {
+        for (let row = 0; row < rows; row += 1) {
+          const offset = row * cols;
+          const value = data[row];
+          for (let col = 0; col < cols; col += 1) {
+            out[offset + col] = value;
+          }
+        }
+      }
+      return new Matrix(out, rows, cols, { dtype });
+    });
+  }
+  return result;
+}
+
+export function tensorNeg(tensor: Tensor): Tensor {
+  const value = neg(tensor.value);
+  const result = new Tensor(value, { requiresGrad: tensor.requiresGrad });
+  if (tensor.requiresGrad) {
+    result.registerDependency(tensor, (grad) =>
+      matchGradientShape(neg(grad), tensor)
+    );
+  }
+  return result;
+}
+
+export function tensorExp(tensor: Tensor): Tensor {
+  const value = exp(tensor.value);
+  const result = new Tensor(value, { requiresGrad: tensor.requiresGrad });
+  if (tensor.requiresGrad) {
+    result.registerDependency(tensor, (grad) =>
+      matchGradientShape(mul(grad, value), tensor)
+    );
+  }
+  return result;
+}
+
+export function tensorLog(tensor: Tensor): Tensor {
+  const value = log(tensor.value);
+  const result = new Tensor(value, { requiresGrad: tensor.requiresGrad });
+  if (tensor.requiresGrad) {
+    result.registerDependency(tensor, (grad) =>
+      matchGradientShape(div(grad, tensor.value), tensor)
+    );
+  }
+  return result;
+}
+
+function tensorFrom(value: Tensor | Matrix | MatrixInputData, rows?: number, cols?: number, options?: TensorOptions): Tensor {
+  if (value instanceof Tensor) {
+    return value;
+  }
+  if (value instanceof Matrix) {
+    return new Tensor(value, options);
+  }
+  if (rows === undefined || cols === undefined) {
+    throw new Error("tensor() requires rows and cols when value is raw data");
+  }
+  return new Tensor(value, rows, cols, options);
+}
+
+export { tensorFrom as tensor };
 export {
   arrowTableToMatrix,
   matrixToArrowTable,
