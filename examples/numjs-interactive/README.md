@@ -16,6 +16,7 @@ pnpm dev
 - `src/main.ts`：快速入门示例，展示矩阵操作与后端检测。
 - `src/backends.ts`：遍历不同 `preferBackend` 选项验证后端可用性。
 - `src/autograd.ts`：演示自动微分，展示梯度回传与广播梯度处理。
+- `src/training.ts`：基于线性回归的训练示例，结合优化器封装实际更新参数。
 - `src/migration.ts`：NumPy ➜ NumJS API 映射示例。
 - `src/webgpu.ts`：WebGPU 启用与性能测量（实验性）。
 - `scripts/node-demo.mjs`：在 Node.js 中运行的 CLI 版本，便于 CI 或 Benchmark。

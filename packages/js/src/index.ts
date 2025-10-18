@@ -4932,7 +4932,7 @@ function elementwiseBinaryMatrix(
 }
 
 export class Tensor {
-  readonly value: Matrix;
+  value: Matrix;
   readonly requiresGrad: boolean;
   readonly name?: string;
   grad: Matrix | null = null;
@@ -5500,6 +5500,359 @@ export type GradcheckResult = {
   maxError: number;
   issues: GradcheckIssue[];
 };
+
+export type OptimizerParameter = {
+  tensor: Tensor;
+  name?: string;
+};
+
+export type Optimizer = {
+  zeroGrad(): void;
+  step(): void;
+};
+
+function ensureTrainable(params: readonly OptimizerParameter[]): void {
+  for (const param of params) {
+    if (!param.tensor.requiresGrad) {
+      throw new Error(
+        `Optimizer parameter ${param.name ?? "<unnamed>"} must have requiresGrad=true`
+      );
+    }
+  }
+}
+
+function tensorDataView(tensor: Tensor): Float64Array {
+  return Float64Array.from(
+    tensor.value.astype("float64", { copy: false }).toArray() as Float64Array
+  );
+}
+
+function tensorGradView(tensor: Tensor): Float64Array {
+  if (!tensor.grad) {
+    throw new Error("Optimizer step requires accumulated gradients; call backward() first");
+  }
+  return Float64Array.from(
+    tensor.grad.astype("float64", { copy: false }).toArray() as Float64Array
+  );
+}
+
+function applyUpdate(
+  tensor: Tensor,
+  update: Float64Array,
+  dtype: DType
+): void {
+  const rows = tensor.value.rows;
+  const cols = tensor.value.cols;
+  const updated =
+    dtype === "float32" ? new Float32Array(rows * cols) : new Float64Array(rows * cols);
+  const current = tensor.value.astype("float64", { copy: false }).toArray() as Float64Array;
+  for (let index = 0; index < update.length; index += 1) {
+    updated[index] = dtype === "float32"
+      ? Math.fround(current[index] + update[index])
+      : current[index] + update[index];
+  }
+  tensor.value = new Matrix(updated, rows, cols, { dtype });
+}
+
+class SgdOptimizer implements Optimizer {
+  private readonly params: OptimizerParameter[];
+  private readonly learningRate: number;
+  private readonly momentum: number;
+  private readonly velocities: Float64Array[];
+
+  constructor(params: OptimizerParameter[], learningRate: number, momentum = 0) {
+    ensureTrainable(params);
+    this.params = params;
+    this.learningRate = learningRate;
+    this.momentum = momentum;
+    this.velocities = params.map((param) => {
+      const buffer = tensorDataView(param.tensor);
+      for (let i = 0; i < buffer.length; i += 1) {
+        buffer[i] = 0;
+      }
+      return buffer;
+    });
+  }
+
+  zeroGrad(): void {
+    for (const param of this.params) {
+      param.tensor.zeroGrad();
+    }
+  }
+
+  step(): void {
+    this.params.forEach((param, index) => {
+      const grad = tensorGradView(param.tensor);
+      const velocity = this.velocities[index];
+      for (let i = 0; i < grad.length; i += 1) {
+        velocity[i] = this.momentum * velocity[i] - this.learningRate * grad[i];
+      }
+      applyUpdate(param.tensor, velocity, param.tensor.value.dtype);
+    });
+  }
+}
+
+class AdamOptimizer implements Optimizer {
+  private readonly params: OptimizerParameter[];
+  private readonly learningRate: number;
+  private readonly beta1: number;
+  private readonly beta2: number;
+  private readonly epsilon: number;
+  private readonly m: Float64Array[];
+  private readonly v: Float64Array[];
+  private timestep = 0;
+
+  constructor(
+    params: OptimizerParameter[],
+    learningRate: number,
+    {
+      beta1 = 0.9,
+      beta2 = 0.999,
+      epsilon = 1e-8,
+    }: { beta1?: number; beta2?: number; epsilon?: number } = {}
+  ) {
+    ensureTrainable(params);
+    this.params = params;
+    this.learningRate = learningRate;
+    this.beta1 = beta1;
+    this.beta2 = beta2;
+    this.epsilon = epsilon;
+    this.m = params.map((param) => {
+      const buffer = tensorDataView(param.tensor);
+      buffer.fill(0);
+      return buffer;
+    });
+    this.v = params.map((param) => {
+      const buffer = tensorDataView(param.tensor);
+      buffer.fill(0);
+      return buffer;
+    });
+  }
+
+  zeroGrad(): void {
+    for (const param of this.params) {
+      param.tensor.zeroGrad();
+    }
+  }
+
+  step(): void {
+    this.timestep += 1;
+    const lrT = this.learningRate * Math.sqrt(1 - Math.pow(this.beta2, this.timestep)) /
+      (1 - Math.pow(this.beta1, this.timestep));
+    this.params.forEach((param, index) => {
+      const grad = tensorGradView(param.tensor);
+      const m = this.m[index];
+      const v = this.v[index];
+      const update = new Float64Array(grad.length);
+      for (let i = 0; i < grad.length; i += 1) {
+        m[i] = this.beta1 * m[i] + (1 - this.beta1) * grad[i];
+        v[i] = this.beta2 * v[i] + (1 - this.beta2) * grad[i] * grad[i];
+        update[i] = -lrT * m[i] / (Math.sqrt(v[i]) + this.epsilon);
+      }
+      applyUpdate(param.tensor, update, param.tensor.value.dtype);
+    });
+  }
+}
+
+class RmsPropOptimizer implements Optimizer {
+  private readonly params: OptimizerParameter[];
+  private readonly learningRate: number;
+  private readonly decay: number;
+  private readonly epsilon: number;
+  private readonly avgSquares: Float64Array[];
+
+  constructor(
+    params: OptimizerParameter[],
+    learningRate: number,
+    { decay = 0.99, epsilon = 1e-8 }: { decay?: number; epsilon?: number } = {}
+  ) {
+    ensureTrainable(params);
+    this.params = params;
+    this.learningRate = learningRate;
+    this.decay = decay;
+    this.epsilon = epsilon;
+    this.avgSquares = params.map((param) => {
+      const buffer = tensorDataView(param.tensor);
+      buffer.fill(0);
+      return buffer;
+    });
+  }
+
+  zeroGrad(): void {
+    for (const param of this.params) {
+      param.tensor.zeroGrad();
+    }
+  }
+
+  step(): void {
+    this.params.forEach((param, index) => {
+      const grad = tensorGradView(param.tensor);
+      const avgSquare = this.avgSquares[index];
+      const update = new Float64Array(grad.length);
+      for (let i = 0; i < grad.length; i += 1) {
+        avgSquare[i] =
+          this.decay * avgSquare[i] + (1 - this.decay) * grad[i] * grad[i];
+        update[i] =
+          -this.learningRate * grad[i] / (Math.sqrt(avgSquare[i]) + this.epsilon);
+      }
+      applyUpdate(param.tensor, update, param.tensor.value.dtype);
+    });
+  }
+}
+
+export function sgd(
+  parameters: OptimizerParameter[],
+  learningRate: number,
+  momentum = 0
+): Optimizer {
+  return new SgdOptimizer(parameters, learningRate, momentum);
+}
+
+export function adam(
+  parameters: OptimizerParameter[],
+  learningRate: number,
+  options?: { beta1?: number; beta2?: number; epsilon?: number }
+): Optimizer {
+  return new AdamOptimizer(parameters, learningRate, options);
+}
+
+export function rmsprop(
+  parameters: OptimizerParameter[],
+  learningRate: number,
+  options?: { decay?: number; epsilon?: number }
+): Optimizer {
+  return new RmsPropOptimizer(parameters, learningRate, options);
+}
+
+export type LinearRegressionTrainOptions = {
+  epochs?: number;
+  learningRate?: number;
+  optimizer?: "sgd" | "adam" | "rmsprop";
+  momentum?: number;
+  beta1?: number;
+  beta2?: number;
+  epsilon?: number;
+  decay?: number;
+};
+
+export type LinearRegressionTrainResult = {
+  weights: Matrix;
+  bias: Matrix;
+  losses: number[];
+};
+
+function toMatrix(value: Matrix | MatrixInputData, rows: number, cols: number, dtype: DType): Matrix {
+  if (value instanceof Matrix) {
+    if (value.rows !== rows || value.cols !== cols) {
+      throw new Error(`Expected matrix of shape ${rows}x${cols}, received ${value.rows}x${value.cols}`);
+    }
+    return value.dtype === dtype ? value : value.astype(dtype, { copy: true });
+  }
+  return new Matrix(value, rows, cols, { dtype });
+}
+
+export function trainLinearRegression(
+  features: Matrix,
+  targets: Matrix,
+  options: LinearRegressionTrainOptions = {}
+): LinearRegressionTrainResult {
+  if (features.cols === 0) {
+    throw new Error("trainLinearRegression requires at least one feature column");
+  }
+  if (features.rows !== targets.rows) {
+    throw new Error("Feature and target matrices must have the same number of rows");
+  }
+  if (targets.cols !== 1) {
+    throw new Error("Targets must be a column vector (shape N x 1)");
+  }
+  const featureCount = features.cols;
+  const sampleCount = features.rows;
+  const dtype: DType = features.dtype === "float32" || targets.dtype === "float32" ? "float32" : "float64";
+
+  const xMatrix = toMatrix(features, sampleCount, featureCount, dtype);
+  const yMatrix = toMatrix(targets, sampleCount, 1, dtype);
+
+  const xTensor = tensorFrom(xMatrix, undefined, undefined, {
+    requiresGrad: false,
+    name: "features",
+  });
+  const yTensor = tensorFrom(yMatrix, undefined, undefined, {
+    requiresGrad: false,
+    name: "targets",
+  });
+
+  const weightInitArray =
+    dtype === "float32" ? new Float32Array(featureCount) : new Float64Array(featureCount);
+  for (let index = 0; index < featureCount; index += 1) {
+    weightInitArray[index] = (Math.random() - 0.5) * 0.01;
+  }
+  const weights = tensorFrom(weightInitArray, featureCount, 1, { requiresGrad: true, name: "weights" });
+  const biasArray = dtype === "float32" ? new Float32Array(1) : new Float64Array(1);
+  biasArray[0] = 0;
+  const bias = tensorFrom(biasArray, 1, 1, {
+    requiresGrad: true,
+    name: "bias",
+  });
+
+  const params: OptimizerParameter[] = [
+    { tensor: weights, name: "weights" },
+    { tensor: bias, name: "bias" },
+  ];
+
+  const epochs = options.epochs ?? 200;
+  const learningRate = options.learningRate ?? 0.05;
+  let optimizer: Optimizer;
+  switch (options.optimizer ?? "sgd") {
+    case "adam":
+      optimizer = adam(params, learningRate, {
+        beta1: options.beta1,
+        beta2: options.beta2,
+        epsilon: options.epsilon,
+      });
+      break;
+    case "rmsprop":
+      optimizer = rmsprop(params, learningRate, {
+        decay: options.decay,
+        epsilon: options.epsilon,
+      });
+      break;
+    case "sgd":
+    default:
+      optimizer = sgd(params, learningRate, options.momentum);
+      break;
+  }
+
+  const invArray = dtype === "float32" ? new Float32Array(1) : new Float64Array(1);
+  invArray[0] = 1 / sampleCount;
+  const invSample = tensorFrom(invArray, 1, 1, {
+    requiresGrad: false,
+  });
+
+  const losses: number[] = [];
+
+  for (let epoch = 0; epoch < epochs; epoch += 1) {
+    optimizer.zeroGrad();
+    const preds = tensorAdd(tensorMatmul(xTensor, weights), tensorSumAxis(bias, 0));
+    const diff = tensorSub(preds, yTensor);
+    const squared = tensorMul(diff, diff);
+    const sumLoss = tensorSum(squared);
+    const mse = tensorMul(sumLoss, invSample);
+
+    const lossValue = Number(mse.value.toArray()[0]);
+    losses.push(lossValue);
+
+    mse.backward();
+    optimizer.step();
+  }
+
+  optimizer.zeroGrad();
+
+  return {
+    weights: weights.value,
+    bias: bias.value,
+    losses,
+  };
+}
 
 function materializeFloat64(input: GradcheckInput): Float64Array {
   if (input.data instanceof Matrix) {

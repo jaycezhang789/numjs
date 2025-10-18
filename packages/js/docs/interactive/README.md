@@ -10,6 +10,7 @@
 - Playground 中包含以下面板：
   - `src/main.ts`：展示矩阵创建、算子链式调用、后端信息输出。
   - `autograd.ts`：新引入的自动微分示例，可查看梯度回传效果。
+  - `training.ts`：线性回归训练 demo，演示 SGD/Adam/RMSProp 优化器的实际更新过程。
   - `webgpu.ts`：可选启用 WebGPU 加速，自动检测运行环境。
   - `migration.ts`：与 NumPy API 映射的对照示例。
 
