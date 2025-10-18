@@ -10,6 +10,7 @@
 - [Key Features](#key-features)
 - [Quick Start](#quick-start)
   - [Common Operations](#common-operations)
+- [文档与教程](#文档与教程)
 - [Backend Strategy](#backend-strategy)
 - [Browser Usage](#browser-usage)
 - [Node.js Compatibility](#nodejs-compatibility)
@@ -66,6 +67,13 @@ console.log(matmul(a, b.transpose()).toArray());
 - Linear algebra helpers such as `svd`, `qr`, `solve`, and `eigen` when supported by the active backend.
 
 Refer to the generated TypeScript declarations in `dist/index.d.ts` for the complete surface area.
+
+## 文档与教程
+
+- [从 NumPy 迁移指南](docs/tutorials/from-numpy-migration.md)：对照表与迁移实践，帮助 Python 团队快速上手。
+- [WASM 与 N-API 后端选择与原理](docs/tutorials/backends.md)：剖析双后端加载流程、手动控制与常见故障排查。
+- [WebGPU 加速篇](docs/tutorials/webgpu.md)：介绍如何启用 GPU 管线与性能调优策略。
+- [StackBlitz/CodeSandbox 交互式文档](docs/interactive/README.md)：在线运行 Playground，附复制即跑 Demo。
 
 ## Backend Strategy
 `init()` negotiates the backend in the following order:

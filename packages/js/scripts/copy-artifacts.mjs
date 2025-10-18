@@ -21,7 +21,9 @@ const PLATFORM_PACKAGE_DIRS = new Map([
   ["darwin-x64", resolve(jsRoot, "npm/darwin-x64")],
   ["darwin-arm64", resolve(jsRoot, "npm/darwin-arm64")],
   ["linux-x64-gnu", resolve(jsRoot, "npm/linux-x64-gnu")],
+  ["linux-x64-musl", resolve(jsRoot, "npm/linux-x64-musl")],
   ["linux-arm64-gnu", resolve(jsRoot, "npm/linux-arm64-gnu")],
+  ["linux-arm64-musl", resolve(jsRoot, "npm/linux-arm64-musl")],
 ]);
 
 async function exists(path) {

@@ -398,12 +398,18 @@ const NAPI_DISTRIBUTIONS: Record<string, NapiDistribution> = {
     binaries: ["darwin-arm64", "darwin-x64"],
   },
   "linux-x64": {
-    packages: ["@jayce789/numjs-linux-x64-gnu"],
-    binaries: ["linux-x64-gnu"],
+    packages: [
+      "@jayce789/numjs-linux-x64-gnu",
+      "@jayce789/numjs-linux-x64-musl",
+    ],
+    binaries: ["linux-x64-gnu", "linux-x64-musl"],
   },
   "linux-arm64": {
-    packages: ["@jayce789/numjs-linux-arm64-gnu"],
-    binaries: ["linux-arm64-gnu"],
+    packages: [
+      "@jayce789/numjs-linux-arm64-gnu",
+      "@jayce789/numjs-linux-arm64-musl",
+    ],
+    binaries: ["linux-arm64-gnu", "linux-arm64-musl"],
   },
 };
 
