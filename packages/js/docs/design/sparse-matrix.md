@@ -84,6 +84,8 @@ export class SparseMatrix {
 | Phase 3 | WASM 后端支持 | 编译 `sprs`/`csparse` 到 wasm，或在 wasm 后端完成 CSR 算法；需关注内存访问与 SIMD |
 | Phase 4 | 外存数据管道 | 利用 `mmap` + `SparseMatrix.fromCSR({rowPtr: MMapUint32(...)})`，结合 chunked 算子处理超大数据集 |
 
+> 当前 WASM 仍保留纯 JS fallback；`packages/wasm` 尚未集成稀疏内核，但接口预留完毕，后续可按 Phase 3 路线接入。
+
 ## 与现有 生态的接口
 
 - **SuiteSparse**：通过 `csrmv`, `csrgemm`、`cholmod` 等接口扩展；在 Rust 层封装统一 API。

@@ -40,10 +40,7 @@ fn main() {
     );
     println!(
         "num-rs dense result: {:?}",
-        product
-            .to_f64_vec()
-            .into_iter()
-            .collect::<Vec<f64>>()
+        product.to_f64_vec().into_iter().collect::<Vec<f64>>()
     );
     println!(
         "sparse add (A + Ax): {:?}",

@@ -41,13 +41,11 @@
 ## Phase C: 测试与性能
 
 1. **单元测试**
-   - 小规模 CSR 运算与 dense 结果一致性。
-   - 异常输入（行列指针非法、越界等）。
+   - ✅ 小规模 CSR 运算与 dense 结果一致性（`packages/core-rs/tests/sparse.rs`）。
+   - ✅ 异常输入（行列指针非法、越界等）。
 
 2. **性能基准**
-   - 在 `benches/` 或 `criterion` 中比较：
-     - 纯 js fallback vs native SuiteSparse
-     - 密度变化（1%, 10%, 50%）的性能。
+   - ✅ Criterion 基准：`cargo bench --bench sparse`（默认 fallback，启用 `--features sparse-native` 使用 native）。
 
 3. **集成测试**
    - 与 `sparse_poc` 的结果对比。

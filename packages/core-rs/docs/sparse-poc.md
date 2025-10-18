@@ -5,9 +5,9 @@
 ## Experiment Steps
 
 1. 安装依赖：`sprs = "0.11"` 已作为 `dev-dependencies` 添加到 `packages/core-rs/Cargo.toml`。
-2. 运行示例：
+2. 运行示例（需启用 `sparse-native` 特性）：
    ```bash
-   cargo run --example sparse_poc
+   cargo run --example sparse_poc --features sparse-native
    ```
    该程序会：
    - 使用 `sprs::CsMat` 构造一个 3x3 CSR 矩阵。

@@ -116,6 +116,7 @@ Fixed-point matrices are backed by signed 64-bit integers plus a per-matrix scal
 - **Property tests.** The Rust core uses [`proptest`](https://docs.rs/proptest) to exercise arithmetic and matmul kernels across random shapes, while the JavaScript wrapper mirrors this with [`fast-check`](https://github.com/dubzzz/fast-check). Run `cargo test -p num_rs_core` and `npm --prefix packages/js run test` to execute both suites.
 - **Backend consistency.** JavaScript tests spawn N-API and WASM processes to ensure numerical parity (within tolerance) across the two runtimes. Skips automatically if a backend is missing on the host.
 - **Benchmarks.** `npm --prefix packages/js run bench` records micro/macro benchmarks (matmul, convolution, pooling pipelines) and emits an HTML report under `tmp/numjs-bench.html` so you can track performance regressions over time.
+- **Sparse matrix validation.** `cargo test --features sparse-native` exercises the CSR-native path (fallback tests run without the feature). Compare fallback/native performance via `cargo bench --bench sparse [--features sparse-native]`.
 
 ## Licensing and Feedback
 

@@ -519,7 +519,8 @@ impl ParsedSparse {
                 .map_err(map_core_error)
             }
             other => Err(map_core_error(format!(
-                "Sparse payload dtype {other} not yet supported"
+                "Sparse payload dtype {:?} not yet supported",
+                other
             ))),
         }
     }
@@ -548,7 +549,8 @@ fn parse_sparse_payload(payload: JsObject) -> Result<ParsedSparse> {
         }
         other => {
             return Err(map_core_error(format!(
-                "Sparse payload dtype {other} not yet supported"
+                "Sparse payload dtype {:?} not yet supported",
+                other
             )))
         }
     };
@@ -562,6 +564,25 @@ fn parse_sparse_payload(payload: JsObject) -> Result<ParsedSparse> {
         )));
     }
 
+    if let Some(values) = values_f32.as_ref() {
+        if col_idx.len() != values.len() {
+            return Err(map_core_error(format!(
+                "Sparse payload colIdx length {} must match values length {}",
+                col_idx.len(),
+                values.len()
+            )));
+        }
+    }
+    if let Some(values) = values_f64.as_ref() {
+        if col_idx.len() != values.len() {
+            return Err(map_core_error(format!(
+                "Sparse payload colIdx length {} must match values length {}",
+                col_idx.len(),
+                values.len()
+            )));
+        }
+    }
+
     Ok(ParsedSparse {
         rows: rows_usize,
         cols: cols as usize,
@@ -573,25 +594,36 @@ fn parse_sparse_payload(payload: JsObject) -> Result<ParsedSparse> {
     })
 }
 
+fn sparse_result_to_matrix(result: MatrixBuffer, target_dtype: &str) -> Result<Matrix> {
+    let mut matrix = Matrix::from_buffer(result);
+    if matrix.dtype() != target_dtype {
+        matrix = matrix.astype(target_dtype.to_string(), Some(true), None)?;
+    }
+    Ok(matrix)
+}
+
 #[napi]
 pub fn sparse_matmul(payload: JsObject, dense: &Matrix) -> Result<Matrix> {
     let parsed = parse_sparse_payload(payload)?;
     let view = parsed.view()?;
-    map_matrix(sparse::sparse_matmul(&view, dense.buffer()))
+    let result = sparse::sparse_matmul(&view, dense.buffer()).map_err(map_core_error)?;
+    sparse_result_to_matrix(result, &dense.dtype())
 }
 
 #[napi]
 pub fn sparse_add(payload: JsObject, dense: &Matrix) -> Result<Matrix> {
     let parsed = parse_sparse_payload(payload)?;
     let view = parsed.view()?;
-    map_matrix(sparse::sparse_add(&view, dense.buffer()))
+    let result = sparse::sparse_add(&view, dense.buffer()).map_err(map_core_error)?;
+    sparse_result_to_matrix(result, &dense.dtype())
 }
 
 #[napi]
 pub fn sparse_transpose(payload: JsObject) -> Result<Matrix> {
     let parsed = parse_sparse_payload(payload)?;
     let view = parsed.view()?;
-    map_matrix(sparse::sparse_transpose(&view))
+    let result = sparse::sparse_transpose(&view).map_err(map_core_error)?;
+    sparse_result_to_matrix(result, parsed.dtype.as_str())
 }
 
 // ---------------------------------------------------------------------

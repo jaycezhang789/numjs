@@ -40,6 +40,9 @@ export declare function writeNpy(matrix: Matrix): Buffer
 export declare function copyBytesTotal(): number
 export declare function takeCopyBytes(): number
 export declare function resetCopyBytes(): void
+export declare function sparseMatmul(payload: object, dense: Matrix): Matrix
+export declare function sparseAdd(payload: object, dense: Matrix): Matrix
+export declare function sparseTranspose(payload: object): Matrix
 export declare function sum(matrix: Matrix, dtype?: string | undefined | null): Matrix
 export declare function fftAxis(matrix: Matrix, axis: number): object
 export declare function fft2D(matrix: Matrix): object

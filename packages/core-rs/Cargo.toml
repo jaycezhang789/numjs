@@ -19,6 +19,7 @@ gpu-cuda = [
     "cudarc/cuda-version-from-build-system",
 ]
 gpu-rocm = ["gpu"]
+sparse-native = ["sprs"]
 
 [dependencies]
 cfg-if = "1"
@@ -36,7 +37,16 @@ rayon = { version = "1.10", optional = true }
 cudarc = { version = "0.11", optional = true, default-features = false, features = ["driver", "nvrtc"] }
 once_cell = { version = "1.19", optional = true }
 rustfft = "6"
+sprs = { version = "0.11", optional = true }
 
 [dev-dependencies]
-sprs = { version = "0.11", default-features = false, features = ["std"] }
 proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[example]]
+name = "sparse_poc"
+required-features = ["sparse-native"]
+
+[[bench]]
+name = "sparse"
+harness = false
