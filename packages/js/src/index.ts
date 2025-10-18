@@ -4851,6 +4851,86 @@ function matchGradientShape(grad: Matrix, tensor: Tensor): Matrix {
   return adjusted;
 }
 
+function maxRowsMatrix(matrix: Matrix, dtype: DType): Matrix {
+  const source =
+    matrix.dtype === dtype ? matrix : matrix.astype(dtype, { copy: true });
+  const rows = source.rows;
+  const cols = source.cols;
+  const data = source.toArray() as Float32Array | Float64Array;
+  const result =
+    dtype === "float32" ? new Float32Array(cols) : new Float64Array(cols);
+  for (let col = 0; col < cols; col += 1) {
+    let maxValue = -Infinity;
+    for (let row = 0; row < rows; row += 1) {
+      const value = data[row * cols + col];
+      if (value > maxValue) {
+        maxValue = value;
+      }
+    }
+    result[col] = maxValue;
+  }
+  return new Matrix(result, 1, cols, { dtype });
+}
+
+function maxColsMatrix(matrix: Matrix, dtype: DType): Matrix {
+  const source =
+    matrix.dtype === dtype ? matrix : matrix.astype(dtype, { copy: true });
+  const rows = source.rows;
+  const cols = source.cols;
+  const data = source.toArray() as Float32Array | Float64Array;
+  const result =
+    dtype === "float32" ? new Float32Array(rows) : new Float64Array(rows);
+  for (let row = 0; row < rows; row += 1) {
+    let maxValue = -Infinity;
+    const offset = row * cols;
+    for (let col = 0; col < cols; col += 1) {
+      const value = data[offset + col];
+      if (value > maxValue) {
+        maxValue = value;
+      }
+    }
+    result[row] = maxValue;
+  }
+  return new Matrix(result, rows, 1, { dtype });
+}
+
+function broadcastMatrix(matrix: Matrix, rows: number, cols: number): Matrix {
+  if (matrix.rows === rows && matrix.cols === cols) {
+    return matrix;
+  }
+  return broadcastTo(matrix, rows, cols);
+}
+
+function elementwiseBinaryMatrix(
+  lhs: Matrix,
+  rhs: Matrix,
+  op: (left: number, right: number) => number,
+  preferredDType?: DType
+): Matrix {
+  const targetRows = broadcastDim(lhs.rows, rhs.rows);
+  const targetCols = broadcastDim(lhs.cols, rhs.cols);
+  const left = broadcastMatrix(lhs, targetRows, targetCols);
+  const right = broadcastMatrix(rhs, targetRows, targetCols);
+  const dtype =
+    preferredDType ??
+    (lhs.dtype === "float32" && rhs.dtype === "float32" ? "float32" : "float64");
+  const leftData = left.astype("float64", { copy: false }).toArray() as Float64Array;
+  const rightData = right.astype("float64", { copy: false }).toArray() as Float64Array;
+  const length = targetRows * targetCols;
+  if (dtype === "float32") {
+    const output = new Float32Array(length);
+    for (let index = 0; index < length; index += 1) {
+      output[index] = op(leftData[index], rightData[index]);
+    }
+    return new Matrix(output, targetRows, targetCols, { dtype: "float32" });
+  }
+  const output64 = new Float64Array(length);
+  for (let index = 0; index < length; index += 1) {
+    output64[index] = op(leftData[index], rightData[index]);
+  }
+  return new Matrix(output64, targetRows, targetCols, { dtype: "float64" });
+}
+
 export class Tensor {
   readonly value: Matrix;
   readonly requiresGrad: boolean;
@@ -5148,6 +5228,237 @@ export function tensorLog(tensor: Tensor): Tensor {
   return result;
 }
 
+export function tensorPow(base: Tensor, exponent: Tensor): Tensor {
+  const value = elementwiseBinaryMatrix(
+    base.value,
+    exponent.value,
+    (left, right) => Math.pow(left, right)
+  );
+  const requiresGrad = base.requiresGrad || exponent.requiresGrad;
+  const result = new Tensor(value, { requiresGrad });
+  const rows = value.rows;
+  const cols = value.cols;
+  if (requiresGrad) {
+    if (base.requiresGrad) {
+      result.registerDependency(base, (grad) => {
+        const dtype = gradDTypeFor(base.value.dtype);
+        const upstream = ensureGradDType(grad, dtype);
+        const gradData = upstream.toArray() as Float32Array | Float64Array;
+        const powBroadcast = broadcastMatrix(result.value, rows, cols);
+        const baseBroadcast = broadcastMatrix(base.value, rows, cols);
+        const exponentBroadcast = broadcastMatrix(exponent.value, rows, cols);
+        const baseArray = baseBroadcast.astype("float64", { copy: false }).toArray() as Float64Array;
+        const expArray = exponentBroadcast.astype("float64", { copy: false }).toArray() as Float64Array;
+        const powArray = powBroadcast.astype("float64", { copy: false }).toArray() as Float64Array;
+        const out =
+          dtype === "float32" ? new Float32Array(rows * cols) : new Float64Array(rows * cols);
+        for (let index = 0; index < rows * cols; index += 1) {
+          const baseVal = baseArray[index];
+          const expVal = expArray[index];
+          const upstreamVal = gradData[index];
+          if (baseVal === 0) {
+            out[index] = 0;
+            continue;
+          }
+          const derivative = expVal * Math.pow(baseVal, expVal - 1);
+          out[index] = upstreamVal * derivative;
+        }
+        const gradMatrix = new Matrix(out, rows, cols, { dtype });
+        return matchGradientShape(gradMatrix, base);
+      });
+    }
+    if (exponent.requiresGrad) {
+      result.registerDependency(exponent, (grad) => {
+        const dtype = gradDTypeFor(exponent.value.dtype);
+        const upstream = ensureGradDType(grad, dtype);
+        const gradData = upstream.toArray() as Float32Array | Float64Array;
+        const baseBroadcast = broadcastMatrix(base.value, rows, cols);
+        const powBroadcast = broadcastMatrix(result.value, rows, cols);
+        const baseArray = baseBroadcast.astype("float64", { copy: false }).toArray() as Float64Array;
+        const powArray = powBroadcast.astype("float64", { copy: false }).toArray() as Float64Array;
+        const out =
+          dtype === "float32" ? new Float32Array(rows * cols) : new Float64Array(rows * cols);
+        for (let index = 0; index < rows * cols; index += 1) {
+          const baseVal = baseArray[index];
+          const upstreamVal = gradData[index];
+          if (baseVal <= 0) {
+            out[index] = 0;
+            continue;
+          }
+          out[index] = upstreamVal * powArray[index] * Math.log(baseVal);
+        }
+        const gradMatrix = new Matrix(out, rows, cols, { dtype });
+        return matchGradientShape(gradMatrix, exponent);
+      });
+    }
+  }
+  return result;
+}
+
+export function tensorMax(lhs: Tensor, rhs: Tensor): Tensor {
+  const value = elementwiseBinaryMatrix(
+    lhs.value,
+    rhs.value,
+    (left, right) => (left > right ? left : right),
+    lhs.value.dtype === "float32" && rhs.value.dtype === "float32" ? "float32" : "float64"
+  );
+  const requiresGrad = lhs.requiresGrad || rhs.requiresGrad;
+  const result = new Tensor(value, { requiresGrad });
+  if (requiresGrad) {
+    const rows = value.rows;
+    const cols = value.cols;
+    if (lhs.requiresGrad) {
+      result.registerDependency(lhs, (grad) => {
+        const dtype = gradDTypeFor(lhs.value.dtype);
+        const upstream = ensureGradDType(grad, dtype);
+        const upstreamArray = upstream.toArray() as Float32Array | Float64Array;
+        const leftBroadcast = broadcastMatrix(lhs.value, rows, cols);
+        const rightBroadcast = broadcastMatrix(rhs.value, rows, cols);
+        const leftArray = leftBroadcast.astype("float64", { copy: false }).toArray() as Float64Array;
+        const rightArray = rightBroadcast.astype("float64", { copy: false }).toArray() as Float64Array;
+        const out =
+          dtype === "float32" ? new Float32Array(rows * cols) : new Float64Array(rows * cols);
+        for (let index = 0; index < rows * cols; index += 1) {
+          const leftVal = leftArray[index];
+          const rightVal = rightArray[index];
+          if (leftVal > rightVal) {
+            out[index] = upstreamArray[index];
+          } else if (leftVal < rightVal) {
+            out[index] = 0;
+          } else {
+            out[index] = upstreamArray[index] * 0.5;
+          }
+        }
+        const gradMatrix = new Matrix(out, rows, cols, { dtype });
+        return matchGradientShape(gradMatrix, lhs);
+      });
+    }
+    if (rhs.requiresGrad) {
+      result.registerDependency(rhs, (grad) => {
+        const dtype = gradDTypeFor(rhs.value.dtype);
+        const upstream = ensureGradDType(grad, dtype);
+        const upstreamArray = upstream.toArray() as Float32Array | Float64Array;
+        const leftBroadcast = broadcastMatrix(lhs.value, rows, cols);
+        const rightBroadcast = broadcastMatrix(rhs.value, rows, cols);
+        const leftArray = leftBroadcast.astype("float64", { copy: false }).toArray() as Float64Array;
+        const rightArray = rightBroadcast.astype("float64", { copy: false }).toArray() as Float64Array;
+        const out =
+          dtype === "float32" ? new Float32Array(rows * cols) : new Float64Array(rows * cols);
+        for (let index = 0; index < rows * cols; index += 1) {
+          const leftVal = leftArray[index];
+          const rightVal = rightArray[index];
+          if (rightVal > leftVal) {
+            out[index] = upstreamArray[index];
+          } else if (rightVal < leftVal) {
+            out[index] = 0;
+          } else {
+            out[index] = upstreamArray[index] * 0.5;
+          }
+        }
+        const gradMatrix = new Matrix(out, rows, cols, { dtype });
+        return matchGradientShape(gradMatrix, rhs);
+      });
+    }
+  }
+  return result;
+}
+
+export function tensorLogSumExp(
+  tensor: Tensor,
+  axis: 0 | 1 = 1
+): Tensor {
+  const dtype = gradDTypeFor(tensor.value.dtype);
+  const maxMatrix =
+    axis === 0
+      ? maxRowsMatrix(tensor.value, dtype)
+      : maxColsMatrix(tensor.value, dtype);
+  const broadcastMax = broadcastMatrix(maxMatrix, tensor.value.rows, tensor.value.cols);
+  const shifted = sub(tensor.value, broadcastMax);
+  const expShifted = exp(shifted);
+  const sumMatrix =
+    axis === 0
+      ? sumRowsMatrix(expShifted, dtype)
+      : sumColsMatrix(expShifted, dtype);
+  const logSum = log(sumMatrix);
+  const value = add(logSum, maxMatrix);
+  const result = new Tensor(value, { requiresGrad: tensor.requiresGrad });
+  if (tensor.requiresGrad) {
+    result.registerDependency(tensor, (grad) => {
+      const upstream = ensureGradDType(grad, dtype);
+      const expSum = broadcastMatrix(sumMatrix, tensor.value.rows, tensor.value.cols);
+      const normalized = div(expShifted, expSum);
+      const broadcastUpstream = broadcastMatrix(upstream, tensor.value.rows, tensor.value.cols);
+      const gradMatrix = mul(broadcastUpstream, normalized);
+      return matchGradientShape(gradMatrix, tensor);
+    });
+  }
+  return result;
+}
+
+export function tensorSoftmax(
+  tensor: Tensor,
+  axis: 0 | 1 = 1
+): Tensor {
+  const dtype = gradDTypeFor(tensor.value.dtype);
+  const maxMatrix =
+    axis === 0
+      ? maxRowsMatrix(tensor.value, dtype)
+      : maxColsMatrix(tensor.value, dtype);
+  const broadcastMax = broadcastMatrix(maxMatrix, tensor.value.rows, tensor.value.cols);
+  const shifted = sub(tensor.value, broadcastMax);
+  const expShifted = exp(shifted);
+  const sumMatrix =
+    axis === 0
+      ? sumRowsMatrix(expShifted, dtype)
+      : sumColsMatrix(expShifted, dtype);
+  const invSum = broadcastMatrix(sumMatrix, tensor.value.rows, tensor.value.cols);
+  const value = div(expShifted, invSum);
+  const result = new Tensor(value, { requiresGrad: tensor.requiresGrad });
+  if (tensor.requiresGrad) {
+    result.registerDependency(tensor, (grad) => {
+      const upstream = ensureGradDType(grad, dtype);
+      const softmaxData = result.value.astype("float64", { copy: false }).toArray() as Float64Array;
+      const gradData = upstream.astype("float64", { copy: false }).toArray() as Float64Array;
+      const rows = tensor.value.rows;
+      const cols = tensor.value.cols;
+      const out =
+        dtype === "float32" ? new Float32Array(rows * cols) : new Float64Array(rows * cols);
+      if (axis === 1) {
+        for (let row = 0; row < rows; row += 1) {
+          let dot = 0;
+          const rowOffset = row * cols;
+          for (let col = 0; col < cols; col += 1) {
+            dot += gradData[rowOffset + col] * softmaxData[rowOffset + col];
+          }
+          for (let col = 0; col < cols; col += 1) {
+            const index = rowOffset + col;
+            out[index] = softmaxData[index] * (gradData[index] - dot);
+          }
+        }
+      } else {
+        const dots =
+          dtype === "float32" ? new Float32Array(cols) : new Float64Array(cols);
+        for (let row = 0; row < rows; row += 1) {
+          const rowOffset = row * cols;
+          for (let col = 0; col < cols; col += 1) {
+            dots[col] += gradData[rowOffset + col] * softmaxData[rowOffset + col];
+          }
+        }
+        for (let row = 0; row < rows; row += 1) {
+          const rowOffset = row * cols;
+          for (let col = 0; col < cols; col += 1) {
+            const index = rowOffset + col;
+            out[index] = softmaxData[index] * (gradData[index] - dots[col]);
+          }
+        }
+      }
+      const gradMatrix = new Matrix(out, rows, cols, { dtype });
+      return matchGradientShape(gradMatrix, tensor);
+    });
+  }
+  return result;
+}
+
 function tensorFrom(value: Tensor | Matrix | MatrixInputData, rows?: number, cols?: number, options?: TensorOptions): Tensor {
   if (value instanceof Tensor) {
     return value;
@@ -5162,6 +5473,156 @@ function tensorFrom(value: Tensor | Matrix | MatrixInputData, rows?: number, col
 }
 
 export { tensorFrom as tensor };
+
+export type GradcheckInput = {
+  data: Matrix | MatrixInputData;
+  rows: number;
+  cols: number;
+  name?: string;
+};
+
+export type GradcheckOptions = {
+  epsilon?: number;
+  atol?: number;
+  rtol?: number;
+};
+
+export type GradcheckIssue = {
+  tensor: number;
+  index: number;
+  analytic: number;
+  numeric: number;
+  error: number;
+};
+
+export type GradcheckResult = {
+  ok: boolean;
+  maxError: number;
+  issues: GradcheckIssue[];
+};
+
+function materializeFloat64(input: GradcheckInput): Float64Array {
+  if (input.data instanceof Matrix) {
+    const array = input.data.astype("float64", { copy: false }).toArray() as Float64Array;
+    return Float64Array.from(array);
+  }
+  if (input.data instanceof Float64Array) {
+    return Float64Array.from(input.data);
+  }
+  if (input.data instanceof Float32Array) {
+    return Float64Array.from(input.data);
+  }
+  if (ArrayBuffer.isView(input.data)) {
+    if (input.data instanceof BigInt64Array || input.data instanceof BigUint64Array) {
+      throw new Error("gradcheck does not support fixed64 inputs");
+    }
+    return Float64Array.from(input.data as ArrayLike<number>);
+  }
+  if (Array.isArray(input.data)) {
+    return Float64Array.from(input.data.map(Number));
+  }
+  return Float64Array.from(input.data as ArrayLike<number>);
+}
+
+function buildTensorsFromBuffers(
+  buffers: readonly Float64Array[],
+  inputs: readonly GradcheckInput[],
+  requiresGrad: boolean
+): Tensor[] {
+  return buffers.map((buffer, index) =>
+    tensorFrom(new Float64Array(buffer), inputs[index].rows, inputs[index].cols, {
+      requiresGrad,
+      name: inputs[index].name ?? `input${index}`,
+    })
+  );
+}
+
+function forwardScalar(
+  build: (...tensors: Tensor[]) => Tensor,
+  buffers: readonly Float64Array[],
+  inputs: readonly GradcheckInput[]
+): number {
+  const tensors = buildTensorsFromBuffers(buffers, inputs, false);
+  const output = build(...tensors);
+  const values = output.value.toArray();
+  if (values.length !== 1) {
+    throw new Error("gradcheck: expected scalar output");
+  }
+  return Number(values[0]);
+}
+
+export function gradcheck(
+  build: (...tensors: Tensor[]) => Tensor,
+  inputs: readonly GradcheckInput[],
+  options: GradcheckOptions = {}
+): GradcheckResult {
+  if (inputs.length === 0) {
+    throw new Error("gradcheck requires at least one input");
+  }
+  const epsilon = options.epsilon ?? 1e-4;
+  const atol = options.atol ?? 1e-5;
+  const rtol = options.rtol ?? 1e-2;
+  const buffers = inputs.map(materializeFloat64);
+  const analyticTensors = buildTensorsFromBuffers(buffers, inputs, true);
+  const output = build(...analyticTensors);
+  const outputValues = output.value.toArray();
+  if (outputValues.length !== 1) {
+    throw new Error("gradcheck: expected scalar output");
+  }
+  output.backward();
+  const analyticGrads = analyticTensors.map((tensor) => {
+    if (!tensor.grad) {
+      return new Float64Array(tensor.value.rows * tensor.value.cols);
+    }
+    const gradArray = tensor.grad.astype("float64", { copy: false }).toArray() as Float64Array;
+    return Float64Array.from(gradArray);
+  });
+  const issues: GradcheckIssue[] = [];
+  let maxError = 0;
+  buffers.forEach((buffer, tensorIndex) => {
+    const analytic = analyticGrads[tensorIndex];
+    const length = buffer.length;
+    for (let index = 0; index < length; index += 1) {
+      const plusBuffers = buffers.map((base, i) => {
+        const copy = Float64Array.from(base);
+        if (i === tensorIndex) {
+          copy[index] += epsilon;
+        }
+        return copy;
+      });
+      const minusBuffers = buffers.map((base, i) => {
+        const copy = Float64Array.from(base);
+        if (i === tensorIndex) {
+          copy[index] -= epsilon;
+        }
+        return copy;
+      });
+      const plusVal = forwardScalar(build, plusBuffers, inputs);
+      const minusVal = forwardScalar(build, minusBuffers, inputs);
+      const numeric = (plusVal - minusVal) / (2 * epsilon);
+      const analyticVal = analytic[index];
+      const error = Math.abs(analyticVal - numeric);
+      const tolerance = atol + rtol * Math.abs(numeric);
+      if (error > tolerance || Number.isNaN(error)) {
+        issues.push({
+          tensor: tensorIndex,
+          index,
+          analytic: analyticVal,
+          numeric,
+          error,
+        });
+      }
+      if (error > maxError) {
+        maxError = error;
+      }
+    }
+  });
+  return {
+    ok: issues.length === 0,
+    maxError,
+    issues,
+  };
+}
 export {
   arrowTableToMatrix,
   matrixToArrowTable,
