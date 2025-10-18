@@ -112,8 +112,10 @@ fn matrices_from_components(
     rows: usize,
     cols: usize,
 ) -> CoreResult<(MatrixBuffer, MatrixBuffer)> {
-    let real_matrix = MatrixBuffer::from_vec(real, rows, cols).map_err(|err| format!("fft: {err}"))?;
-    let imag_matrix = MatrixBuffer::from_vec(imag, rows, cols).map_err(|err| format!("fft: {err}"))?;
+    let real_matrix =
+        MatrixBuffer::from_vec(real, rows, cols).map_err(|err| format!("fft: {err}"))?;
+    let imag_matrix =
+        MatrixBuffer::from_vec(imag, rows, cols).map_err(|err| format!("fft: {err}"))?;
     Ok((real_matrix, imag_matrix))
 }
 

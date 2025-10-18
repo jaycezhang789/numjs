@@ -3,13 +3,14 @@ pub mod compress;
 #[cfg(any(feature = "cpu-openblas", feature = "cpu-blis", feature = "cpu-mkl"))]
 mod cpu;
 pub mod dtype;
-pub mod fft;
 pub mod element;
 pub mod error;
+pub mod fft;
 pub mod gpu;
 mod macros;
 pub mod metrics;
 mod simd;
+pub mod sparse;
 mod threading;
 
 use buffer::MatrixBuffer;
@@ -36,6 +37,7 @@ use nalgebra::{DMatrix, SymmetricEigen};
 pub use compress::compress;
 pub use error::codes;
 pub use metrics::{copy_bytes_total, reset_copy_bytes, take_copy_bytes};
+pub use sparse::{sparse_add, sparse_matmul, sparse_transpose, CsrMatrixView};
 pub type CoreResult<T> = Result<T, String>;
 
 // ---------------------------------------------------------------------
@@ -2358,10 +2360,7 @@ pub fn write_npz_matrices(_entries: &[(&str, MatrixBuffer)]) -> CoreResult<Vec<u
     Err("npz support is disabled".into())
 }
 
-pub fn fft_axis(
-    matrix: &MatrixBuffer,
-    axis: usize,
-) -> CoreResult<(MatrixBuffer, MatrixBuffer)> {
+pub fn fft_axis(matrix: &MatrixBuffer, axis: usize) -> CoreResult<(MatrixBuffer, MatrixBuffer)> {
     fft::fft1d(matrix, axis)
 }
 

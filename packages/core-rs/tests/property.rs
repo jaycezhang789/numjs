@@ -1,8 +1,4 @@
-use num_rs_core::{
-    add as core_add,
-    buffer::MatrixBuffer,
-    matmul as core_matmul,
-};
+use num_rs_core::{add as core_add, buffer::MatrixBuffer, matmul as core_matmul};
 use proptest::prelude::*;
 
 fn matrix_from_vec(data: Vec<f64>, rows: usize, cols: usize) -> MatrixBuffer {

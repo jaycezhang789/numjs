@@ -5854,6 +5854,430 @@ export function trainLinearRegression(
   };
 }
 
+// -----------------------------
+// Sparse Matrix Support
+// -----------------------------
+
+export type SparseValueArray = Float32Array | Float64Array | BigInt64Array;
+
+export type SparseFormat = "csr";
+
+export type SparseMatrixInit = {
+  rows: number;
+  cols: number;
+  rowPtr: Uint32Array;
+  colIdx: Uint32Array;
+  values: SparseValueArray;
+  dtype?: DType;
+};
+
+type SparseCSRComponents = {
+  rowPtr: Uint32Array;
+  colIdx: Uint32Array;
+  values: SparseValueArray;
+};
+
+function cloneSparseValues(values: SparseValueArray): SparseValueArray {
+  const Ctor = values.constructor as {
+    new (buffer: ArrayBufferLike | number | SparseValueArray, byteOffset?: number, length?: number): SparseValueArray;
+  };
+  return new Ctor(values) as SparseValueArray;
+}
+
+function cooToCsr(
+  rows: number,
+  cols: number,
+  rowIdx: Uint32Array,
+  colIdx: Uint32Array,
+  values: SparseValueArray
+): SparseCSRComponents {
+  if (rowIdx.length !== colIdx.length || rowIdx.length !== values.length) {
+    throw new Error("COO components must have the same length");
+  }
+  const nnz = rowIdx.length;
+  const rowPtr = new Uint32Array(rows + 1);
+  for (let k = 0; k < nnz; k += 1) {
+    const row = rowIdx[k];
+    if (row >= rows) {
+      throw new Error(`COO row index ${row} out of bounds for rows=${rows}`);
+    }
+    rowPtr[row + 1] += 1;
+  }
+  for (let r = 0; r < rows; r += 1) {
+    rowPtr[r + 1] += rowPtr[r];
+  }
+  const sortedColIdx = new Uint32Array(nnz);
+  const ValueCtor = values.constructor as { new (length: number): SparseValueArray };
+  const sortedValues = new ValueCtor(nnz) as SparseValueArray;
+  const offsets = rowPtr.slice(0);
+  for (let k = 0; k < nnz; k += 1) {
+    const row = rowIdx[k];
+    const dest = offsets[row];
+    sortedColIdx[dest] = colIdx[k];
+    (sortedValues as any)[dest] = (values as any)[k];
+    offsets[row] += 1;
+  }
+  return { rowPtr, colIdx: sortedColIdx, values: sortedValues };
+}
+
+function csrTranspose(
+  rows: number,
+  cols: number,
+  rowPtr: Uint32Array,
+  colIdx: Uint32Array,
+  values: SparseValueArray
+): SparseCSRComponents {
+  const nnz = values.length;
+  const transRowPtr = new Uint32Array(cols + 1);
+  for (let k = 0; k < nnz; k += 1) {
+    const col = colIdx[k];
+    if (col >= cols) {
+      throw new Error(`CSR column index ${col} out of bounds for cols=${cols}`);
+    }
+    transRowPtr[col + 1] += 1;
+  }
+  for (let c = 0; c < cols; c += 1) {
+    transRowPtr[c + 1] += transRowPtr[c];
+  }
+  const transposeColIdx = new Uint32Array(nnz);
+  const ValueCtor = values.constructor as { new (length: number): SparseValueArray };
+  const transposeValues = new ValueCtor(nnz) as SparseValueArray;
+  const offsets = transRowPtr.slice(0);
+  for (let row = 0; row < rows; row += 1) {
+    for (let k = rowPtr[row]; k < rowPtr[row + 1]; k += 1) {
+      const col = colIdx[k];
+      const dest = offsets[col];
+      transposeColIdx[dest] = row;
+      (transposeValues as any)[dest] = (values as any)[k];
+      offsets[col] += 1;
+    }
+  }
+  return { rowPtr: transRowPtr, colIdx: transposeColIdx, values: transposeValues };
+}
+
+export class SparseMatrix {
+  readonly rows: number;
+  readonly cols: number;
+  readonly dtype: DType;
+  readonly format: SparseFormat = "csr";
+
+  private readonly _rowPtr: Uint32Array;
+  private readonly _colIdx: Uint32Array;
+  private readonly _values: SparseValueArray;
+
+  constructor(init: SparseMatrixInit) {
+    if (init.rowPtr.length !== init.rows + 1) {
+      throw new Error("rowPtr length must equal rows + 1");
+    }
+    if (init.colIdx.length !== init.values.length) {
+      throw new Error("colIdx and values must have the same length");
+    }
+    this.rows = init.rows;
+    this.cols = init.cols;
+    this._rowPtr = init.rowPtr;
+    this._colIdx = init.colIdx;
+    this._values = init.values;
+    this.dtype = init.dtype ?? "float64";
+  }
+
+  static fromCSR(
+    rowPtr: Uint32Array,
+    colIdx: Uint32Array,
+    values: SparseValueArray,
+    rows: number,
+    cols: number,
+    dtype?: DType
+  ): SparseMatrix {
+    return new SparseMatrix({ rowPtr, colIdx, values, rows, cols, dtype });
+  }
+
+  static fromCOO(
+    rowIdx: Uint32Array,
+    colIdx: Uint32Array,
+    values: SparseValueArray,
+    rows: number,
+    cols: number,
+    dtype?: DType
+  ): SparseMatrix {
+    const csr = cooToCsr(rows, cols, rowIdx, colIdx, values);
+    return new SparseMatrix({ ...csr, rows, cols, dtype });
+  }
+
+  static fromDense(matrix: Matrix, threshold = 0): SparseMatrix {
+    const rows = matrix.rows;
+    const cols = matrix.cols;
+    const source = matrix.astype("float64", { copy: false }).toArray() as Float64Array;
+    const rowCounts = new Uint32Array(rows + 1);
+    let nnz = 0;
+    for (let row = 0; row < rows; row += 1) {
+      for (let col = 0; col < cols; col += 1) {
+        const value = source[row * cols + col];
+        if (Math.abs(value) > threshold) {
+          nnz += 1;
+          rowCounts[row + 1] += 1;
+        }
+      }
+    }
+    for (let r = 0; r < rows; r += 1) {
+      rowCounts[r + 1] += rowCounts[r];
+    }
+    const colIdx = new Uint32Array(nnz);
+    const values = matrix.dtype === "float32" ? new Float32Array(nnz) : new Float64Array(nnz);
+    const offsets = rowCounts.slice(0);
+    for (let row = 0; row < rows; row += 1) {
+      for (let col = 0; col < cols; col += 1) {
+        const value = source[row * cols + col];
+        if (Math.abs(value) > threshold) {
+          const dest = offsets[row];
+          colIdx[dest] = col;
+          (values as any)[dest] = matrix.dtype === "float32" ? Math.fround(value) : value;
+          offsets[row] += 1;
+        }
+      }
+    }
+    return new SparseMatrix({
+      rowPtr: rowCounts,
+      colIdx,
+      values,
+      rows,
+      cols,
+      dtype: matrix.dtype === "float32" ? "float32" : "float64",
+    });
+  }
+
+  get rowPtr(): Uint32Array {
+    return this._rowPtr;
+  }
+
+  get colIdx(): Uint32Array {
+    return this._colIdx;
+  }
+
+  get values(): SparseValueArray {
+    return this._values;
+  }
+
+  get nnz(): number {
+    return this._values.length;
+  }
+
+  toCSR(): SparseCSRComponents {
+    return {
+      rowPtr: this._rowPtr.slice(0),
+      colIdx: this._colIdx.slice(0),
+      values: cloneSparseValues(this._values),
+    };
+  }
+
+  toCOO(): { rowIdx: Uint32Array; colIdx: Uint32Array; values: SparseValueArray } {
+    const rowIdx = new Uint32Array(this.nnz);
+    for (let row = 0; row < this.rows; row += 1) {
+      for (let k = this._rowPtr[row]; k < this._rowPtr[row + 1]; k += 1) {
+        rowIdx[k] = row;
+      }
+    }
+    return {
+      rowIdx,
+      colIdx: this._colIdx.slice(0),
+      values: cloneSparseValues(this._values),
+    };
+  }
+
+  toDense(dtype: DType = this.dtype): Matrix {
+    const rows = this.rows;
+    const cols = this.cols;
+    const length = rows * cols;
+    let data: Float32Array | Float64Array;
+    if (dtype === "float32") {
+      data = new Float32Array(length);
+    } else {
+      data = new Float64Array(length);
+    }
+    for (let row = 0; row < rows; row += 1) {
+      for (let k = this._rowPtr[row]; k < this._rowPtr[row + 1]; k += 1) {
+        const col = this._colIdx[k];
+        const value = (this._values as any)[k];
+        if (dtype === "float32") {
+          (data as Float32Array)[row * cols + col] = Math.fround(Number(value));
+        } else {
+          (data as Float64Array)[row * cols + col] = Number(value);
+        }
+      }
+    }
+    return new Matrix(data, rows, cols, { dtype });
+  }
+
+  transpose(): SparseMatrix {
+    const transposed = csrTranspose(
+      this.rows,
+      this.cols,
+      this._rowPtr,
+      this._colIdx,
+      this._values
+    );
+    return new SparseMatrix({
+      ...transposed,
+      rows: this.cols,
+      cols: this.rows,
+      dtype: this.dtype,
+    });
+  }
+}
+
+type SparsePayload = {
+  rows: number;
+  cols: number;
+  dtype: DType;
+  rowPtr: Uint32Array;
+  colIdx: Uint32Array;
+  values: SparseValueArray;
+};
+
+function createSparsePayload(matrix: SparseMatrix): SparsePayload {
+  return {
+    rows: matrix.rows,
+    cols: matrix.cols,
+    dtype: matrix.dtype,
+    rowPtr: matrix.rowPtr,
+    colIdx: matrix.colIdx,
+    values: matrix.values,
+  };
+}
+
+export type SparseMatmulOptions = {
+  backend?: "auto" | "js";
+};
+
+function tryBackendSparseMatmul(sparse: SparseMatrix, dense: Matrix): Matrix | null {
+  const backend = ensureBackend();
+  const fn =
+    (backend as { sparse_matmul?: (payload: SparsePayload, dense: BackendMatrixHandle) => BackendMatrixHandle }).sparse_matmul ??
+    (backend as { sparseMatmul?: (payload: SparsePayload, dense: BackendMatrixHandle) => BackendMatrixHandle }).sparseMatmul;
+  if (typeof fn !== "function") {
+    return null;
+  }
+  try {
+    const handle = fn(createSparsePayload(sparse), getHandle(dense));
+    if (handle) {
+      const dtype = getMatrixDTypeFromHandle(handle) ?? dense.dtype;
+      const fixedScale =
+        dtype === "fixed64" ? getMatrixFixedScaleFromHandle(handle) ?? null : null;
+      return Matrix.fromHandleWithDType(handle, dtype, fixedScale !== null ? { fixedScale } : undefined);
+    }
+  } catch (error) {
+    console.warn("[numjs][sparse] backend sparse_matmul failed; falling back to JS implementation.", error);
+  }
+  return null;
+}
+
+function tryBackendSparseAdd(sparse: SparseMatrix, dense: Matrix): Matrix | null {
+  const backend = ensureBackend();
+  const fn =
+    (backend as { sparse_add?: (payload: SparsePayload, dense: BackendMatrixHandle) => BackendMatrixHandle }).sparse_add ??
+    (backend as { sparseAdd?: (payload: SparsePayload, dense: BackendMatrixHandle) => BackendMatrixHandle }).sparseAdd;
+  if (typeof fn !== "function") {
+    return null;
+  }
+  try {
+    const handle = fn(createSparsePayload(sparse), getHandle(dense));
+    if (handle) {
+      const dtype = getMatrixDTypeFromHandle(handle) ?? dense.dtype;
+      const fixedScale =
+        dtype === "fixed64" ? getMatrixFixedScaleFromHandle(handle) ?? null : null;
+      return Matrix.fromHandleWithDType(handle, dtype, fixedScale !== null ? { fixedScale } : undefined);
+    }
+  } catch (error) {
+    console.warn("[numjs][sparse] backend sparse_add failed; falling back to JS implementation.", error);
+  }
+  return null;
+}
+
+function tryBackendSparseTranspose(sparse: SparseMatrix): SparseMatrix | null {
+  const backend = ensureBackend();
+  const fn =
+    (backend as { sparse_transpose?: (payload: SparsePayload) => SparsePayload | Matrix }).sparse_transpose ??
+    (backend as { sparseTranspose?: (payload: SparsePayload) => SparsePayload | Matrix }).sparseTranspose;
+  if (typeof fn !== "function") {
+    return null;
+  }
+  try {
+    const payload = fn(createSparsePayload(sparse));
+    if (payload instanceof Matrix) {
+      return SparseMatrix.fromDense(payload);
+    }
+    if (payload) {
+      return new SparseMatrix({
+        rowPtr: payload.rowPtr,
+        colIdx: payload.colIdx,
+        values: payload.values,
+        rows: payload.rows,
+        cols: payload.cols,
+        dtype: payload.dtype,
+      });
+    }
+  } catch (error) {
+    console.warn("[numjs][sparse] backend sparse_transpose failed; falling back to JS implementation.", error);
+  }
+  return null;
+}
+
+export function sparseMatmul(
+  sparse: SparseMatrix,
+  dense: Matrix,
+  options: SparseMatmulOptions = {}
+): Matrix {
+  if (sparse.cols !== dense.rows) {
+    throw new Error(
+      `sparseMatmul: dimension mismatch (${sparse.rows}x${sparse.cols}) * (${dense.rows}x${dense.cols})`
+    );
+  }
+  if (options.backend !== "js") {
+    const backendResult = tryBackendSparseMatmul(sparse, dense);
+    if (backendResult) {
+      return backendResult;
+    }
+  }
+  const denseSparse = sparse.toDense(
+    dense.dtype === "float32" ? "float32" : "float64"
+  );
+  return matmul(denseSparse, dense);
+}
+
+export function sparseAdd(
+  sparse: SparseMatrix,
+  dense: Matrix,
+  options: { backend?: "auto" | "js" } = {}
+): Matrix {
+  if (sparse.rows !== dense.rows || sparse.cols !== dense.cols) {
+    throw new Error(
+      `sparseAdd: shape mismatch sparse ${sparse.rows}x${sparse.cols} vs dense ${dense.rows}x${dense.cols}`
+    );
+  }
+  if (options.backend !== "js") {
+    const backendResult = tryBackendSparseAdd(sparse, dense);
+    if (backendResult) {
+      return backendResult;
+    }
+  }
+  const denseSparse = sparse.toDense(
+    dense.dtype === "float32" ? "float32" : "float64"
+  );
+  return add(denseSparse, dense);
+}
+
+export function sparseTranspose(
+  sparse: SparseMatrix,
+  options: { backend?: "auto" | "js" } = {}
+): SparseMatrix {
+  if (options.backend !== "js") {
+    const backendResult = tryBackendSparseTranspose(sparse);
+    if (backendResult) {
+      return backendResult;
+    }
+  }
+  return sparse.transpose();
+}
+
 function materializeFloat64(input: GradcheckInput): Float64Array {
   if (input.data instanceof Matrix) {
     const array = input.data.astype("float64", { copy: false }).toArray() as Float64Array;

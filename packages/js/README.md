@@ -75,6 +75,7 @@ Refer to the generated TypeScript declarations in `dist/index.d.ts` for the comp
 - [WebGPU 加速篇](docs/tutorials/webgpu.md)：介绍如何启用 GPU 管线与性能调优策略。
 - [StackBlitz/CodeSandbox 交互式文档](docs/interactive/README.md)：在线运行 Playground，附复制即跑 Demo。
 - 自动微分与训练：示例包含 `trainLinearRegression`、`sgd`/`adam`/`rmsprop` 优化器，快速验证 Autograd 工作流。
+- 稀疏矩阵设计：查看 [SparseMatrix 草案](docs/design/sparse-matrix.md)，了解 CSR 结构与后续 SuiteSparse 绑定计划。
 - [锦上添花与未来探索](docs/future.md)：概述计划中的自动微分与随机分布增强路线。
 
 ## Backend Strategy

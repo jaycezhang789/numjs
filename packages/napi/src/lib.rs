@@ -1,5 +1,6 @@
 use napi::bindgen_prelude::{
-    BigInt64Array, Buffer, Env, Error, Float64Array, Result, TypedArrayType,
+    BigInt64Array, Buffer, Env, Error, Float32Array, Float64Array, Result, TypedArrayType,
+    Uint32Array,
 };
 use napi::JsObject;
 use napi_derive::napi;
@@ -8,17 +9,18 @@ use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
 use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
 use num_rs_core::gpu;
+use num_rs_core::sparse::{self, CsrMatrixView};
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
-    cos as core_cos, div as core_div, dot as core_dot, exp as core_exp, gather as core_gather,
-    gather_pairs as core_gather_pairs, log as core_log, matmul as core_matmul,
+    cos as core_cos, div as core_div, dot as core_dot, exp as core_exp, fft2d as core_fft2d,
+    fft_axis as core_fft_axis, gather as core_gather, gather_pairs as core_gather_pairs,
+    ifft2d as core_ifft2d, ifft_axis as core_ifft_axis, log as core_log, matmul as core_matmul,
     median as core_median, mul as core_mul, nanmean as core_nanmean, nansum as core_nansum,
     neg as core_neg, percentile as core_percentile, put as core_put, quantile as core_quantile,
     read_npy_matrix, scatter as core_scatter, scatter_pairs as core_scatter_pairs,
     sigmoid as core_sigmoid, sin as core_sin, stack as core_stack, sub as core_sub,
     sum as core_sum, take as core_take, tanh as core_tanh, transpose as core_transpose,
     where_select as core_where, where_select_multi as core_where_multi, write_npy_matrix,
-    fft_axis as core_fft_axis, ifft_axis as core_ifft_axis, fft2d as core_fft2d, ifft2d as core_ifft2d,
 };
 #[cfg(feature = "linalg")]
 use num_rs_core::{eigen as core_eigen, qr as core_qr, solve as core_solve, svd as core_svd};
@@ -31,7 +33,6 @@ use std::sync::Arc;
 pub struct Matrix {
     buffer: MatrixBuffer,
 }
-
 
 #[napi]
 impl Matrix {
@@ -473,6 +474,127 @@ pub fn reset_copy_bytes() {
 }
 
 // ---------------------------------------------------------------------
+// Sparse matrix fallbacks
+// ---------------------------------------------------------------------
+
+struct ParsedSparse {
+    rows: usize,
+    cols: usize,
+    dtype: DType,
+    row_ptr: Vec<u32>,
+    col_idx: Vec<u32>,
+    values_f32: Option<Vec<f32>>,
+    values_f64: Option<Vec<f64>>,
+}
+
+impl ParsedSparse {
+    fn view(&self) -> Result<CsrMatrixView<'_>> {
+        match self.dtype {
+            DType::Float32 => {
+                let values = self
+                    .values_f32
+                    .as_ref()
+                    .ok_or_else(|| map_core_error("sparse payload missing float32 values"))?;
+                sparse::CsrMatrixView::new_f32(
+                    self.rows,
+                    self.cols,
+                    &self.row_ptr,
+                    &self.col_idx,
+                    values,
+                )
+                .map_err(map_core_error)
+            }
+            DType::Float64 => {
+                let values = self
+                    .values_f64
+                    .as_ref()
+                    .ok_or_else(|| map_core_error("sparse payload missing float64 values"))?;
+                sparse::CsrMatrixView::new_f64(
+                    self.rows,
+                    self.cols,
+                    &self.row_ptr,
+                    &self.col_idx,
+                    values,
+                )
+                .map_err(map_core_error)
+            }
+            other => Err(map_core_error(format!(
+                "Sparse payload dtype {other} not yet supported"
+            ))),
+        }
+    }
+}
+
+fn parse_sparse_payload(payload: JsObject) -> Result<ParsedSparse> {
+    let rows: u32 = payload.get_named_property("rows")?;
+    let cols: u32 = payload.get_named_property("cols")?;
+    let dtype_string: String = payload.get_named_property("dtype")?;
+    let dtype = dtype_string
+        .parse::<DType>()
+        .map_err(|err| map_core_error(err.to_string()))?;
+    let row_ptr_js: Uint32Array = payload.get_named_property("rowPtr")?;
+    let col_idx_js: Uint32Array = payload.get_named_property("colIdx")?;
+    let row_ptr = row_ptr_js.to_vec();
+    let col_idx = col_idx_js.to_vec();
+
+    let (values_f32, values_f64) = match dtype {
+        DType::Float32 => {
+            let values_js: Float32Array = payload.get_named_property("values")?;
+            (Some(values_js.to_vec()), None)
+        }
+        DType::Float64 => {
+            let values_js: Float64Array = payload.get_named_property("values")?;
+            (None, Some(values_js.to_vec()))
+        }
+        other => {
+            return Err(map_core_error(format!(
+                "Sparse payload dtype {other} not yet supported"
+            )))
+        }
+    };
+
+    let rows_usize = rows as usize;
+    if row_ptr.len() != rows_usize + 1 {
+        return Err(map_core_error(format!(
+            "Sparse payload rowPtr length {} must equal rows + 1 ({})",
+            row_ptr.len(),
+            rows_usize + 1
+        )));
+    }
+
+    Ok(ParsedSparse {
+        rows: rows_usize,
+        cols: cols as usize,
+        dtype,
+        row_ptr,
+        col_idx,
+        values_f32,
+        values_f64,
+    })
+}
+
+#[napi]
+pub fn sparse_matmul(payload: JsObject, dense: &Matrix) -> Result<Matrix> {
+    let parsed = parse_sparse_payload(payload)?;
+    let view = parsed.view()?;
+    map_matrix(sparse::sparse_matmul(&view, dense.buffer()))
+}
+
+#[napi]
+pub fn sparse_add(payload: JsObject, dense: &Matrix) -> Result<Matrix> {
+    let parsed = parse_sparse_payload(payload)?;
+    let view = parsed.view()?;
+    map_matrix(sparse::sparse_add(&view, dense.buffer()))
+}
+
+#[napi]
+pub fn sparse_transpose(payload: JsObject) -> Result<Matrix> {
+    let parsed = parse_sparse_payload(payload)?;
+    let view = parsed.view()?;
+    map_matrix(sparse::sparse_transpose(&view))
+}
+
+// ---------------------------------------------------------------------
 // Stable reductions
 // ---------------------------------------------------------------------
 
@@ -505,8 +627,8 @@ pub fn fft2d(env: Env, matrix: &Matrix) -> Result<JsObject> {
 
 #[napi]
 pub fn ifft_axis(env: Env, real: &Matrix, imag: &Matrix, axis: u32) -> Result<JsObject> {
-    let (real_buf, imag_buf) = core_ifft_axis(real.buffer(), imag.buffer(), axis as usize)
-        .map_err(map_core_error)?;
+    let (real_buf, imag_buf) =
+        core_ifft_axis(real.buffer(), imag.buffer(), axis as usize).map_err(map_core_error)?;
     let mut obj = env.create_object()?;
     obj.set_named_property("real", Matrix::from_buffer(real_buf))?;
     obj.set_named_property("imag", Matrix::from_buffer(imag_buf))?;
