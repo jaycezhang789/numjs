@@ -1,6 +1,6 @@
 {
   "name": "@jayce789/numjs",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "description": "NumPy-inspired numerical computing for JavaScript with automatic Node N-API fallback to WebAssembly.",
   "type": "module",
   "main": "dist/index.cjs",
