@@ -2,6 +2,7 @@
 name = "num_rs_core"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [features]
 default = ["linalg", "npy", "parallel"]
@@ -20,6 +21,7 @@ gpu-cuda = [
 ]
 gpu-rocm = ["gpu"]
 sparse-native = ["sprs"]
+sparse-suitesparse = []
 
 [dependencies]
 cfg-if = "1"
@@ -42,6 +44,9 @@ sprs = { version = "0.11", optional = true }
 [dev-dependencies]
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+
+[build-dependencies]
+cc = "1"
 
 [[example]]
 name = "sparse_poc"

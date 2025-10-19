@@ -37,7 +37,7 @@ use nalgebra::{DMatrix, SymmetricEigen};
 pub use compress::compress;
 pub use error::codes;
 pub use metrics::{copy_bytes_total, reset_copy_bytes, take_copy_bytes};
-pub use sparse::{sparse_add, sparse_matmul, sparse_transpose, CsrMatrixView};
+pub use sparse::{sparse_add, sparse_matmul, sparse_matvec, sparse_transpose, CsrMatrixView};
 pub type CoreResult<T> = Result<T, String>;
 
 // ---------------------------------------------------------------------

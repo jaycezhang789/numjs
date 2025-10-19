@@ -4,9 +4,51 @@ use crate::error;
 use crate::{add as core_add, matmul as core_matmul, transpose as core_transpose, CoreResult};
 
 #[cfg(feature = "sparse-native")]
-use ndarray::Array2;
+mod sprs;
 #[cfg(feature = "sparse-native")]
-use sprs::CsMat;
+use sprs::SprsBackend;
+
+#[cfg(feature = "sparse-suitesparse")]
+mod suitesparse;
+#[cfg(feature = "sparse-suitesparse")]
+use suitesparse::SuiteSparseBackend;
+
+/// Backend contract for sparse CSR operations. Concrete implementations can use
+/// software fallbacks (dense) or accelerated bindings such as SuiteSparse.
+pub trait SparseBackend {
+    fn csrmv(&self, csr: &CsrMatrixView<'_>, dense: &MatrixBuffer) -> CoreResult<MatrixBuffer>;
+    fn csrgemm(&self, csr: &CsrMatrixView<'_>, dense: &MatrixBuffer) -> CoreResult<MatrixBuffer>;
+    fn csradd(&self, csr: &CsrMatrixView<'_>, dense: &MatrixBuffer) -> CoreResult<MatrixBuffer>;
+    fn transpose(&self, csr: &CsrMatrixView<'_>) -> CoreResult<MatrixBuffer>;
+}
+
+struct FallbackBackend;
+
+impl SparseBackend for FallbackBackend {
+    fn csrmv(&self, csr: &CsrMatrixView<'_>, dense: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+        if dense.cols() != 1 {
+            return Err(error::shape_mismatch(
+                "csrmv expects a column vector (dense.ncols == 1)",
+            ));
+        }
+        self.csrgemm(csr, dense)
+    }
+
+    fn csrgemm(&self, csr: &CsrMatrixView<'_>, dense: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+        let lhs = csr.to_dense()?;
+        core_matmul(&lhs, dense)
+    }
+
+    fn csradd(&self, csr: &CsrMatrixView<'_>, dense: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+        let lhs = csr.to_dense()?;
+        core_add(&lhs, dense)
+    }
+
+    fn transpose(&self, csr: &CsrMatrixView<'_>) -> CoreResult<MatrixBuffer> {
+        let dense = csr.to_dense()?;
+        core_transpose(&dense)
+    }
+}
 
 #[derive(Clone, Copy)]
 pub enum CsrValues<'a> {
@@ -186,7 +228,7 @@ impl<'a> CsrMatrixView<'a> {
         Ok(())
     }
 
-    fn nnz(&self) -> CoreResult<usize> {
+    pub fn nnz(&self) -> CoreResult<usize> {
         self.row_ptr
             .last()
             .copied()
@@ -196,9 +238,22 @@ impl<'a> CsrMatrixView<'a> {
 }
 
 pub fn sparse_matmul(csr: &CsrMatrixView<'_>, dense: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    #[cfg(feature = "sparse-suitesparse")]
+    {
+        let backend = SuiteSparseBackend;
+        match backend.csrgemm(csr, dense) {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                eprintln!(
+                    "[num_rs_core][sparse] suitesparse sparse_matmul failed: {err}. Falling back to alternate implementation."
+                );
+            }
+        }
+    }
     #[cfg(feature = "sparse-native")]
     {
-        match sparse_matmul_native(csr, dense) {
+        let backend = SprsBackend;
+        match backend.csrgemm(csr, dense) {
             Ok(result) => return Ok(result),
             Err(err) => {
                 eprintln!(
@@ -207,13 +262,26 @@ pub fn sparse_matmul(csr: &CsrMatrixView<'_>, dense: &MatrixBuffer) -> CoreResul
             }
         }
     }
-    sparse_matmul_fallback(csr, dense)
+    FallbackBackend.csrgemm(csr, dense)
 }
 
 pub fn sparse_add(csr: &CsrMatrixView<'_>, dense: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    #[cfg(feature = "sparse-suitesparse")]
+    {
+        let backend = SuiteSparseBackend;
+        match backend.csradd(csr, dense) {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                eprintln!(
+                    "[num_rs_core][sparse] suitesparse sparse_add failed: {err}. Falling back to alternate implementation."
+                );
+            }
+        }
+    }
     #[cfg(feature = "sparse-native")]
     {
-        match sparse_add_native(csr, dense) {
+        let backend = SprsBackend;
+        match backend.csradd(csr, dense) {
             Ok(result) => return Ok(result),
             Err(err) => {
                 eprintln!(
@@ -222,13 +290,26 @@ pub fn sparse_add(csr: &CsrMatrixView<'_>, dense: &MatrixBuffer) -> CoreResult<M
             }
         }
     }
-    sparse_add_fallback(csr, dense)
+    FallbackBackend.csradd(csr, dense)
 }
 
 pub fn sparse_transpose(csr: &CsrMatrixView<'_>) -> CoreResult<MatrixBuffer> {
+    #[cfg(feature = "sparse-suitesparse")]
+    {
+        let backend = SuiteSparseBackend;
+        match backend.transpose(csr) {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                eprintln!(
+                    "[num_rs_core][sparse] suitesparse sparse_transpose failed: {err}. Falling back to alternate implementation."
+                );
+            }
+        }
+    }
     #[cfg(feature = "sparse-native")]
     {
-        match sparse_transpose_native(csr) {
+        let backend = SprsBackend;
+        match backend.transpose(csr) {
             Ok(result) => return Ok(result),
             Err(err) => {
                 eprintln!(
@@ -237,91 +318,33 @@ pub fn sparse_transpose(csr: &CsrMatrixView<'_>) -> CoreResult<MatrixBuffer> {
             }
         }
     }
-    sparse_transpose_fallback(csr)
+    FallbackBackend.transpose(csr)
 }
 
-fn sparse_matmul_fallback(
-    csr: &CsrMatrixView<'_>,
-    dense: &MatrixBuffer,
-) -> CoreResult<MatrixBuffer> {
-    let lhs = csr.to_dense()?;
-    core_matmul(&lhs, dense)
-}
-
-fn sparse_add_fallback(csr: &CsrMatrixView<'_>, dense: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
-    let lhs = csr.to_dense()?;
-    core_add(&lhs, dense)
-}
-
-fn sparse_transpose_fallback(csr: &CsrMatrixView<'_>) -> CoreResult<MatrixBuffer> {
-    let dense = csr.to_dense()?;
-    core_transpose(&dense)
-}
-
-#[cfg(feature = "sparse-native")]
-fn csr_to_sprs_f64(csr: &CsrMatrixView<'_>) -> CoreResult<CsMat<f64>> {
-    let indptr: Vec<usize> = csr.row_ptr().iter().map(|&v| v as usize).collect();
-    let indices: Vec<usize> = csr.col_idx().iter().map(|&v| v as usize).collect();
-    let values: Vec<f64> = match csr.dtype() {
-        DType::Float32 => csr
-            .values_f32()
-            .ok_or_else(|| error::numeric_issue("expected float32 values"))?
-            .iter()
-            .map(|&v| v as f64)
-            .collect(),
-        DType::Float64 => csr
-            .values_f64()
-            .ok_or_else(|| error::numeric_issue("expected float64 values"))?
-            .to_vec(),
-        other => {
-            return Err(error::numeric_issue(format!(
-                "sparse native operations currently support only float32/float64 (got {other})"
-            )))
+pub fn sparse_matvec(csr: &CsrMatrixView<'_>, vector: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
+    #[cfg(feature = "sparse-suitesparse")]
+    {
+        let backend = SuiteSparseBackend;
+        match backend.csrmv(csr, vector) {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                eprintln!(
+                    "[num_rs_core][sparse] suitesparse sparse_matvec failed: {err}. Falling back to alternate implementation."
+                );
+            }
         }
-    };
-    Ok(CsMat::new(
-        (csr.rows(), csr.cols()),
-        indptr,
-        indices,
-        values,
-    ))
-}
-
-#[cfg(feature = "sparse-native")]
-fn sparse_matmul_native(csr: &CsrMatrixView<'_>, dense: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
-    let csr = csr_to_sprs_f64(csr)?;
-    let rhs_vec = dense
-        .to_f64_vec()
-        .map_err(|err| error::numeric_issue(format!("dense conversion failed: {err}")))?;
-    let rhs = Array2::from_shape_vec((dense.rows(), dense.cols()), rhs_vec)
-        .map_err(|err| error::numeric_issue(format!("reshape failure: {err}")))?;
-    let result = &csr * &rhs;
-    let data = result.into_raw_vec();
-    MatrixBuffer::from_vec(data, csr.rows(), rhs.ncols()).map_err(Into::into)
-}
-
-#[cfg(feature = "sparse-native")]
-fn sparse_add_native(csr: &CsrMatrixView<'_>, dense: &MatrixBuffer) -> CoreResult<MatrixBuffer> {
-    if csr.rows() != dense.rows() || csr.cols() != dense.cols() {
-        return Err(error::shape_mismatch("sparse_add: shape mismatch"));
     }
-    let csr = csr_to_sprs_f64(csr)?;
-    let mut dense_vec = dense
-        .to_f64_vec()
-        .map_err(|err| error::numeric_issue(format!("dense conversion failed: {err}")))?;
-    let mut dense_array = Array2::from_shape_vec((dense.rows(), dense.cols()), dense_vec)
-        .map_err(|err| error::numeric_issue(format!("reshape failure: {err}")))?;
-    let csr_dense = Array2::from_shape_vec((csr.rows(), csr.cols()), csr.to_dense())
-        .map_err(|err| error::numeric_issue(format!("csr to dense reshape failure: {err}")))?;
-    dense_array += &csr_dense;
-    let data = dense_array.into_raw_vec();
-    MatrixBuffer::from_vec(data, csr.rows(), csr.cols()).map_err(Into::into)
-}
-
-#[cfg(feature = "sparse-native")]
-fn sparse_transpose_native(csr: &CsrMatrixView<'_>) -> CoreResult<MatrixBuffer> {
-    let csr = csr_to_sprs_f64(csr)?;
-    let transposed = csr.transpose_view().to_owned();
-    let data = transposed.to_dense();
-    MatrixBuffer::from_vec(data, transposed.rows(), transposed.cols()).map_err(Into::into)
+    #[cfg(feature = "sparse-native")]
+    {
+        let backend = SprsBackend;
+        match backend.csrmv(csr, vector) {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                eprintln!(
+                    "[num_rs_core][sparse] native sparse_matvec failed: {err}. Falling back to dense implementation."
+                );
+            }
+        }
+    }
+    FallbackBackend.csrmv(csr, vector)
 }

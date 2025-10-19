@@ -1,5 +1,7 @@
 use num_rs_core::buffer::MatrixBuffer;
-use num_rs_core::sparse::{sparse_add, sparse_matmul, sparse_transpose, CsrMatrixView};
+use num_rs_core::sparse::{
+    sparse_add, sparse_matmul, sparse_matvec, sparse_transpose, CsrMatrixView,
+};
 use num_rs_core::{add as core_add, matmul as core_matmul, transpose as core_transpose};
 
 fn sample_csr() -> (Vec<u32>, Vec<u32>, Vec<f64>) {
@@ -65,6 +67,21 @@ fn sparse_matmul_matches_dense() {
 }
 
 #[test]
+fn sparse_matvec_matches_dense() {
+    let (row_ptr, col_idx, values) = sample_csr();
+    let view = CsrMatrixView::new_f64(3, 3, &row_ptr, &col_idx, &values).expect("csr view");
+    let rhs = dense_rhs();
+
+    let sparse = sparse_matvec(&view, &rhs).expect("sparse matvec");
+    let dense = {
+        let lhs = view.to_dense().expect("dense lhs");
+        core_matmul(&lhs, &rhs).expect("dense matvec")
+    };
+
+    assert_eq!(sparse.to_f64_vec(), dense.to_f64_vec());
+}
+
+#[test]
 fn sparse_add_matches_dense() {
     let (row_ptr, col_idx, values) = sample_csr();
     let view = CsrMatrixView::new_f64(3, 3, &row_ptr, &col_idx, &values).expect("csr view");
@@ -113,6 +130,54 @@ fn sparse_native_matches_dense() {
     let dense = {
         let lhs = view.to_dense().expect("dense lhs");
         core_matmul(&lhs, &rhs).expect("dense matmul")
+    };
+
+    assert_eq!(sparse.to_f64_vec(), dense.to_f64_vec());
+}
+
+#[cfg(feature = "sparse-native")]
+#[test]
+fn sparse_native_matvec_matches_dense() {
+    let (row_ptr, col_idx, values) = sample_csr();
+    let view = CsrMatrixView::new_f64(3, 3, &row_ptr, &col_idx, &values).expect("csr view");
+    let rhs = dense_rhs();
+
+    let sparse = sparse_matvec(&view, &rhs).expect("native matvec");
+    let dense = {
+        let lhs = view.to_dense().expect("dense lhs");
+        core_matmul(&lhs, &rhs).expect("dense matvec")
+    };
+
+    assert_eq!(sparse.to_f64_vec(), dense.to_f64_vec());
+}
+
+#[cfg(feature = "sparse-suitesparse")]
+#[test]
+fn sparse_suitesparse_matches_dense() {
+    let (row_ptr, col_idx, values) = sample_csr();
+    let view = CsrMatrixView::new_f64(3, 3, &row_ptr, &col_idx, &values).expect("csr view");
+    let rhs = dense_rhs();
+
+    let sparse = sparse_matmul(&view, &rhs).expect("suitesparse matmul");
+    let dense = {
+        let lhs = view.to_dense().expect("dense lhs");
+        core_matmul(&lhs, &rhs).expect("dense matmul")
+    };
+
+    assert_eq!(sparse.to_f64_vec(), dense.to_f64_vec());
+}
+
+#[cfg(feature = "sparse-suitesparse")]
+#[test]
+fn sparse_suitesparse_matvec_matches_dense() {
+    let (row_ptr, col_idx, values) = sample_csr();
+    let view = CsrMatrixView::new_f64(3, 3, &row_ptr, &col_idx, &values).expect("csr view");
+    let rhs = dense_rhs();
+
+    let sparse = sparse_matvec(&view, &rhs).expect("suitesparse matvec");
+    let dense = {
+        let lhs = view.to_dense().expect("dense lhs");
+        core_matmul(&lhs, &rhs).expect("dense matvec")
     };
 
     assert_eq!(sparse.to_f64_vec(), dense.to_f64_vec());
