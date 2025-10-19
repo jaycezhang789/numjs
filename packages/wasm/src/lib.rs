@@ -1,4 +1,6 @@
-use js_sys::{Error as JsError, Float32Array, Float64Array, Object, Reflect, Uint8Array};
+use js_sys::{
+    Error as JsError, Float32Array, Float64Array, Object, Reflect, Uint32Array, Uint8Array,
+};
 use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
 use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
@@ -9,15 +11,18 @@ use num_rs_core::{
     ifft2d as core_ifft2d, ifft_axis as core_ifft_axis, log as core_log, matmul as core_matmul,
     median as core_median, mul as core_mul, nanmean as core_nanmean, nansum as core_nansum,
     neg as core_neg, percentile as core_percentile, put as core_put, quantile as core_quantile,
-    scatter as core_scatter, scatter_pairs as core_scatter_pairs, sigmoid as core_sigmoid,
-    sin as core_sin, stack as core_stack, sub as core_sub, sum as core_sum, take as core_take,
-    tanh as core_tanh, transpose as core_transpose, where_select as core_where,
+    read_npy_matrix, scatter as core_scatter, scatter_pairs as core_scatter_pairs,
+    sigmoid as core_sigmoid, sin as core_sin, stack as core_stack, sub as core_sub,
+    sum as core_sum, take as core_take, tanh as core_tanh, transpose as core_transpose,
+    where_select as core_where, where_select_multi as core_where_multi, write_npy_matrix,
 };
+use num_rs_core::sparse::{self, CsrMatrixView};
 #[cfg(feature = "linalg")]
-use num_rs_core::{qr as core_qr, svd as core_svd};
+use num_rs_core::{eigen as core_eigen, qr as core_qr, solve as core_solve, svd as core_svd};
 use std::convert::TryFrom;
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 
 #[cfg(feature = "threads")]
 use std::sync::OnceLock;
@@ -250,6 +255,148 @@ fn convert_indices(indices: &[i32]) -> Result<Vec<isize>, JsValue> {
         .collect()
 }
 
+struct ParsedSparse {
+    rows: usize,
+    cols: usize,
+    dtype: DType,
+    row_ptr: Vec<u32>,
+    col_idx: Vec<u32>,
+    values_f32: Option<Vec<f32>>,
+    values_f64: Option<Vec<f64>>,
+}
+
+impl ParsedSparse {
+    fn view(&self) -> Result<CsrMatrixView<'_>, JsValue> {
+        match self.dtype {
+            DType::Float32 => {
+                let values = self
+                    .values_f32
+                    .as_ref()
+                    .ok_or_else(|| JsValue::from_str("Sparse payload missing float32 values"))?;
+                sparse::CsrMatrixView::new_f32(
+                    self.rows,
+                    self.cols,
+                    &self.row_ptr,
+                    &self.col_idx,
+                    values,
+                )
+                .map_err(|err| map_core_error(&err))
+            }
+            DType::Float64 => {
+                let values = self
+                    .values_f64
+                    .as_ref()
+                    .ok_or_else(|| JsValue::from_str("Sparse payload missing float64 values"))?;
+                sparse::CsrMatrixView::new_f64(
+                    self.rows,
+                    self.cols,
+                    &self.row_ptr,
+                    &self.col_idx,
+                    values,
+                )
+                .map_err(|err| map_core_error(&err))
+            }
+            other => Err(JsValue::from_str(&format!(
+                "Sparse payload dtype {:?} not yet supported",
+                other
+            ))),
+        }
+    }
+}
+
+fn parse_sparse_payload(payload: JsValue) -> Result<ParsedSparse, JsValue> {
+    let object: Object = payload
+        .dyn_into::<Object>()
+        .map_err(|_| JsValue::from_str("sparse_* payload must be an object"))?;
+    let rows = Reflect::get(&object, &JsValue::from_str("rows"))?
+        .as_f64()
+        .ok_or_else(|| JsValue::from_str("Sparse payload rows must be a number"))? as usize;
+    let cols = Reflect::get(&object, &JsValue::from_str("cols"))?
+        .as_f64()
+        .ok_or_else(|| JsValue::from_str("Sparse payload cols must be a number"))? as usize;
+    let dtype_str = Reflect::get(&object, &JsValue::from_str("dtype"))?
+        .as_string()
+        .ok_or_else(|| JsValue::from_str("Sparse payload dtype must be a string"))?;
+    let dtype = DType::from_str(&dtype_str).map_err(|err| JsValue::from_str(&err))?;
+    let row_ptr_value = Reflect::get(&object, &JsValue::from_str("rowPtr"))?;
+    let row_ptr_array = row_ptr_value
+        .dyn_into::<Uint32Array>()
+        .map_err(|_| JsValue::from_str("Sparse payload rowPtr must be a Uint32Array"))?;
+    let row_ptr = row_ptr_array.to_vec();
+    let col_idx_value = Reflect::get(&object, &JsValue::from_str("colIdx"))?;
+    let col_idx_array = col_idx_value
+        .dyn_into::<Uint32Array>()
+        .map_err(|_| JsValue::from_str("Sparse payload colIdx must be a Uint32Array"))?;
+    let col_idx = col_idx_array.to_vec();
+
+    let values_value = Reflect::get(&object, &JsValue::from_str("values"))?;
+    let (values_f32, values_f64) = match dtype {
+        DType::Float32 => {
+            let values_array = values_value
+                .dyn_into::<Float32Array>()
+                .map_err(|_| JsValue::from_str("Sparse payload values must be a Float32Array"))?;
+            (Some(values_array.to_vec()), None)
+        }
+        DType::Float64 => {
+            let values_array = values_value
+                .dyn_into::<Float64Array>()
+                .map_err(|_| JsValue::from_str("Sparse payload values must be a Float64Array"))?;
+            (None, Some(values_array.to_vec()))
+        }
+        other => {
+            return Err(JsValue::from_str(&format!(
+                "Sparse payload dtype {:?} not yet supported",
+                other
+            )))
+        }
+    };
+
+    if row_ptr.len() != rows + 1 {
+        return Err(JsValue::from_str(&format!(
+            "Sparse payload rowPtr length {} must equal rows + 1 ({})",
+            row_ptr.len(),
+            rows + 1
+        )));
+    }
+
+    if let Some(values) = values_f32.as_ref() {
+        if col_idx.len() != values.len() {
+            return Err(JsValue::from_str(&format!(
+                "Sparse payload colIdx length {} must match values length {}",
+                col_idx.len(),
+                values.len()
+            )));
+        }
+    }
+    if let Some(values) = values_f64.as_ref() {
+        if col_idx.len() != values.len() {
+            return Err(JsValue::from_str(&format!(
+                "Sparse payload colIdx length {} must match values length {}",
+                col_idx.len(),
+                values.len()
+            )));
+        }
+    }
+
+    Ok(ParsedSparse {
+        rows,
+        cols,
+        dtype,
+        row_ptr,
+        col_idx,
+        values_f32,
+        values_f64,
+    })
+}
+
+fn sparse_result_to_matrix(result: MatrixBuffer, target_dtype: &str) -> Result<Matrix, JsValue> {
+    let mut matrix = Matrix::from_buffer(result);
+    if matrix.dtype() != target_dtype {
+        matrix = matrix.astype(target_dtype.to_string(), Some(true), None::<String>)?;
+    }
+    Ok(matrix)
+}
+
 #[wasm_bindgen]
 pub fn add(a: &Matrix, b: &Matrix) -> Result<Matrix, JsValue> {
     map_matrix(core_add(a.buffer(), b.buffer()))
@@ -383,6 +530,27 @@ pub fn qr(matrix: &Matrix) -> Result<JsValue, JsValue> {
     Ok(obj.into())
 }
 
+#[cfg(feature = "linalg")]
+#[wasm_bindgen]
+pub fn solve(a: &Matrix, b: &Matrix) -> Result<Matrix, JsValue> {
+    core_solve(a.buffer(), b.buffer())
+        .map(Matrix::from_buffer)
+        .map_err(|err| map_core_error(&err))
+}
+
+#[cfg(feature = "linalg")]
+#[wasm_bindgen]
+pub fn eigen(matrix: &Matrix) -> Result<JsValue, JsValue> {
+    let (values, vectors) = core_eigen(matrix.buffer()).map_err(|err| map_core_error(&err))?;
+    let obj = Object::new();
+    let values_vec = values.to_f64_vec();
+    let values_js = JsValue::from(Float64Array::from(values_vec.as_slice()));
+    let vectors_js = JsValue::from(Matrix::from_buffer(vectors));
+    set_object_property(&obj, "values", values_js)?;
+    set_object_property(&obj, "vectors", vectors_js)?;
+    Ok(obj.into())
+}
+
 #[wasm_bindgen]
 pub fn row(matrix: &Matrix, index: i32) -> Result<Matrix, JsValue> {
     matrix
@@ -436,6 +604,8 @@ pub fn compress(mask: &Matrix, matrix: &Matrix) -> Result<Matrix, JsValue> {
         .map(Matrix::from_buffer)
         .map_err(|e| JsValue::from_str(&e))
 }
+
+#[wasm_bindgen]
 pub fn take(matrix: &Matrix, axis: usize, indices: Vec<i32>) -> Result<Matrix, JsValue> {
     let converted = convert_indices(&indices)?;
     map_matrix(core_take(matrix.buffer(), axis, &converted))
@@ -501,6 +671,62 @@ pub fn scatter_pairs(
         &cols,
         values.buffer(),
     ))
+}
+
+#[wasm_bindgen(js_name = "where_select_multi")]
+pub fn where_select_multi_wasm(
+    conditions: Box<[Matrix]>,
+    choices: Box<[Matrix]>,
+    default_value: Option<Matrix>,
+) -> Result<Matrix, JsValue> {
+    let condition_refs: Vec<&MatrixBuffer> = conditions.iter().map(|matrix| matrix.buffer()).collect();
+    let choice_refs: Vec<&MatrixBuffer> = choices.iter().map(|matrix| matrix.buffer()).collect();
+    let default_ref = default_value.as_ref().map(|matrix| matrix.buffer());
+    core_where_multi(&condition_refs, &choice_refs, default_ref)
+        .map(Matrix::from_buffer)
+        .map_err(|err| map_core_error(&err))
+}
+
+#[wasm_bindgen(js_name = "sparse_matmul")]
+pub fn sparse_matmul(payload: JsValue, dense: &Matrix) -> Result<Matrix, JsValue> {
+    let parsed = parse_sparse_payload(payload)?;
+    let view = parsed.view()?;
+    let result = sparse::sparse_matmul(&view, dense.buffer()).map_err(|err| map_core_error(&err))?;
+    let target_dtype = dense.dtype();
+    sparse_result_to_matrix(result, &target_dtype)
+}
+
+#[wasm_bindgen(js_name = "sparse_add")]
+pub fn sparse_add(payload: JsValue, dense: &Matrix) -> Result<Matrix, JsValue> {
+    let parsed = parse_sparse_payload(payload)?;
+    let view = parsed.view()?;
+    let result = sparse::sparse_add(&view, dense.buffer()).map_err(|err| map_core_error(&err))?;
+    let target_dtype = dense.dtype();
+    sparse_result_to_matrix(result, &target_dtype)
+}
+
+#[wasm_bindgen(js_name = "sparse_transpose")]
+pub fn sparse_transpose(payload: JsValue) -> Result<Matrix, JsValue> {
+    let parsed = parse_sparse_payload(payload)?;
+    let target_dtype = parsed.dtype.as_str().to_string();
+    let view = parsed.view()?;
+    let result = sparse::sparse_transpose(&view).map_err(|err| map_core_error(&err))?;
+    sparse_result_to_matrix(result, target_dtype.as_str())
+}
+
+#[wasm_bindgen]
+pub fn read_npy(data: Uint8Array) -> Result<Matrix, JsValue> {
+    let bytes = data.to_vec();
+    read_npy_matrix(bytes.as_slice())
+        .map(Matrix::from_buffer)
+        .map_err(|err| map_core_error(&err))
+}
+
+#[wasm_bindgen]
+pub fn write_npy(matrix: &Matrix) -> Result<Uint8Array, JsValue> {
+    write_npy_matrix(matrix.buffer())
+        .map(|bytes| Uint8Array::from(bytes.as_slice()))
+        .map_err(|err| map_core_error(&err))
 }
 
 #[wasm_bindgen]
