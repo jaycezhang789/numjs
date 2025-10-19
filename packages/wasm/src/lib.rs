@@ -1,4 +1,4 @@
-use js_sys::{Error as JsError, Float32Array, Float64Array, Reflect, Uint8Array};
+use js_sys::{Error as JsError, Float32Array, Float64Array, Object, Reflect, Uint8Array};
 use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
 use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
@@ -13,6 +13,8 @@ use num_rs_core::{
     sin as core_sin, stack as core_stack, sub as core_sub, sum as core_sum, take as core_take,
     tanh as core_tanh, transpose as core_transpose, where_select as core_where,
 };
+#[cfg(feature = "linalg")]
+use num_rs_core::{qr as core_qr, svd as core_svd};
 use std::convert::TryFrom;
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
@@ -346,6 +348,39 @@ pub fn transpose(matrix: &Matrix) -> Result<Matrix, JsValue> {
 #[wasm_bindgen(js_name = "broadcast_to")]
 pub fn broadcast_to(matrix: &Matrix, rows: usize, cols: usize) -> Result<Matrix, JsValue> {
     map_matrix(core_broadcast_to(matrix.buffer(), rows, cols))
+}
+
+#[cfg(feature = "linalg")]
+fn set_object_property(object: &Object, key: &str, value: JsValue) -> Result<(), JsValue> {
+    Reflect::set(object, &JsValue::from_str(key), &value)?;
+    Ok(())
+}
+
+#[cfg(feature = "linalg")]
+#[wasm_bindgen]
+pub fn svd(matrix: &Matrix) -> Result<JsValue, JsValue> {
+    let (u, s, vt) = core_svd(matrix.buffer()).map_err(|err| map_core_error(&err))?;
+    let obj = Object::new();
+    let u_js = JsValue::from(Matrix::from_buffer(u));
+    let sigma_vec = s.to_f64_vec();
+    let sigma_js = JsValue::from(Float64Array::from(sigma_vec.as_slice()));
+    let vt_js = JsValue::from(Matrix::from_buffer(vt));
+    set_object_property(&obj, "u", u_js)?;
+    set_object_property(&obj, "s", sigma_js)?;
+    set_object_property(&obj, "vt", vt_js)?;
+    Ok(obj.into())
+}
+
+#[cfg(feature = "linalg")]
+#[wasm_bindgen]
+pub fn qr(matrix: &Matrix) -> Result<JsValue, JsValue> {
+    let (q, r) = core_qr(matrix.buffer()).map_err(|err| map_core_error(&err))?;
+    let obj = Object::new();
+    let q_js = JsValue::from(Matrix::from_buffer(q));
+    let r_js = JsValue::from(Matrix::from_buffer(r));
+    set_object_property(&obj, "q", q_js)?;
+    set_object_property(&obj, "r", r_js)?;
+    Ok(obj.into())
 }
 
 #[wasm_bindgen]
