@@ -865,4 +865,45 @@ mod tests {
         let result = Matrix::from_bytes(raw, 2, 1, "fixed64".to_string());
         assert!(result.is_err());
     }
+
+    #[test]
+    fn parsed_sparse_view_rejects_row_ptr_length() {
+        let parsed = ParsedSparse {
+            rows: 3,
+            cols: 3,
+            dtype: DType::Float64,
+            row_ptr: vec![0, 1, 1],
+            col_idx: vec![0],
+            values_f32: None,
+            values_f64: Some(vec![1.0]),
+        };
+        let err = parsed.view().err().unwrap();
+        assert!(err.reason.contains("rowPtr"));
+    }
+
+    #[test]
+    fn parsed_sparse_view_rejects_col_idx_length() {
+        let parsed = ParsedSparse {
+            rows: 3,
+            cols: 3,
+            dtype: DType::Float32,
+            row_ptr: vec![0, 2, 4, 6],
+            col_idx: vec![0, 1, 2],
+            values_f32: Some(vec![1.0, 2.0]),
+            values_f64: None,
+        };
+        let err = parsed.view().err().unwrap();
+        assert!(err.reason.contains("colIdx"));
+    }
+
+    #[test]
+    fn sparse_result_respects_target_dtype() {
+        let dense = MatrixBuffer::from_vec(vec![1.0f64, 2.0, 3.0, 4.0], 2, 2).unwrap();
+        let matrix = sparse_result_to_matrix(dense, "float64").expect("matrix");
+        assert_eq!(matrix.dtype(), "float64");
+
+        let dense32 = MatrixBuffer::from_vec(vec![1.0f64, 2.0, 3.0, 4.0], 2, 2).unwrap();
+        let matrix32 = sparse_result_to_matrix(dense32, "float32").expect("matrix");
+        assert_eq!(matrix32.dtype(), "float32");
+    }
 }
