@@ -1,12 +1,12 @@
-# 文档索引
+# Documentation Index
 
-欢迎来到 `@jayce789/numjs` 的扩展文档。这里按主题提供深入教程、后端机制剖析以及 WebGPU 加速实践，所有材料均保持与最新包版本同步。
+Welcome to the extended documentation for `@jayce789/numjs`. The material is grouped by topic so you can deep dive into the subsystems you care about—backends, sparse support, WebGPU acceleration, and future roadmap items. Every guide is kept in sync with the latest published package.
 
-- **迁移指南**：[`从 NumPy 迁移指南`](./tutorials/from-numpy-migration.md) 帮助你快速把现有 Python 工作流搬到 JavaScript/TypeScript。
-- **后端原理与选择**：[`WASM 与 N-API 后端选择与原理`](./tutorials/backends.md) 解释双后端架构的设计哲学、加载流程与手动控制策略。
-- **WebGPU 加速篇**：[`WebGPU 加速篇`](./tutorials/webgpu.md) 展示如何结合浏览器/Node.js 的 GPU 能力提升矩阵算子吞吐。
-- **交互式文档**：在 [`StackBlitz/CodeSandbox 指南`](./interactive/README.md) 中体验在线 playground，并获取复制即跑的 demo 代码。
-- **锦上添花与未来探索**：[`Autograd 与随机分布路线图`](./future.md) 描述计划中的自动微分与随机分布功能。
-- **SparseMatrix 设计**：[`稀疏矩阵草案`](./design/sparse-matrix.md) 介绍 CSR 存储、稀疏算子 fallback 与 SuiteSparse 集成规划。
+- **Migration Guide** – [`From NumPy to NumJS`](./tutorials/from-numpy-migration.md) walks through the one-to-one API mapping and outlines a workflow for porting existing Python notebooks or services.
+- **Backend Architecture** – [`Choosing between WASM and N-API`](./tutorials/backends.md) explains how the dual-backend loader works, how the distribution packages are organised, and how to override the automatic detection.
+- **WebGPU Acceleration** – [`WebGPU Tutorial`](./tutorials/webgpu.md) shows how to initialise the experimental GPU pipeline in browsers or Node.js and how to chain GPU kernels effectively.
+- **Interactive Playground** – [`StackBlitz / CodeSandbox guide`](./interactive/README.md) lists ready-to-run sandboxes, the included demo scripts, and tips for sharing sessions with your team.
+- **Future Roadmap** – [`Autograd, Randomness, and more`](./future.md) describes planned features, design constraints, and how you can influence the prioritisation.
+- **Sparse Matrix Design** – [`SparseMatrix Architecture`](./design/sparse-matrix.md) documents the CSR-first data model, backend dispatch, and the SuiteSparse integration plan.
 
-> 文档建议与勘误欢迎通过 Issues 或 PR 提交，我们会在发版前统一校验。每篇教程下方也提供了与 `examples/` 目录对应的示例入口。
+> We welcome feedback and corrections through GitHub Issues or pull requests. Each guide links back to the relevant example in the `examples/` directory so you can try the code locally.

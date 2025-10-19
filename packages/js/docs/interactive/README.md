@@ -1,45 +1,45 @@
-# 交互式文档 & 在线 Playground
+# Interactive Documentation & Online Playground
 
-你可以通过 StackBlitz 或 CodeSandbox 即时体验 `@jayce789/numjs`，无需本地安装。我们提供了两个官方入口以及“复制即跑”的最小示例，方便你快速验证 API 或分享给团队成员。
+You can try `@jayce789/numjs` instantly on StackBlitz or CodeSandbox—no local setup required. The official sandboxes described below mirror the repository’s `examples/numjs-interactive` project, making it easy to experiment, share snippets, or reproduce bug reports.
 
 ## StackBlitz
 
-- **入口**：<https://stackblitz.com/github/jaycezhang789/numjs/tree/master/examples/numjs-interactive?file=src/main.ts&terminal=dev>
-- 预装依赖：`@jayce789/numjs`, `typescript`, `tslib`
-- 默认启动脚本：`pnpm dev`（Vite）
-- Playground 中包含以下面板：
-  - `src/main.ts`：展示矩阵创建、算子链式调用、后端信息输出。
-  - `autograd.ts`：新引入的自动微分示例，可查看梯度回传效果。
-  - `training.ts`：线性回归训练 demo，演示 SGD/Adam/RMSProp 优化器的实际更新过程。
-  - `webgpu.ts`：可选启用 WebGPU 加速，自动检测运行环境。
-  - `migration.ts`：与 NumPy API 映射的对照示例。
+- **Entry point**: <https://stackblitz.com/github/jaycezhang789/numjs/tree/master/examples/numjs-interactive?file=src/main.ts&terminal=dev>
+- Preinstalled dependencies: `@jayce789/numjs`, `typescript`, `tslib`
+- Default command: `pnpm dev` (Vite dev server)
+- Included panels:
+  - `src/main.ts` – matrix construction, chained operators, backend diagnostics.
+  - `autograd.ts` – early autograd prototype showcasing forward and backward passes.
+  - `training.ts` – linear regression training loop with SGD/Adam/RMSProp.
+  - `webgpu.ts` – optional WebGPU acceleration demo with environment detection.
+  - `migration.ts` – side-by-side NumPy → NumJS API mapping.
 
-> 第一次打开 Playground 时 StackBlitz 会自动执行 `pnpm install`，控制台出现 `"ready - server running..."` 后即可实时编辑并查看输出。
+> The first time StackBlitz loads the project it runs `pnpm install`. Once the console prints `ready - server running...`, edits refresh instantly.
 
 ## CodeSandbox
 
-- **入口**：<https://codesandbox.io/p/github/jaycezhang789/numjs/tree/master/examples/numjs-interactive>
-- 预设任务：
-  1. 执行 `pnpm install`
-  2. 启动 `pnpm dev`
-- 内置任务 `src/backends.ts` 示范如何手动指定 N-API / WASM / WebGPU。
-- 支持 Live Collaboration，可直接邀请队友在同一环境修改代码并观察输出。
+- **Entry point**: <https://codesandbox.io/p/github/jaycezhang789/numjs/tree/master/examples/numjs-interactive>
+- Preconfigured tasks:
+  1. `pnpm install`
+  2. `pnpm dev`
+- Highlight: `src/backends.ts` shows how to force N-API, WASM, or WebGPU backends at runtime.
+- Live collaboration is enabled—invite teammates to edit and observe output together.
 
-## 复制即跑的 Demo
+## Clone-and-run demo
 
 ```bash
 npx degit jaycezhang789/numjs/examples/numjs-interactive my-numjs-playground
 cd my-numjs-playground
-pnpm install   # 或 npm install / yarn
+pnpm install   # or npm install / yarn
 pnpm dev       # http://localhost:5173
 ```
 
-该 Demo 基于 Vite + TypeScript，结构与在线 Playground 完全一致。主要文件简介：
+This Vite + TypeScript project is identical to the online playgrounds. Key files:
 
-- `src/main.ts`：快速入门脚本，展示 `init()`, `Matrix`, `add`, `matmul`, `backendKind()` 的组合使用。
-- `src/backends.ts`：提供后端能力检测与手动切换示例。
-- `src/webgpu.ts`：演示 WebGPU 加速矩阵乘法与广播操作。
+- `src/main.ts` – quickstart script using `init()`, `Matrix`, `add`, `matmul`, and `backendKind()`.
+- `src/backends.ts` – backend capability inspection and manual selection.
+- `src/webgpu.ts` – WebGPU accelerated matmul and broadcast example.
 
-如需在 Node.js 纯后端环境运行，可参考 `scripts/node-demo.mjs`（同目录提供），执行 `pnpm node-demo` 或 `node scripts/node-demo.mjs` 即可。
+For a purely Node.js experience, run `node scripts/node-demo.mjs` (also available via `pnpm node-demo`).
 
-> 提示：在 StackBlitz/CodeSandbox 中运行 WebGPU 相关示例时，请使用支持 WebGPU 的现代浏览器（Chromium 113+）。
+> Tip: When running WebGPU demos in online sandboxes, use a modern browser with WebGPU enabled (Chromium 113+). Some sandboxes disable experimental APIs in embedded iframes; open the project in a dedicated tab if necessary.

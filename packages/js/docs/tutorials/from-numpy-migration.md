@@ -1,73 +1,76 @@
-# 从 NumPy 迁移指南
+# Migrating from NumPy to NumJS
 
-> 目标读者：已经熟悉 Python/NumPy，希望将现有科学计算或数据处理代码迁移到 JavaScript/TypeScript 与 `@jayce789/numjs` 的开发者。
+> Audience: engineers who already rely on Python + NumPy and want to port data-processing or numerical workloads to TypeScript/JavaScript using `@jayce789/numjs`.
 
-## 核心理念对齐
+The goal of this guide is to map familiar NumPy concepts to their NumJS equivalents, highlight the practical differences (initialisation, async loading, typing), and provide copy-pasteable examples for the most common migration scenarios.
 
-| NumPy | NumJS (`@jayce789/numjs`) | 备注 |
+## Conceptual mapping
+
+| NumPy concept | NumJS equivalent | Notes |
 | --- | --- | --- |
-| `numpy.ndarray` | `Matrix` | 默认存储为列主序（column-major），便于与 BLAS/LAPACK 互操作。 |
-| `dtype` | `DType` | 名称一致：`float32/float64/int32/...`。`fixed64` 是 numjs 特有的十进制定点格式。 |
-| Broadcasting | `broadcastTo`, 自动广播规则 | 与 NumPy 一致，严格检查维度。 |
-| UFunc | 顶层函数（如 `add`, `exp`, `sin`） | 大多数标量/矩阵算子覆盖；更多函数持续补充。 |
-| 视图 / Copy-on-write | 默认延迟复制 | 仅在需要保留旧数据时进行 copy，节省内存。 |
+| `numpy.ndarray` | `Matrix` | Stored column-major to interoperate efficiently with BLAS/LAPACK. Same semantics as a 2‑D ndarray. |
+| `dtype` | `DType` | Names match (`float32`, `float64`, `int32`, …). NumJS adds `fixed64` for decimal fixed-point. |
+| Broadcasting | `broadcastTo`, implicit broadcasting in elementwise ops | Follows NumPy’s rules exactly; dimension mismatches surface as `E_SHAPE_MISMATCH`. |
+| UFuncs | Top-level helpers (`add`, `exp`, `sin`, …) | Most scalar/matrix operators have a direct equivalent. Missing functions can often be expressed via `map` or pending work in the roadmap. |
+| Views / copy-on-write | Lazy copy semantics | Operations return lightweight views when safe; explicit copying is available via `clone()` or `Matrix.from`. |
 
-## 迁移步骤速览
+## Migration checklist
 
-1. **梳理数据入口**：确认数据是从文件、网络还是内存中生成，决定是否需要 `readNpy`, `matrixFromBytes`, `new Matrix(typedArray, rows, cols)` 等入口。
-2. **映射线性代数操作**：`matmul`, `svd`, `qr`, `solve` 等与 NumPy 接口保持一致，通常仅需替换命名。
-3. **处理异步初始化**：NumJS 需要 `await init()` 以加载 N-API 或 WebAssembly 后端，可在顶层 `async` 函数或框架启动阶段调用。
-4. **类型系统对接**：在 TypeScript 中，函数签名可声明为 `Matrix | Float64Array` 等联合类型，配合 `matrix.dtype` 判别具体实现。
-5. **测试与校验**：使用 `allClose` 替换 NumPy 的 `assert_allclose`，并重用公差 `DEFAULT_RTOL`, `DEFAULT_ATOL`。
+1. **Identify data sources** – Decide whether inputs come from files, network responses, or typed arrays. Pick the appropriate constructor (`readNpy`, `matrixFromBytes`, `new Matrix(typedArray, rows, cols)`).
+2. **Port linear algebra kernels** – `matmul`, `svd`, `qr`, `solve`, `pinv` mirror NumPy 1:1. Most changes are mechanical renames.
+3. **Handle asynchronous initialisation** – Call `await init()` once near process start to load the backend (N-API or WASM). This is often the biggest structural change compared to Python.
+4. **Add TypeScript typings** – Annotate functions to accept `Matrix` or plain typed arrays. Inspect `matrix.dtype` when branching on behaviour.
+5. **Recreate test coverage** – Replace `numpy.testing.assert_allclose` with `allClose(matrixA, matrixB, rtol, atol)`. Defaults `DEFAULT_RTOL` and `DEFAULT_ATOL` match NumPy’s double precision.
 
 ```ts
-// numpy: c = numpy.matmul(a, b) + bias
+// NumPy: c = numpy.matmul(a, b) + bias
 import { init, Matrix, matmul, add } from "@jayce789/numjs";
 
 await init();
 
-const a = new Matrix([1, 2, 3, 4], 2, 2);
-const b = new Matrix([5, 6, 7, 8], 2, 2);
-const bias = new Matrix([1, 1, 1, 1], 2, 2);
+const a = Matrix.fromArray([1, 2, 3, 4], { rows: 2, cols: 2 });
+const b = Matrix.fromArray([5, 6, 7, 8], { rows: 2, cols: 2 });
+const bias = Matrix.full(2, 2, 1);
 
 const c = add(matmul(a, b.transpose()), bias);
 console.log(c.toArray()); // Float64Array [20, 27, 32, 43]
 ```
 
-## 常见迁移场景
+## Typical migration scenarios
 
-### 1. NPY / NPZ 文件读取
+### 1. Loading `.npy` / `.npz` files
 
-- 使用 `readNpy` 或 `readNpz`（多矩阵）读取由 NumPy 导出的二进制文件。
-- 浏览器环境需确保 `.npy` 文件以 `ArrayBuffer` 形式获取后再传递给 NumJS。
+- Use `readNpy` or `readNpz` from `@jayce789/numjs/io`. Both functions accept `Uint8Array` buffers and return `Matrix` instances while preserving dtype and shape.
+- In browsers, fetch the file as an `ArrayBuffer` before passing it to the loader.
 
 ```ts
 import { readNpy } from "@jayce789/numjs/io";
+
 const buffer = await fetch("/weights.fc1.npy").then(r => r.arrayBuffer());
 const matrix = readNpy(new Uint8Array(buffer));
 ```
 
-### 2. Pandas / Arrow 数据互通
+### 2. Interoperating with Pandas / Arrow data
 
-- 推荐使用 `apache-arrow` 或 `nodejs-polars` 作为桥梁：先把 DataFrame 转为 TypedArray，再构建 `Matrix`。
-- 对于列式数据，可直接复用底层 `Float64Array`，避免额外复制。
+- Bridge through Apache Arrow or Polars: convert columns to typed arrays, then wrap them using `Matrix.fromArray`.
+- When the dataset is columnar, you can reuse the underlying `Float64Array` without copying, which keeps migration costs low.
 
-### 3. SciPy 线性代数迁移
+### 3. Replacing SciPy linear algebra
 
-- `solve`, `qr`, `svd`, `eigen` 等操作由 Rust/BLAS 支持，接口设计保持 NumPy 风格。
-- 若依赖稀疏矩阵或 FFT，可在过渡期将相关部分保留在 Python，通过 WebSocket / WASM worker 进行远程调用，逐步替换。
+- `solve`, `qr`, `svd`, `eigen`, and related operations are implemented in Rust on top of vendor BLAS. Their signatures mirror NumPy for drop-in replacement.
+- For features still missing (e.g. sparse solvers, FFT beyond the current coverage) you can keep the Python implementation temporarily and call it via a service or worker until the NumJS equivalent lands.
 
-## 性能调优建议
+## Performance tips
 
-- **优先使用 N-API 后端**：在 Node.js 环境中默认加载原生 `.node`，与 Python C 扩展性能接近。
-- **批量操作**：合并小矩阵运算，减少 FFI 往返；`stack` / `concat` 可帮助组批。
-- **避免频繁 `toArray()`**：只在需要与第三方库交互时输出数据，内部计算保持 `Matrix` 类型。
-- **固定随机种子**：NumJS 提供 `seedRandom` 以便重现实验。
+- **Prefer the N-API backend** – On Node.js, the native module offers performance comparable to NumPy’s C extensions. Ensure your deployment includes the platform package (`@jayce789/numjs-linux-x64`, etc.).
+- **Batch operations** – Group small matrix operations to reduce FFI round trips. Utilities such as `stack` and `concat` help vectorise workloads.
+- **Avoid repeated `toArray()`** – Keep results as `Matrix` until you genuinely need a typed array for interoperability.
+- **Deterministic randomness** – Use `seedRandom` (or module-specific seeders) to reproduce experiments after migration.
 
-## 参考资源
+## Additional resources
 
-- StackBlitz Demo：见 [交互式文档](../interactive/README.md)。
-- GitHub `examples/`：`examples/numjs-interactive/src/migration.ts` 展示从 NumPy 脚本移植的端到端案例。
-- 常见问题可搜索仓库 Discussions 或开启 Issue。
+- Interactive playgrounds: see the [StackBlitz and CodeSandbox guide](../interactive/README.md) for ready-to-run environments.
+- Repository examples: `examples/numjs-interactive/src/migration.ts` contains an end-to-end port of a NumPy script.
+- Join the discussion: search existing issues/discussions for migration topics or open a new thread with your findings.
 
-迁移过程中若发现 API 或性能差异，欢迎反馈，我们会在后续版本中优先修复。
+If you encounter API gaps or performance regressions during migration, please file an issue—we treat migration blockers as high priority.
