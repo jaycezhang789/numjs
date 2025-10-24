@@ -78,16 +78,23 @@ pub fn reduce_sum_f32(values: &[f32]) -> CoreResult<f32> {
 #[cfg(feature = "gpu-cuda")]
 mod cuda {
     use super::*;
-    use cudarc::driver::{CudaContext, CudaFunction, CudaModule, LaunchConfig};
-    use cudarc::nvrtc::compile_ptx;
+    use cudarc::cublas::sys::cublasOperation_t;
+    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+    use cudarc::driver::{CudaDevice, CudaFunction, LaunchConfig};
+    use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
     use once_cell::sync::Lazy;
+    use std::collections::BTreeSet;
+    use std::os::raw::c_int;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
-    /// Kernel launch uses a fixed block size that matches the shared memory
-    /// allocation inside `reduce_sum_f32`.
+    const MODULE_NAME: &str = "numjs_cuda_core";
+    /// Must stay in sync with the CUB block size used in `reduce_sum_f32`.
     const THREADS_PER_BLOCK: u32 = 256;
 
     const CUDA_KERNEL_SOURCE: &str = r#"
+#include <cub/block/block_reduce.cuh>
+
 extern "C" __global__ void matmul_f32(
     const float* __restrict__ lhs,
     const float* __restrict__ rhs,
@@ -113,55 +120,79 @@ extern "C" __global__ void reduce_sum_f32(
     float* __restrict__ output,
     int length
 ) {
-    // blockDim.x is limited to 256 on the host side so this shared array is safe.
-    __shared__ float shared[256];
-    int tid = threadIdx.x;
-    int block_size = blockDim.x;
-    int grid_size = block_size * gridDim.x;
-    int index = blockIdx.x * blockDim.x + tid;
-    float total = 0.0f;
-    while (index < length) {
-        total += input[index];
-        index += grid_size;
+    using BlockReduce = cub::BlockReduce<float, 256>;
+    __shared__ typename BlockReduce::TempStorage storage;
+    float thread_sum = 0.0f;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    while (idx < length) {
+        thread_sum += input[idx];
+        idx += stride;
     }
-    shared[tid] = total;
-    __syncthreads();
-    for (int stride = block_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared[tid] += shared[tid + stride];
-        }
-        __syncthreads();
-    }
-    if (tid == 0) {
-        atomicAdd(output, shared[0]);
+    float block_sum = BlockReduce(storage).Sum(thread_sum);
+    if (threadIdx.x == 0) {
+        atomicAdd(output, block_sum);
     }
 }
 "#;
 
     struct CudaState {
-        ctx: Arc<CudaContext>,
-        module: Arc<CudaModule>,
-        matmul: Arc<CudaFunction>,
-        reduce: Arc<CudaFunction>,
+        device: Arc<CudaDevice>,
+        blas: Arc<CudaBlas>,
+        reduce: CudaFunction,
+        matmul_fallback: Option<CudaFunction>,
     }
 
     static CUDA_STATE: Lazy<Result<CudaState, String>> = Lazy::new(|| {
-        let ctx = CudaContext::new(0).map_err(|err| err.to_string())?;
-        let ptx = compile_ptx(CUDA_KERNEL_SOURCE).map_err(|err| err.to_string())?;
-        let module = ctx.load_module(ptx).map_err(|err| err.to_string())?;
-        let matmul = module
-            .load_function("matmul_f32")
+        let device = CudaDevice::new(0).map_err(|err| err.to_string())?;
+        let blas = CudaBlas::new(device.clone()).map_err(|err| err.to_string())?;
+        let ptx = compile_cuda_module()?;
+        device
+            .load_ptx(ptx, MODULE_NAME, &["matmul_f32", "reduce_sum_f32"])
             .map_err(|err| err.to_string())?;
-        let reduce = module
-            .load_function("reduce_sum_f32")
-            .map_err(|err| err.to_string())?;
+        let reduce = device
+            .get_func(MODULE_NAME, "reduce_sum_f32")
+            .ok_or_else(|| "cuda reduce kernel not found".to_string())?;
+        let matmul_fallback = device.get_func(MODULE_NAME, "matmul_f32");
         Ok(CudaState {
-            ctx,
-            module,
-            matmul: Arc::new(matmul),
-            reduce: Arc::new(reduce),
+            device,
+            blas: Arc::new(blas),
+            reduce,
+            matmul_fallback,
         })
     });
+
+    fn compile_cuda_module() -> Result<cudarc::nvrtc::Ptx, String> {
+        let mut opts = CompileOptions::default();
+        opts.include_paths = cuda_include_paths();
+        opts.use_fast_math = Some(true);
+        match compile_ptx_with_opts(CUDA_KERNEL_SOURCE, opts) {
+            Ok(ptx) => Ok(ptx),
+            Err(CompileError::CompileError { log, .. }) => {
+                Err(format!("nvrtc compile failed: {}", log.to_string_lossy()))
+            }
+            Err(err) => Err(format!("nvrtc compile failed: {err:?}")),
+        }
+    }
+
+    fn cuda_include_paths() -> Vec<String> {
+        let mut paths = BTreeSet::new();
+        for key in ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"] {
+            if let Ok(base) = std::env::var(key) {
+                let candidate = PathBuf::from(&base).join("include");
+                if candidate.exists() {
+                    paths.insert(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+        if let Ok(path) = std::env::var("CUDA_INC_PATH") {
+            let candidate = PathBuf::from(path);
+            if candidate.exists() {
+                paths.insert(candidate.to_string_lossy().into_owned());
+            }
+        }
+        paths.into_iter().collect()
+    }
 
     fn resolve_state() -> Result<&'static CudaState, String> {
         CUDA_STATE.as_ref().map_err(|err| err.clone())
@@ -194,19 +225,21 @@ extern "C" __global__ void reduce_sum_f32(
             .checked_mul(k)
             .ok_or_else(|| "cuda matmul: lhs dimension overflow".to_string())?;
         if a.len() != lhs_elems {
-            return Err(
-                format!("cuda matmul: lhs length mismatch (expected {lhs_elems}, got {})", a.len())
-                    .into(),
-            );
+            return Err(format!(
+                "cuda matmul: lhs length mismatch (expected {lhs_elems}, got {})",
+                a.len()
+            )
+            .into());
         }
         let rhs_elems = k
             .checked_mul(n)
             .ok_or_else(|| "cuda matmul: rhs dimension overflow".to_string())?;
         if b.len() != rhs_elems {
-            return Err(
-                format!("cuda matmul: rhs length mismatch (expected {rhs_elems}, got {})", b.len())
-                    .into(),
-            );
+            return Err(format!(
+                "cuda matmul: rhs length mismatch (expected {rhs_elems}, got {})",
+                b.len()
+            )
+            .into());
         }
         let total_elems = m
             .checked_mul(n)
@@ -223,31 +256,56 @@ extern "C" __global__ void reduce_sum_f32(
             .map_err(|_| "cuda matmul: k dimension exceeds i32::MAX".to_string())?;
         let n_i32 = i32::try_from(n)
             .map_err(|_| "cuda matmul: n dimension exceeds i32::MAX".to_string())?;
-        let stream = state.ctx.default_stream();
-        let a_dev = stream
-            .memcpy_stod(a)
-            .map_err(|err| format!("cuda memcpy_stod(lhs): {err}"))?;
-        let b_dev = stream
-            .memcpy_stod(b)
-            .map_err(|err| format!("cuda memcpy_stod(rhs): {err}"))?;
-        let mut c_dev = stream
+
+        let device = &state.device;
+        let a_dev = device
+            .htod_sync_copy(a)
+            .map_err(|err| format!("cuda htod_sync_copy(lhs): {err}"))?;
+        let b_dev = device
+            .htod_sync_copy(b)
+            .map_err(|err| format!("cuda htod_sync_copy(rhs): {err}"))?;
+        let mut c_dev = device
             .alloc_zeros::<f32>(total_elems)
             .map_err(|err| format!("cuda alloc_zeros(out): {err}"))?;
-        let cfg = launch_config_for_len(total_elems)?;
-        let mut launch = stream.launch_builder(&state.matmul);
-        launch.arg(&a_dev);
-        launch.arg(&b_dev);
-        launch.arg(&mut c_dev);
-        launch.arg(&m_i32);
-        launch.arg(&k_i32);
-        launch.arg(&n_i32);
-        unsafe { launch.launch(cfg) }.map_err(|err| format!("cuda matmul launch failed: {err}"))?;
-        stream
+
+        let gemm_cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n_i32 as c_int,
+            n: m_i32 as c_int,
+            k: k_i32 as c_int,
+            alpha: 1.0f32,
+            lda: n_i32 as c_int,
+            ldb: k_i32 as c_int,
+            beta: 0.0f32,
+            ldc: n_i32 as c_int,
+        };
+
+        let blas = &state.blas;
+        if let Err(err) = unsafe { blas.gemm(gemm_cfg, &b_dev, &a_dev, &mut c_dev) }
+            .map_err(|err| format!("cuda cublas sgemm failed: {err}"))
+        {
+            if let Some(kernel) = state.matmul_fallback.as_ref() {
+                let cfg = launch_config_for_len(total_elems)?;
+                unsafe {
+                    kernel
+                        .clone()
+                        .launch(cfg, (&a_dev, &b_dev, &mut c_dev, m_i32, k_i32, n_i32))
+                }
+                .map_err(|launch_err| {
+                    format!("cuda matmul fallback launch failed: {launch_err}")
+                })?;
+            } else {
+                return Err(err.into());
+            }
+        }
+
+        device
             .synchronize()
-            .map_err(|err| format!("cuda stream synchronize: {err}"))?;
-        let host = stream
-            .memcpy_dtov(&c_dev)
-            .map_err(|err| format!("cuda memcpy_dtov(out): {err}"))?;
+            .map_err(|err| format!("cuda device synchronize: {err}"))?;
+        let host = device
+            .dtoh_sync_copy(&c_dev)
+            .map_err(|err| format!("cuda dtoh(out): {err}"))?;
         Ok(host)
     }
 
@@ -259,27 +317,29 @@ extern "C" __global__ void reduce_sum_f32(
             return Err("cuda reduce: input length exceeds i32::MAX".into());
         }
         let state = resolve_state()?;
-        let stream = state.ctx.default_stream();
-        let input_dev = stream
-            .memcpy_stod(values)
-            .map_err(|err| format!("cuda memcpy_stod(input): {err}"))?;
-        let mut output_dev = stream
+        let device = &state.device;
+        let input_dev = device
+            .htod_sync_copy(values)
+            .map_err(|err| format!("cuda htod_sync_copy(input): {err}"))?;
+        let mut output_dev = device
             .alloc_zeros::<f32>(1)
             .map_err(|err| format!("cuda alloc_zeros(sum): {err}"))?;
         let cfg = launch_config_for_len(values.len())?;
-        let mut launch = stream.launch_builder(&state.reduce);
-        launch.arg(&input_dev);
-        launch.arg(&mut output_dev);
         let len_i32 = i32::try_from(values.len())
             .map_err(|_| "cuda reduce: input length exceeds i32::MAX".to_string())?;
-        launch.arg(&len_i32);
-        unsafe { launch.launch(cfg) }.map_err(|err| format!("cuda reduce launch failed: {err}"))?;
-        stream
+        unsafe {
+            state
+                .reduce
+                .clone()
+                .launch(cfg, (&input_dev, &mut output_dev, len_i32))
+        }
+        .map_err(|err| format!("cuda reduce launch failed: {err}"))?;
+        device
             .synchronize()
-            .map_err(|err| format!("cuda stream synchronize: {err}"))?;
-        let host = stream
-            .memcpy_dtov(&output_dev)
-            .map_err(|err| format!("cuda memcpy_dtov(sum): {err}"))?;
+            .map_err(|err| format!("cuda device synchronize: {err}"))?;
+        let host = device
+            .dtoh_sync_copy(&output_dev)
+            .map_err(|err| format!("cuda dtoh(sum): {err}"))?;
         Ok(host[0])
     }
 }
