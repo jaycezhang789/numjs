@@ -83,6 +83,10 @@ mod cuda {
     use once_cell::sync::Lazy;
     use std::sync::Arc;
 
+    /// Kernel launch uses a fixed block size that matches the shared memory
+    /// allocation inside `reduce_sum_f32`.
+    const THREADS_PER_BLOCK: u32 = 256;
+
     const CUDA_KERNEL_SOURCE: &str = r#"
 extern "C" __global__ void matmul_f32(
     const float* __restrict__ lhs,
@@ -109,6 +113,7 @@ extern "C" __global__ void reduce_sum_f32(
     float* __restrict__ output,
     int length
 ) {
+    // blockDim.x is limited to 256 on the host side so this shared array is safe.
     __shared__ float shared[256];
     int tid = threadIdx.x;
     int block_size = blockDim.x;
@@ -166,14 +171,58 @@ extern "C" __global__ void reduce_sum_f32(
         CUDA_STATE.is_ok()
     }
 
+    fn launch_config_for_len(len: usize) -> Result<LaunchConfig, String> {
+        let threads_per_block = THREADS_PER_BLOCK as usize;
+        let blocks = if len == 0 {
+            0
+        } else {
+            ((len - 1) / threads_per_block) + 1
+        };
+        if blocks > u32::MAX as usize {
+            return Err("cuda launch: grid dimension overflow".into());
+        }
+        Ok(LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (THREADS_PER_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+
     pub fn matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> CoreResult<Vec<f32>> {
         let state = resolve_state()?;
-        if a.len() != m * k {
-            return Err("cuda matmul: lhs length mismatch".into());
+        let lhs_elems = m
+            .checked_mul(k)
+            .ok_or_else(|| "cuda matmul: lhs dimension overflow".to_string())?;
+        if a.len() != lhs_elems {
+            return Err(
+                format!("cuda matmul: lhs length mismatch (expected {lhs_elems}, got {})", a.len())
+                    .into(),
+            );
         }
-        if b.len() != k * n {
-            return Err("cuda matmul: rhs length mismatch".into());
+        let rhs_elems = k
+            .checked_mul(n)
+            .ok_or_else(|| "cuda matmul: rhs dimension overflow".to_string())?;
+        if b.len() != rhs_elems {
+            return Err(
+                format!("cuda matmul: rhs length mismatch (expected {rhs_elems}, got {})", b.len())
+                    .into(),
+            );
         }
+        let total_elems = m
+            .checked_mul(n)
+            .ok_or_else(|| "cuda matmul: output dimension overflow".to_string())?;
+        if total_elems > i32::MAX as usize {
+            return Err("cuda matmul: output element count exceeds i32::MAX".into());
+        }
+        if total_elems == 0 {
+            return Ok(Vec::new());
+        }
+        let m_i32 = i32::try_from(m)
+            .map_err(|_| "cuda matmul: m dimension exceeds i32::MAX".to_string())?;
+        let k_i32 = i32::try_from(k)
+            .map_err(|_| "cuda matmul: k dimension exceeds i32::MAX".to_string())?;
+        let n_i32 = i32::try_from(n)
+            .map_err(|_| "cuda matmul: n dimension exceeds i32::MAX".to_string())?;
         let stream = state.ctx.default_stream();
         let a_dev = stream
             .memcpy_stod(a)
@@ -182,16 +231,13 @@ extern "C" __global__ void reduce_sum_f32(
             .memcpy_stod(b)
             .map_err(|err| format!("cuda memcpy_stod(rhs): {err}"))?;
         let mut c_dev = stream
-            .alloc_zeros::<f32>(m * n)
+            .alloc_zeros::<f32>(total_elems)
             .map_err(|err| format!("cuda alloc_zeros(out): {err}"))?;
-        let cfg = LaunchConfig::for_num_elems((m * n) as u32);
+        let cfg = launch_config_for_len(total_elems)?;
         let mut launch = stream.launch_builder(&state.matmul);
         launch.arg(&a_dev);
         launch.arg(&b_dev);
         launch.arg(&mut c_dev);
-        let m_i32 = m as i32;
-        let k_i32 = k as i32;
-        let n_i32 = n as i32;
         launch.arg(&m_i32);
         launch.arg(&k_i32);
         launch.arg(&n_i32);
@@ -209,6 +255,9 @@ extern "C" __global__ void reduce_sum_f32(
         if values.is_empty() {
             return Ok(0.0);
         }
+        if values.len() > i32::MAX as usize {
+            return Err("cuda reduce: input length exceeds i32::MAX".into());
+        }
         let state = resolve_state()?;
         let stream = state.ctx.default_stream();
         let input_dev = stream
@@ -217,11 +266,12 @@ extern "C" __global__ void reduce_sum_f32(
         let mut output_dev = stream
             .alloc_zeros::<f32>(1)
             .map_err(|err| format!("cuda alloc_zeros(sum): {err}"))?;
-        let cfg = LaunchConfig::for_num_elems(values.len() as u32);
+        let cfg = launch_config_for_len(values.len())?;
         let mut launch = stream.launch_builder(&state.reduce);
         launch.arg(&input_dev);
         launch.arg(&mut output_dev);
-        let len_i32 = values.len() as i32;
+        let len_i32 = i32::try_from(values.len())
+            .map_err(|_| "cuda reduce: input length exceeds i32::MAX".to_string())?;
         launch.arg(&len_i32);
         unsafe { launch.launch(cfg) }.map_err(|err| format!("cuda reduce launch failed: {err}"))?;
         stream
