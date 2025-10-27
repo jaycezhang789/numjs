@@ -35,8 +35,11 @@ use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
 use nalgebra::{DMatrix, SymmetricEigen};
 
 pub use compress::compress;
+pub use gpu::NanPolicy;
 pub use error::codes;
 pub use metrics::{copy_bytes_total, reset_copy_bytes, take_copy_bytes};
+#[cfg(feature = "gpu-cuda")]
+pub use gpu::{matmul_batched_f32_strided_device, matmul_f32_ex_device};
 pub use sparse::{sparse_add, sparse_matmul, sparse_matvec, sparse_transpose, CsrMatrixView};
 pub type CoreResult<T> = Result<T, String>;
 
