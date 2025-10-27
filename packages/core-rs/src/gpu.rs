@@ -393,6 +393,50 @@ extern "C" __global__ void argmax_stage1_ignore_nan(const float* __restrict__ in
     }
 }
 
+extern "C" __global__ void argmax_stage_reduce(const float* __restrict__ values_in,
+                                               const int* __restrict__ idx_in,
+                                               float* __restrict__ values_out,
+                                               int* __restrict__ idx_out,
+                                               int length) {
+    __shared__ float smax[BLOCK_SIZE];
+    __shared__ int sidx[BLOCK_SIZE];
+    int tid = threadIdx.x;
+    int global = blockIdx.x * blockDim.x + tid;
+    int stride = blockDim.x * gridDim.x;
+    float best_val = -INFINITY;
+    int best_idx = -1;
+    for (int idx = global; idx < length; idx += stride) {
+        float v = values_in[idx];
+        int i = idx_in[idx];
+        if (i >= 0) {
+            if (best_idx < 0 || v > best_val || (v == best_val && i < best_idx)) {
+                best_val = v;
+                best_idx = i;
+            }
+        }
+    }
+    smax[tid] = best_val;
+    sidx[tid] = best_idx;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = smax[tid + s];
+            int oi = sidx[tid + s];
+            float cv = smax[tid];
+            int ci = sidx[tid];
+            if (oi >= 0 && (ci < 0 || ov > cv || (ov == cv && oi < ci))) {
+                smax[tid] = ov;
+                sidx[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        values_out[blockIdx.x] = smax[0];
+        idx_out[blockIdx.x] = sidx[0];
+    }
+}
+
 extern "C" __global__ void first_nan_index_stage1(const float* __restrict__ input,
                                                   int* __restrict__ pmin,
                                                   int length) {
@@ -422,6 +466,36 @@ extern "C" __global__ void first_nan_index_stage1(const float* __restrict__ inpu
         pmin[blockIdx.x] = smin[0];
     }
 }
+
+extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
+                                                  int* __restrict__ partial,
+                                                  int length) {
+    __shared__ int smin[BLOCK_SIZE];
+    int tid = threadIdx.x;
+    int global = blockIdx.x * blockDim.x + tid;
+    int stride = blockDim.x * gridDim.x;
+    int best = length;
+    for (int idx = global; idx < length; idx += stride) {
+        int v = input[idx];
+        if (v < best) {
+            best = v;
+        }
+    }
+    smin[tid] = best;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            int other = smin[tid + s];
+            if (other < smin[tid]) {
+                smin[tid] = other;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial[blockIdx.x] = smin[0];
+    }
+}
 "#;
 
     pub fn is_available() -> bool {
@@ -441,16 +515,9 @@ extern "C" __global__ void first_nan_index_stage1(const float* __restrict__ inpu
         trans_a: bool,
         trans_b: bool,
     ) -> Result<GemmConfig<f32>, String> {
-        let to_i32 = |x: usize| -> Result<i32, String> {
-            if x > i32::MAX as usize {
-                Err("gemm dims exceed i32".into())
-            } else {
-                Ok(x as i32)
-            }
-        };
-        let m_i = to_i32(m)?;
-        let n_i = to_i32(n)?;
-        let k_i = to_i32(k)?;
+        let m_i = usize_to_i32("gemm m", m)?;
+        let n_i = usize_to_i32("gemm n", n)?;
+        let k_i = usize_to_i32("gemm k", k)?;
         let transa_cublas =
             if trans_b { cublasOperation_t::CUBLAS_OP_T } else { cublasOperation_t::CUBLAS_OP_N };
         let transb_cublas =
@@ -517,6 +584,55 @@ extern "C" __global__ void first_nan_index_stage1(const float* __restrict__ inpu
 
     fn path_to_string(path: &PathBuf) -> String {
         path.to_string_lossy().into_owned()
+    }
+
+    const REDUCE_BLOCK_DIM: u32 = 256;
+    const REDUCE_BLOCK_DIM_USIZE: usize = REDUCE_BLOCK_DIM as usize;
+
+    fn usize_to_i32(label: &str, value: usize) -> Result<i32, String> {
+        if value > i32::MAX as usize {
+            Err(format!("{label}: {value} exceeds i32::MAX"))
+        } else {
+            Ok(value as i32)
+        }
+    }
+
+    fn usize_to_i64(label: &str, value: usize) -> Result<i64, String> {
+        if value > i64::MAX as usize {
+            Err(format!("{label}: {value} exceeds i64::MAX"))
+        } else {
+            Ok(value as i64)
+        }
+    }
+
+    fn blocks_for_len(label: &str, len: usize) -> Result<u32, String> {
+        if len == 0 {
+            return Ok(1);
+        }
+        let adjusted = len
+            .checked_add(REDUCE_BLOCK_DIM_USIZE - 1)
+            .ok_or_else(|| format!("{label}: length overflow computing grid dim"))?;
+        let blocks = adjusted / REDUCE_BLOCK_DIM_USIZE;
+        if blocks == 0 {
+            return Ok(1);
+        }
+        if blocks > u32::MAX as usize {
+            return Err(format!("{label}: grid_dim.x exceeds u32::MAX"));
+        }
+        Ok(blocks as u32)
+    }
+
+    fn checked_stride_product(label: &str, stride: i64, count: usize) -> Result<usize, String> {
+        if stride < 0 {
+            return Err(format!("{label}: negative stride {stride} not supported"));
+        }
+        let product = (stride as u128)
+            .checked_mul(count as u128)
+            .ok_or_else(|| format!("{label}: stride overflow"))?;
+        if product > usize::MAX as u128 {
+            return Err(format!("{label}: stride product exceeds usize::MAX"));
+        }
+        Ok(product as usize)
     }
 
     pub fn matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> CoreResult<Vec<f32>> {
@@ -588,9 +704,9 @@ extern "C" __global__ void first_nan_index_stage1(const float* __restrict__ inpu
             n,
             trans_a,
             trans_b,
-            a_each as i64,
-            b_each as i64,
-            c_each as i64,
+            usize_to_i64("matmul_batched_f32 stride_a", a_each)?,
+            usize_to_i64("matmul_batched_f32 stride_b", b_each)?,
+            usize_to_i64("matmul_batched_f32 stride_c", c_each)?,
         )
     }
 
@@ -607,10 +723,11 @@ extern "C" __global__ void first_nan_index_stage1(const float* __restrict__ inpu
         stride_b: i64,
         stride_c: i64,
     ) -> CoreResult<Vec<f32>> {
-        let a_need = stride_a.checked_mul(batch as i64).ok_or("stride overflow")?;
-        let b_need = stride_b.checked_mul(batch as i64).ok_or("stride overflow")?;
-        let c_need = stride_c.checked_mul(batch as i64).ok_or("stride overflow")? as usize;
-        if (a.len() as i64) < a_need || (b.len() as i64) < b_need {
+        let batch_i32 = usize_to_i32("matmul_batched_f32_strided batch", batch)?;
+        let a_need = checked_stride_product("matmul_batched_f32_strided stride_a", stride_a, batch)?;
+        let b_need = checked_stride_product("matmul_batched_f32_strided stride_b", stride_b, batch)?;
+        let c_need = checked_stride_product("matmul_batched_f32_strided stride_c", stride_c, batch)?;
+        if a.len() < a_need || b.len() < b_need {
             return Err("matmul_batched_f32_strided: buffer too small for given stride".into());
         }
         let ctx = CudaContext::new(0).map_err(|e| format!("cuda: {:?}", e))?;
@@ -628,7 +745,7 @@ extern "C" __global__ void first_nan_index_stage1(const float* __restrict__ inpu
         let gemm_cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
         let cfg = StridedBatchedConfig::<f32> {
             gemm: gemm_cfg,
-            batch_size: batch as i32,
+            batch_size: batch_i32,
             stride_a: stride_b,
             stride_b: stride_a,
             stride_c,
@@ -689,9 +806,10 @@ extern "C" __global__ void first_nan_index_stage1(const float* __restrict__ inpu
         }
         let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
         let gemm_cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
+        let batch_i32 = usize_to_i32("matmul_batched_f32_strided_device batch", batch)?;
         let cfg = StridedBatchedConfig::<f32> {
             gemm: gemm_cfg,
-            batch_size: batch as i32,
+            batch_size: batch_i32,
             stride_a: stride_b,
             stride_b: stride_a,
             stride_c,
@@ -710,32 +828,39 @@ extern "C" __global__ void first_nan_index_stage1(const float* __restrict__ inpu
         let func = module
             .load_function("reduce_sum_stage1")
             .map_err(|e| format!("get func: {:?}", e))?;
-        let block: u32 = 256;
-        let blocks = ((n as u32 + block - 1) / block).max(1);
-        let d_in = stream
+        let mut current = stream
             .memcpy_stod(values)
             .map_err(|e| format!("htod: {:?}", e))?;
-        let mut tmp: CudaSlice<f32> = stream
-            .alloc_zeros(blocks as usize)
-            .map_err(|e| format!("alloc tmp: {:?}", e))?;
-        let cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (block, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&func)
-                .arg(&d_in)
-                .arg(&mut tmp)
-                .arg(&((n as i32)))
-                .launch(cfg)
+        let mut current_len = n;
+        loop {
+            let len_i32 = usize_to_i32("reduce_sum length", current_len)?;
+            let blocks = blocks_for_len("reduce_sum length", current_len)?;
+            let mut next: CudaSlice<f32> = stream
+                .alloc_zeros(blocks as usize)
+                .map_err(|e| format!("alloc tmp: {:?}", e))?;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (REDUCE_BLOCK_DIM, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&func)
+                    .arg(&current)
+                    .arg(&mut next)
+                    .arg(&len_i32)
+                    .launch(cfg)
+            }
+            .map_err(|e| format!("launch reduce_sum: {:?}", e))?;
+            if blocks == 1 {
+                let host = stream
+                    .memcpy_dtov(&next)
+                    .map_err(|e| format!("dtoh: {:?}", e))?;
+                return Ok(host.into_iter().next().unwrap_or(0.0));
+            }
+            current = next;
+            current_len = blocks as usize;
         }
-        .map_err(|e| format!("launch: {:?}", e))?;
-        let host = stream
-            .memcpy_dtov(&tmp)
-            .map_err(|e| format!("dtoh: {:?}", e))?;
-        Ok(host.into_iter().sum())
     }
 
     pub fn reduce_max_f32_with_policy(values: &[f32], policy: NanPolicy) -> CoreResult<f32> {
@@ -743,82 +868,106 @@ extern "C" __global__ void first_nan_index_stage1(const float* __restrict__ inpu
         if n == 0 {
             return Err("reduce_max on empty slice".into());
         }
+        if matches!(policy, NanPolicy::Ignore) && !values.iter().any(|v| !v.is_nan()) {
+            return Ok(f32::NAN);
+        }
         let ctx = CudaContext::new(0).map_err(|e| format!("cuda: {:?}", e))?;
         let stream = ctx.default_stream();
         let module = load_reduce_module(&ctx)?;
         let k_max = module
             .load_function("reduce_max_stage1_ignore_nan")
             .map_err(|e| format!("get func: {:?}", e))?;
-        let k_nan = module
-            .load_function("first_nan_index_stage1")
-            .map_err(|e| format!("get func: {:?}", e))?;
-        let block: u32 = 256;
-        let d_in = stream
+        let mut current = stream
             .memcpy_stod(values)
             .map_err(|e| format!("htod: {:?}", e))?;
         if matches!(policy, NanPolicy::Propagate) {
-            let blocks = ((n as u32 + block - 1) / block).max(1);
-            let mut tmp_nan = stream
-                .alloc_zeros::<i32>(blocks as usize)
+            let k_nan = module
+                .load_function("first_nan_index_stage1")
+                .map_err(|e| format!("get func: {:?}", e))?;
+            let k_nan_reduce = module
+                .load_function("min_index_stage_reduce")
+                .map_err(|e| format!("get func: {:?}", e))?;
+            let nan_blocks = blocks_for_len("reduce_max first_nan length", n)?;
+            let mut nan_current = stream
+                .alloc_zeros::<i32>(nan_blocks as usize)
                 .map_err(|e| format!("alloc tmp_nan: {:?}", e))?;
+            let len_i32 = usize_to_i32("reduce_max first_nan length", n)?;
             let cfg = LaunchConfig {
-                grid_dim: (blocks, 1, 1),
-                block_dim: (block, 1, 1),
+                grid_dim: (nan_blocks, 1, 1),
+                block_dim: (REDUCE_BLOCK_DIM, 1, 1),
                 shared_mem_bytes: 0,
             };
             unsafe {
                 stream
                     .launch_builder(&k_nan)
-                    .arg(&d_in)
-                    .arg(&mut tmp_nan)
-                    .arg(&((n as i32)))
+                    .arg(&current)
+                    .arg(&mut nan_current)
+                    .arg(&len_i32)
                     .launch(cfg)
             }
             .map_err(|e| format!("launch first_nan: {:?}", e))?;
-            let host = stream
-                .memcpy_dtov(&tmp_nan)
-                .map_err(|e| format!("dtoh: {:?}", e))?;
-            let mut min_idx = n as i32;
-            for v in host {
-                if v < min_idx {
-                    min_idx = v;
+            let mut nan_len = nan_blocks as usize;
+            while nan_len > 1 {
+                let blocks = blocks_for_len("reduce_max first_nan partial length", nan_len)?;
+                let mut next_nan = stream
+                    .alloc_zeros::<i32>(blocks as usize)
+                    .map_err(|e| format!("alloc next_nan: {:?}", e))?;
+                let len_i32 = usize_to_i32("reduce_max first_nan partial length", nan_len)?;
+                let cfg = LaunchConfig {
+                    grid_dim: (blocks, 1, 1),
+                    block_dim: (REDUCE_BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    stream
+                        .launch_builder(&k_nan_reduce)
+                        .arg(&nan_current)
+                        .arg(&mut next_nan)
+                        .arg(&len_i32)
+                        .launch(cfg)
                 }
+                .map_err(|e| format!("launch min_index_reduce: {:?}", e))?;
+                nan_current = next_nan;
+                nan_len = blocks as usize;
             }
-            if min_idx < n as i32 {
+            let host = stream
+                .memcpy_dtov(&nan_current)
+                .map_err(|e| format!("dtoh: {:?}", e))?;
+            let min_idx = host.into_iter().next().unwrap_or(n as i32);
+            if min_idx >= 0 && (min_idx as usize) < n {
                 return Ok(f32::NAN);
             }
         }
-        let blocks = ((n as u32 + block - 1) / block).max(1);
-        let mut tmp = stream
-            .alloc_zeros::<f32>(blocks as usize)
-            .map_err(|e| format!("alloc tmp: {:?}", e))?;
-        let cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (block, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&k_max)
-                .arg(&d_in)
-                .arg(&mut tmp)
-                .arg(&((n as i32)))
-                .launch(cfg)
-        }
-        .map_err(|e| format!("launch max: {:?}", e))?;
-        let host = stream
-            .memcpy_dtov(&tmp)
-            .map_err(|e| format!("dtoh: {:?}", e))?;
-        let mut max_val = f32::NEG_INFINITY;
-        for v in host {
-            if v > max_val {
-                max_val = v;
+        let mut current_len = n;
+        loop {
+            let len_i32 = usize_to_i32("reduce_max length", current_len)?;
+            let blocks = blocks_for_len("reduce_max length", current_len)?;
+            let mut next = stream
+                .alloc_zeros::<f32>(blocks as usize)
+                .map_err(|e| format!("alloc tmp: {:?}", e))?;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (REDUCE_BLOCK_DIM, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&k_max)
+                    .arg(&current)
+                    .arg(&mut next)
+                    .arg(&len_i32)
+                    .launch(cfg)
             }
-        }
-        if matches!(policy, NanPolicy::Ignore) && !values.iter().any(|v| !v.is_nan()) {
-            Ok(f32::NAN)
-        } else {
-            Ok(max_val)
+            .map_err(|e| format!("launch max: {:?}", e))?;
+            if blocks == 1 {
+                let host = stream
+                    .memcpy_dtov(&next)
+                    .map_err(|e| format!("dtoh: {:?}", e))?;
+                let max_val = host.into_iter().next().unwrap_or(f32::NEG_INFINITY);
+                return Ok(max_val);
+            }
+            current = next;
+            current_len = blocks as usize;
         }
     }
 
@@ -827,88 +976,141 @@ extern "C" __global__ void first_nan_index_stage1(const float* __restrict__ inpu
         if n == 0 {
             return Err("argmax on empty slice".into());
         }
+        if matches!(policy, NanPolicy::Ignore) && !values.iter().any(|v| !v.is_nan()) {
+            return Ok(0);
+        }
         let ctx = CudaContext::new(0).map_err(|e| format!("cuda: {:?}", e))?;
         let stream = ctx.default_stream();
         let module = load_reduce_module(&ctx)?;
         let k_argmax = module
             .load_function("argmax_stage1_ignore_nan")
             .map_err(|e| format!("get func: {:?}", e))?;
-        let k_nan = module
-            .load_function("first_nan_index_stage1")
-            .map_err(|e| format!("get func: {:?}", e))?;
-        let block: u32 = 256;
-        let d_in = stream
+        let current = stream
             .memcpy_stod(values)
             .map_err(|e| format!("htod: {:?}", e))?;
         if matches!(policy, NanPolicy::Propagate) {
-            let blocks = ((n as u32 + block - 1) / block).max(1);
-            let mut tmp_nan = stream
-                .alloc_zeros::<i32>(blocks as usize)
+            let k_nan = module
+                .load_function("first_nan_index_stage1")
+                .map_err(|e| format!("get func: {:?}", e))?;
+            let k_nan_reduce = module
+                .load_function("min_index_stage_reduce")
+                .map_err(|e| format!("get func: {:?}", e))?;
+            let nan_blocks = blocks_for_len("argmax first_nan length", n)?;
+            let mut nan_current = stream
+                .alloc_zeros::<i32>(nan_blocks as usize)
                 .map_err(|e| format!("alloc tmp_nan: {:?}", e))?;
+            let len_i32 = usize_to_i32("argmax first_nan length", n)?;
             let cfg = LaunchConfig {
-                grid_dim: (blocks, 1, 1),
-                block_dim: (block, 1, 1),
+                grid_dim: (nan_blocks, 1, 1),
+                block_dim: (REDUCE_BLOCK_DIM, 1, 1),
                 shared_mem_bytes: 0,
             };
             unsafe {
                 stream
                     .launch_builder(&k_nan)
-                    .arg(&d_in)
-                    .arg(&mut tmp_nan)
-                    .arg(&((n as i32)))
+                    .arg(&current)
+                    .arg(&mut nan_current)
+                    .arg(&len_i32)
                     .launch(cfg)
             }
             .map_err(|e| format!("launch first_nan: {:?}", e))?;
-            let host = stream
-                .memcpy_dtov(&tmp_nan)
-                .map_err(|e| format!("dtoh: {:?}", e))?;
-            let mut min_idx = n as i32;
-            for v in host {
-                if v < min_idx {
-                    min_idx = v;
+            let mut nan_len = nan_blocks as usize;
+            while nan_len > 1 {
+                let blocks = blocks_for_len("argmax first_nan partial length", nan_len)?;
+                let mut next_nan = stream
+                    .alloc_zeros::<i32>(blocks as usize)
+                    .map_err(|e| format!("alloc next_nan: {:?}", e))?;
+                let len_i32 = usize_to_i32("argmax first_nan partial length", nan_len)?;
+                let cfg = LaunchConfig {
+                    grid_dim: (blocks, 1, 1),
+                    block_dim: (REDUCE_BLOCK_DIM, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    stream
+                        .launch_builder(&k_nan_reduce)
+                        .arg(&nan_current)
+                        .arg(&mut next_nan)
+                        .arg(&len_i32)
+                        .launch(cfg)
                 }
+                .map_err(|e| format!("launch min_index_reduce: {:?}", e))?;
+                nan_current = next_nan;
+                nan_len = blocks as usize;
             }
-            if min_idx < n as i32 {
+            let host = stream
+                .memcpy_dtov(&nan_current)
+                .map_err(|e| format!("dtoh: {:?}", e))?;
+            let min_idx = host.into_iter().next().unwrap_or(n as i32);
+            if min_idx >= 0 && (min_idx as usize) < n {
                 return Ok(min_idx as usize);
             }
         }
-        let blocks = ((n as u32 + block - 1) / block).max(1);
-        let mut pmax = stream
+        let len_i32 = usize_to_i32("argmax length", n)?;
+        let mut blocks = blocks_for_len("argmax length", n)?;
+        let mut vals = stream
             .alloc_zeros::<f32>(blocks as usize)
             .map_err(|e| format!("alloc pmax: {:?}", e))?;
-        let mut pidx = stream
+        let mut idxs = stream
             .alloc_zeros::<i32>(blocks as usize)
             .map_err(|e| format!("alloc pidx: {:?}", e))?;
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
-            block_dim: (block, 1, 1),
+            block_dim: (REDUCE_BLOCK_DIM, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe {
             stream
                 .launch_builder(&k_argmax)
-                .arg(&d_in)
-                .arg(&mut pmax)
-                .arg(&mut pidx)
-                .arg(&((n as i32)))
+                .arg(&current)
+                .arg(&mut vals)
+                .arg(&mut idxs)
+                .arg(&len_i32)
                 .launch(cfg)
         }
-        .map_err(|e| format!("launch argmax: {:?}", e))?;
-        let hv = stream
-            .memcpy_dtov(&pmax)
-            .map_err(|e| format!("dtoh: {:?}", e))?;
-        let hi = stream
-            .memcpy_dtov(&pidx)
-            .map_err(|e| format!("dtoh: {:?}", e))?;
-        let mut best_val = f32::NEG_INFINITY;
-        let mut best_idx: i32 = -1;
-        for (val, idx) in hv.into_iter().zip(hi.into_iter()) {
-            if idx >= 0 && (best_idx < 0 || val > best_val || (val == best_val && idx < best_idx)) {
-                best_val = val;
-                best_idx = idx;
+        .map_err(|e| format!("launch argmax stage1: {:?}", e))?;
+        let k_argmax_reduce = module
+            .load_function("argmax_stage_reduce")
+            .map_err(|e| format!("get func: {:?}", e))?;
+        let mut current_len = blocks as usize;
+        while current_len > 1 {
+            blocks = blocks_for_len("argmax partial length", current_len)?;
+            let mut next_vals = stream
+                .alloc_zeros::<f32>(blocks as usize)
+                .map_err(|e| format!("alloc next_vals: {:?}", e))?;
+            let mut next_idxs = stream
+                .alloc_zeros::<i32>(blocks as usize)
+                .map_err(|e| format!("alloc next_idxs: {:?}", e))?;
+            let len_i32 = usize_to_i32("argmax partial length", current_len)?;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (REDUCE_BLOCK_DIM, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&k_argmax_reduce)
+                    .arg(&vals)
+                    .arg(&idxs)
+                    .arg(&mut next_vals)
+                    .arg(&mut next_idxs)
+                    .arg(&len_i32)
+                    .launch(cfg)
             }
+            .map_err(|e| format!("launch argmax reduce: {:?}", e))?;
+            vals = next_vals;
+            idxs = next_idxs;
+            current_len = blocks as usize;
         }
-        Ok(if best_idx < 0 { 0usize } else { best_idx as usize })
+        let hi = stream
+            .memcpy_dtov(&idxs)
+            .map_err(|e| format!("dtoh: {:?}", e))?;
+        let best_idx = hi.into_iter().next().unwrap_or(-1);
+        if best_idx < 0 {
+            Ok(0)
+        } else {
+            Ok(best_idx as usize)
+        }
     }
 }
 
