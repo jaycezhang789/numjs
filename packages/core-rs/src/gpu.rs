@@ -166,13 +166,24 @@ pub fn argmax_f32_with_policy(values: &[f32], policy: NanPolicy) -> CoreResult<u
 }
 
 pub fn matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> CoreResult<Vec<f32>> {
+    matmul_f32_with_policy(a, b, m, k, n, MatmulTensorCorePolicy::Accuracy)
+}
+
+pub fn matmul_f32_with_policy(
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    policy: MatmulTensorCorePolicy,
+) -> CoreResult<Vec<f32>> {
     if a.len() != m.saturating_mul(k) || b.len() != k.saturating_mul(n) {
         return Err("matmul_f32: shape mismatch".into());
     }
     #[cfg(feature = "gpu-cuda")]
     {
         if cuda::is_available() {
-            return cuda::matmul_f32(a, b, m, k, n);
+            return cuda::matmul_f32_with_policy(a, b, m, k, n, policy);
         }
     }
     Ok(matmul_cpu(a, b, m, k, n))
@@ -874,6 +885,7 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         Ok(product as usize)
     }
 
+    #[allow(dead_code)]
     pub fn matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> CoreResult<Vec<f32>> {
         matmul_f32_ex_with_policy(
             a,
@@ -885,6 +897,17 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
             false,
             MatmulTensorCorePolicy::Accuracy,
         )
+    }
+
+    pub fn matmul_f32_with_policy(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        policy: MatmulTensorCorePolicy,
+    ) -> CoreResult<Vec<f32>> {
+        matmul_f32_ex_with_policy(a, b, m, k, n, false, false, policy)
     }
 
     #[allow(dead_code)]

@@ -8,7 +8,7 @@ use napi_derive::napi;
 use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
 use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
-use num_rs_core::gpu;
+use num_rs_core::gpu::{self, MatmulTensorCorePolicy};
 use num_rs_core::sparse::{self, CsrMatrixView};
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
@@ -256,8 +256,29 @@ pub fn gpu_backend_kind() -> Option<String> {
     gpu::backend_name().map(|kind| kind.to_string())
 }
 
+fn parse_tensor_core_policy(policy: Option<String>) -> Result<MatmulTensorCorePolicy> {
+    let default_policy = MatmulTensorCorePolicy::Performance;
+    let Some(value) = policy else {
+        return Ok(default_policy);
+    };
+    let normalized = value.trim().to_ascii_lowercase();
+    let policy = match normalized.as_str() {
+        "" => default_policy,
+        "accuracy" => MatmulTensorCorePolicy::Accuracy,
+        "performance" => MatmulTensorCorePolicy::Performance,
+        "float16" | "fp16" => MatmulTensorCorePolicy::Float16,
+        "bfloat16" | "bf16" => MatmulTensorCorePolicy::BFloat16,
+        other => {
+            return Err(Error::from_reason(format!(
+                "gpu_matmul: unknown tensorCorePolicy '{other}'"
+            )));
+        }
+    };
+    Ok(policy)
+}
+
 #[napi]
-pub fn gpu_matmul(a: &Matrix, b: &Matrix) -> Result<Matrix> {
+pub fn gpu_matmul(a: &Matrix, b: &Matrix, tensor_core_policy: Option<String>) -> Result<Matrix> {
     if let Some(_kind) = gpu::active_backend_kind() {
         let rows = a.rows() as usize;
         let shared = a.cols() as usize;
@@ -272,7 +293,8 @@ pub fn gpu_matmul(a: &Matrix, b: &Matrix) -> Result<Matrix> {
         let rhs = ensure_float32_buffer(b.buffer())?;
         let lhs_view = lhs.try_as_slice::<f32>().map_err(map_core_error)?;
         let rhs_view = rhs.try_as_slice::<f32>().map_err(map_core_error)?;
-        match gpu::matmul_f32(lhs_view, rhs_view, rows, shared, cols) {
+        let policy = parse_tensor_core_policy(tensor_core_policy)?;
+        match gpu::matmul_f32_with_policy(lhs_view, rhs_view, rows, shared, cols, policy) {
             Ok(values) => {
                 let buffer = MatrixBuffer::from_vec(values, rows, cols).map_err(map_core_error)?;
                 return Ok(Matrix::from_buffer(buffer));

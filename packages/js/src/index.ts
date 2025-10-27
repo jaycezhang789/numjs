@@ -62,8 +62,11 @@ export type WebGpuInitOptions = {
   forceFallback?: boolean;
 };
 
+export type MatmulTensorCorePolicy = "accuracy" | "performance" | "float16" | "bfloat16";
+
 export type GpuMatmulOptions = {
   mode?: GpuExecutionMode;
+  tensorCorePolicy?: MatmulTensorCorePolicy;
 };
 
 export type Conv2DOptions = {
@@ -2097,10 +2100,12 @@ export async function matmulAsync(
       (backend as Record<string, unknown>).gpuMatmul;
     if (typeof nativeGpuMatmul === "function") {
       try {
-        const handle = (nativeGpuMatmul as (lhs: BackendMatrixHandle, rhs: BackendMatrixHandle) => BackendMatrixHandle)(
-          getHandle(a),
-          getHandle(b)
-        );
+        const tensorCorePolicy = options.tensorCorePolicy ?? "performance";
+        const handle = (nativeGpuMatmul as (
+          lhs: BackendMatrixHandle,
+          rhs: BackendMatrixHandle,
+          policy?: MatmulTensorCorePolicy
+        ) => BackendMatrixHandle)(getHandle(a), getHandle(b), tensorCorePolicy);
         const dtype = getMatrixDTypeFromHandle(handle) ?? "float32";
         const metadata =
           dtype === "fixed64"
