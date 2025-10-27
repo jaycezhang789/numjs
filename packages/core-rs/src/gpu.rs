@@ -47,6 +47,24 @@ pub enum NanPolicy {
     Propagate,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum MatmulTensorCorePolicy {
+    /// 优先精度，保持 FP32 计算路径（默认）
+    Accuracy,
+    /// 优先性能，在支持的硬件上启用 TF32 Tensor Core（cuBLASLt）
+    Performance,
+    /// 强制使用 FP16 Tensor Core（主机侧转换后执行）
+    Float16,
+    /// 强制使用 BF16 Tensor Core（主机侧转换后执行）
+    BFloat16,
+}
+
+impl Default for MatmulTensorCorePolicy {
+    fn default() -> Self {
+        MatmulTensorCorePolicy::Accuracy
+    }
+}
+
 pub fn reduce_sum_f32(values: &[f32]) -> CoreResult<f32> {
     #[cfg(feature = "gpu-cuda")]
     {
@@ -169,10 +187,32 @@ pub fn matmul_f32_ex(
     trans_a: bool,
     trans_b: bool,
 ) -> CoreResult<Vec<f32>> {
+    matmul_f32_ex_with_policy(
+        a,
+        b,
+        m,
+        k,
+        n,
+        trans_a,
+        trans_b,
+        MatmulTensorCorePolicy::Accuracy,
+    )
+}
+
+pub fn matmul_f32_ex_with_policy(
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    trans_a: bool,
+    trans_b: bool,
+    policy: MatmulTensorCorePolicy,
+) -> CoreResult<Vec<f32>> {
     #[cfg(feature = "gpu-cuda")]
     {
         if cuda::is_available() {
-            return cuda::matmul_f32_ex(a, b, m, k, n, trans_a, trans_b);
+            return cuda::matmul_f32_ex_with_policy(a, b, m, k, n, trans_a, trans_b, policy);
         }
     }
     Ok(matmul_cpu_ex(a, b, m, k, n, trans_a, trans_b))
@@ -188,10 +228,36 @@ pub fn matmul_batched_f32(
     trans_a: bool,
     trans_b: bool,
 ) -> CoreResult<Vec<f32>> {
+    matmul_batched_f32_with_policy(
+        a,
+        b,
+        batch,
+        m,
+        k,
+        n,
+        trans_a,
+        trans_b,
+        MatmulTensorCorePolicy::Accuracy,
+    )
+}
+
+pub fn matmul_batched_f32_with_policy(
+    a: &[f32],
+    b: &[f32],
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    trans_a: bool,
+    trans_b: bool,
+    policy: MatmulTensorCorePolicy,
+) -> CoreResult<Vec<f32>> {
     #[cfg(feature = "gpu-cuda")]
     {
         if cuda::is_available() {
-            return cuda::matmul_batched_f32(a, b, batch, m, k, n, trans_a, trans_b);
+            return cuda::matmul_batched_f32_with_policy(
+                a, b, batch, m, k, n, trans_a, trans_b, policy,
+            );
         }
     }
     let mut out = vec![0.0f32; batch.saturating_mul(m.saturating_mul(n))];
@@ -221,11 +287,41 @@ pub fn matmul_batched_f32_strided(
     stride_b: i64,
     stride_c: i64,
 ) -> CoreResult<Vec<f32>> {
+    matmul_batched_f32_strided_with_policy(
+        a,
+        b,
+        batch,
+        m,
+        k,
+        n,
+        trans_a,
+        trans_b,
+        stride_a,
+        stride_b,
+        stride_c,
+        MatmulTensorCorePolicy::Accuracy,
+    )
+}
+
+pub fn matmul_batched_f32_strided_with_policy(
+    a: &[f32],
+    b: &[f32],
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    trans_a: bool,
+    trans_b: bool,
+    stride_a: i64,
+    stride_b: i64,
+    stride_c: i64,
+    policy: MatmulTensorCorePolicy,
+) -> CoreResult<Vec<f32>> {
     #[cfg(feature = "gpu-cuda")]
     {
         if cuda::is_available() {
-            return cuda::matmul_batched_f32_strided(
-                a, b, batch, m, k, n, trans_a, trans_b, stride_a, stride_b, stride_c,
+            return cuda::matmul_batched_f32_strided_with_policy(
+                a, b, batch, m, k, n, trans_a, trans_b, stride_a, stride_b, stride_c, policy,
             );
         }
     }
@@ -283,14 +379,16 @@ fn matmul_cpu_ex(
 #[cfg(feature = "gpu-cuda")]
 mod cuda {
     use super::CoreResult;
-    use crate::gpu::NanPolicy;
+    use crate::gpu::{MatmulTensorCorePolicy, NanPolicy};
     use cudarc::cublas::sys::cublasOperation_t;
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
+    use cudarc::cublaslt::safe::{CudaBlasLT, Matmul, MatmulConfig};
     use cudarc::driver::{
         CudaContext, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig,
         PushKernelArg,
     };
     use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+    use half::{bf16, f16};
     use std::{collections::HashSet, env, fs, path::PathBuf, sync::Arc};
 
     const REDUCE_KERNEL_SRC: &str = r#"
@@ -586,6 +684,147 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         path.to_string_lossy().into_owned()
     }
 
+    fn build_cublaslt_config_row_major(
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> Result<MatmulConfig, String> {
+        let gemm = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
+        Ok(MatmulConfig {
+            transa: gemm.transa == cublasOperation_t::CUBLAS_OP_T,
+            transb: gemm.transb == cublasOperation_t::CUBLAS_OP_T,
+            transc: false,
+            m: gemm.m as u64,
+            n: gemm.n as u64,
+            k: gemm.k as u64,
+            alpha: gemm.alpha,
+            lda: gemm.lda as i64,
+            ldb: gemm.ldb as i64,
+            beta: gemm.beta,
+            ldc: gemm.ldc as i64,
+            stride_a: None,
+            stride_b: None,
+            stride_c: None,
+            stride_bias: None,
+            batch_size: None,
+        })
+    }
+
+    fn build_cublaslt_config_row_major_strided(
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+        batch: usize,
+        stride_a: i64,
+        stride_b: i64,
+        stride_c: i64,
+    ) -> Result<MatmulConfig, String> {
+        let mut cfg = build_cublaslt_config_row_major(m, k, n, trans_a, trans_b)?;
+        cfg.stride_a = Some(stride_b);
+        cfg.stride_b = Some(stride_a);
+        cfg.stride_c = Some(stride_c);
+        cfg.batch_size = Some(usize_to_i32("cublasLt batch size", batch)?);
+        Ok(cfg)
+    }
+
+    fn ensure_no_alias<T, A, B, Cc>(
+        stream: &Arc<CudaStream>,
+        a: &A,
+        b: &B,
+        c: &mut Cc,
+        label: &str,
+    ) -> Result<(), String>
+    where
+        A: DevicePtr<T> + ?Sized,
+        B: DevicePtr<T> + ?Sized,
+        Cc: DevicePtrMut<T> + ?Sized,
+    {
+        let (ap, _) = a.device_ptr(stream);
+        let (bp, _) = b.device_ptr(stream);
+        let (cp, _) = c.device_ptr_mut(stream);
+        if cp == ap || cp == bp {
+            Err(format!("{label}: output aliases input"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn launch_cublaslt_f32<I, Cc>(
+        stream: Arc<CudaStream>,
+        a: &I,
+        b: &I,
+        c: &mut Cc,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> Result<(), String>
+    where
+        I: DevicePtr<f32>,
+        Cc: DevicePtrMut<f32>,
+    {
+        let cfg = build_cublaslt_config_row_major(m, k, n, trans_a, trans_b)?;
+        let blas_lt = CudaBlasLT::new(stream.clone()).map_err(|e| format!("cublasLt: {:?}", e))?;
+        unsafe {
+            <CudaBlasLT as Matmul<f32>>::matmul(&blas_lt, cfg, b, a, c, None, None)
+                .map_err(|e| format!("cublasLt matmul: {:?}", e))
+        }
+    }
+
+    fn launch_cublaslt_f32_strided<I, Cc>(
+        stream: Arc<CudaStream>,
+        a: &I,
+        b: &I,
+        c: &mut Cc,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+        stride_a: i64,
+        stride_b: i64,
+        stride_c: i64,
+    ) -> Result<(), String>
+    where
+        I: DevicePtr<f32>,
+        Cc: DevicePtrMut<f32>,
+    {
+        let cfg = build_cublaslt_config_row_major_strided(
+            m, k, n, trans_a, trans_b, batch, stride_a, stride_b, stride_c,
+        )?;
+        let blas_lt = CudaBlasLT::new(stream.clone()).map_err(|e| format!("cublasLt: {:?}", e))?;
+        unsafe {
+            <CudaBlasLT as Matmul<f32>>::matmul(&blas_lt, cfg, b, a, c, None, None)
+                .map_err(|e| format!("cublasLt matmul: {:?}", e))
+        }
+    }
+
+    fn launch_cublaslt_half<T, I, Cc>(
+        stream: Arc<CudaStream>,
+        a: &I,
+        b: &I,
+        c: &mut Cc,
+        cfg: MatmulConfig,
+    ) -> Result<(), String>
+    where
+        T: 'static,
+        I: DevicePtr<T>,
+        Cc: DevicePtrMut<T>,
+        CudaBlasLT: Matmul<T>,
+    {
+        let blas_lt = CudaBlasLT::new(stream.clone()).map_err(|e| format!("cublasLt: {:?}", e))?;
+        unsafe {
+            <CudaBlasLT as Matmul<T>>::matmul(&blas_lt, cfg, b, a, c, None, None)
+                .map_err(|e| format!("cublasLt matmul: {:?}", e))
+        }
+    }
+
     const REDUCE_BLOCK_DIM: u32 = 256;
     const REDUCE_BLOCK_DIM_USIZE: usize = REDUCE_BLOCK_DIM as usize;
 
@@ -636,9 +875,19 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
     }
 
     pub fn matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> CoreResult<Vec<f32>> {
-        matmul_f32_ex(a, b, m, k, n, false, false)
+        matmul_f32_ex_with_policy(
+            a,
+            b,
+            m,
+            k,
+            n,
+            false,
+            false,
+            MatmulTensorCorePolicy::Accuracy,
+        )
     }
 
+    #[allow(dead_code)]
     pub fn matmul_f32_ex(
         a: &[f32],
         b: &[f32],
@@ -647,6 +896,28 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         n: usize,
         trans_a: bool,
         trans_b: bool,
+    ) -> CoreResult<Vec<f32>> {
+        matmul_f32_ex_with_policy(
+            a,
+            b,
+            m,
+            k,
+            n,
+            trans_a,
+            trans_b,
+            MatmulTensorCorePolicy::Accuracy,
+        )
+    }
+
+    pub fn matmul_f32_ex_with_policy(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+        policy: MatmulTensorCorePolicy,
     ) -> CoreResult<Vec<f32>> {
         let need_a = if trans_a { k.checked_mul(m) } else { m.checked_mul(k) }.ok_or("size overflow")?;
         let need_b = if trans_b { n.checked_mul(k) } else { k.checked_mul(n) }.ok_or("size overflow")?;
@@ -659,25 +930,145 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         }
         let ctx = CudaContext::new(0).map_err(|e| format!("cuda: {:?}", e))?;
         let stream = ctx.default_stream();
-        let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
-        let d_a = stream
-            .memcpy_stod(a)
-            .map_err(|e| format!("htod a: {:?}", e))?;
-        let d_b = stream
-            .memcpy_stod(b)
-            .map_err(|e| format!("htod b: {:?}", e))?;
-        let mut d_c = stream
-            .alloc_zeros::<f32>(total)
-            .map_err(|e| format!("alloc c: {:?}", e))?;
-        let cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
-        unsafe { blas.gemm(cfg, &d_b, &d_a, &mut d_c) }
-            .map_err(|e| format!("sgemm: {:?}", e))?;
-        stream
-            .memcpy_dtov(&d_c)
-            .map_err(|e| format!("dtoh c: {:?}", e))
+        match policy {
+            MatmulTensorCorePolicy::Accuracy => {
+                let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
+                let d_a = stream
+                    .memcpy_stod(a)
+                    .map_err(|e| format!("htod a: {:?}", e))?;
+                let d_b = stream
+                    .memcpy_stod(b)
+                    .map_err(|e| format!("htod b: {:?}", e))?;
+                let mut d_c = stream
+                    .alloc_zeros::<f32>(total)
+                    .map_err(|e| format!("alloc c: {:?}", e))?;
+                let cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
+                unsafe { blas.gemm(cfg, &d_b, &d_a, &mut d_c) }
+                    .map_err(|e| format!("sgemm: {:?}", e))?;
+                stream
+                    .memcpy_dtov(&d_c)
+                    .map_err(|e| format!("dtoh c: {:?}", e))
+            }
+            MatmulTensorCorePolicy::Performance => {
+                let d_a = stream
+                    .memcpy_stod(a)
+                    .map_err(|e| format!("htod a: {:?}", e))?;
+                let d_b = stream
+                    .memcpy_stod(b)
+                    .map_err(|e| format!("htod b: {:?}", e))?;
+                let mut d_c = stream
+                    .alloc_zeros::<f32>(total)
+                    .map_err(|e| format!("alloc c: {:?}", e))?;
+                match launch_cublaslt_f32(
+                    stream.clone(),
+                    &d_a,
+                    &d_b,
+                    &mut d_c,
+                    m,
+                    k,
+                    n,
+                    trans_a,
+                    trans_b,
+                ) {
+                    Ok(()) => stream
+                        .memcpy_dtov(&d_c)
+                        .map_err(|e| format!("dtoh c: {:?}", e)),
+                    Err(err) => {
+                        // 回退到传统 cuBLAS
+                        let blas =
+                            CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
+                        let cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
+                        unsafe { blas.gemm(cfg, &d_b, &d_a, &mut d_c) }
+                            .map_err(|e| format!("sgemm: {:?}", e))?;
+                        let mut host = stream
+                            .memcpy_dtov(&d_c)
+                            .map_err(|e| format!("dtoh c: {:?}", e))?;
+                        host.shrink_to_fit();
+                        if cfg!(debug_assertions) {
+                            eprintln!("cublasLt fast path failed ({err}), fallback to cuBLAS");
+                        }
+                        Ok(host)
+                    }
+                }
+            }
+            MatmulTensorCorePolicy::Float16 => {
+                let cfg = build_cublaslt_config_row_major(m, k, n, trans_a, trans_b)?;
+                let a_half: Vec<f16> = a.iter().map(|&v| f16::from_f32(v)).collect();
+                let b_half: Vec<f16> = b.iter().map(|&v| f16::from_f32(v)).collect();
+                let d_a = stream
+                    .memcpy_stod(&a_half)
+                    .map_err(|e| format!("htod a[f16]: {:?}", e))?;
+                let d_b = stream
+                    .memcpy_stod(&b_half)
+                    .map_err(|e| format!("htod b[f16]: {:?}", e))?;
+                let mut d_c = stream
+                    .alloc_zeros::<f16>(total)
+                    .map_err(|e| format!("alloc c[f16]: {:?}", e))?;
+                launch_cublaslt_half::<f16, _, _>(
+                    stream.clone(),
+                    &d_a,
+                    &d_b,
+                    &mut d_c,
+                    cfg,
+                )?;
+                let host_half = stream
+                    .memcpy_dtov(&d_c)
+                    .map_err(|e| format!("dtoh c[f16]: {:?}", e))?;
+                Ok(host_half.into_iter().map(|v| f32::from(v)).collect())
+            }
+            MatmulTensorCorePolicy::BFloat16 => {
+                let cfg = build_cublaslt_config_row_major(m, k, n, trans_a, trans_b)?;
+                let a_half: Vec<bf16> = a.iter().map(|&v| bf16::from_f32(v)).collect();
+                let b_half: Vec<bf16> = b.iter().map(|&v| bf16::from_f32(v)).collect();
+                let d_a = stream
+                    .memcpy_stod(&a_half)
+                    .map_err(|e| format!("htod a[bf16]: {:?}", e))?;
+                let d_b = stream
+                    .memcpy_stod(&b_half)
+                    .map_err(|e| format!("htod b[bf16]: {:?}", e))?;
+                let mut d_c = stream
+                    .alloc_zeros::<bf16>(total)
+                    .map_err(|e| format!("alloc c[bf16]: {:?}", e))?;
+                launch_cublaslt_half::<bf16, _, _>(
+                    stream.clone(),
+                    &d_a,
+                    &d_b,
+                    &mut d_c,
+                    cfg,
+                )?;
+                let host_half = stream
+                    .memcpy_dtov(&d_c)
+                    .map_err(|e| format!("dtoh c[bf16]: {:?}", e))?;
+                Ok(host_half.into_iter().map(|v| f32::from(v)).collect())
+            }
+        }
     }
 
+    #[allow(dead_code)]
     pub fn matmul_batched_f32(
+        a: &[f32],
+        b: &[f32],
+        batch: usize,
+        m: usize,
+        k: usize,
+    n: usize,
+    trans_a: bool,
+    trans_b: bool,
+) -> CoreResult<Vec<f32>> {
+    matmul_batched_f32_with_policy(
+        a,
+        b,
+        batch,
+        m,
+        k,
+        n,
+        trans_a,
+        trans_b,
+        MatmulTensorCorePolicy::Accuracy,
+    )
+}
+
+    pub fn matmul_batched_f32_with_policy(
         a: &[f32],
         b: &[f32],
         batch: usize,
@@ -686,6 +1077,7 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         n: usize,
         trans_a: bool,
         trans_b: bool,
+        policy: MatmulTensorCorePolicy,
     ) -> CoreResult<Vec<f32>> {
         let a_each = if trans_a { k.checked_mul(m) } else { m.checked_mul(k) }.ok_or("size overflow")?;
         let b_each = if trans_b { n.checked_mul(k) } else { k.checked_mul(n) }.ok_or("size overflow")?;
@@ -695,7 +1087,7 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         {
             return Err("matmul_batched_f32: shape mismatch".into());
         }
-        matmul_batched_f32_strided(
+        matmul_batched_f32_strided_with_policy(
             a,
             b,
             batch,
@@ -707,9 +1099,11 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
             usize_to_i64("matmul_batched_f32 stride_a", a_each)?,
             usize_to_i64("matmul_batched_f32 stride_b", b_each)?,
             usize_to_i64("matmul_batched_f32 stride_c", c_each)?,
+            policy,
         )
     }
 
+    #[allow(dead_code)]
     pub fn matmul_batched_f32_strided(
         a: &[f32],
         b: &[f32],
@@ -723,6 +1117,36 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         stride_b: i64,
         stride_c: i64,
     ) -> CoreResult<Vec<f32>> {
+        matmul_batched_f32_strided_with_policy(
+            a,
+            b,
+            batch,
+            m,
+            k,
+            n,
+            trans_a,
+            trans_b,
+            stride_a,
+            stride_b,
+            stride_c,
+            MatmulTensorCorePolicy::Accuracy,
+        )
+    }
+
+    pub fn matmul_batched_f32_strided_with_policy(
+        a: &[f32],
+        b: &[f32],
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+        stride_a: i64,
+        stride_b: i64,
+        stride_c: i64,
+        policy: MatmulTensorCorePolicy,
+    ) -> CoreResult<Vec<f32>> {
         let batch_i32 = usize_to_i32("matmul_batched_f32_strided batch", batch)?;
         let a_need = checked_stride_product("matmul_batched_f32_strided stride_a", stride_a, batch)?;
         let b_need = checked_stride_product("matmul_batched_f32_strided stride_b", stride_b, batch)?;
@@ -732,35 +1156,147 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         }
         let ctx = CudaContext::new(0).map_err(|e| format!("cuda: {:?}", e))?;
         let stream = ctx.default_stream();
-        let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
-        let d_a = stream
-            .memcpy_stod(a)
-            .map_err(|e| format!("htod a: {:?}", e))?;
-        let d_b = stream
-            .memcpy_stod(b)
-            .map_err(|e| format!("htod b: {:?}", e))?;
-        let mut d_c = stream
-            .alloc_zeros::<f32>(c_need)
-            .map_err(|e| format!("alloc c: {:?}", e))?;
-        let gemm_cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
-        let cfg = StridedBatchedConfig::<f32> {
-            gemm: gemm_cfg,
-            batch_size: batch_i32,
-            stride_a: stride_b,
-            stride_b: stride_a,
-            stride_c,
-        };
-        unsafe { blas.gemm_strided_batched(cfg, &d_b, &d_a, &mut d_c) }
-            .map_err(|e| format!("sgemm_strided_batched: {:?}", e))?;
-        stream
-            .memcpy_dtov(&d_c)
-            .map_err(|e| format!("dtoh c: {:?}", e))
+        match policy {
+            MatmulTensorCorePolicy::Accuracy => {
+                let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
+                let d_a = stream
+                    .memcpy_stod(a)
+                    .map_err(|e| format!("htod a: {:?}", e))?;
+                let d_b = stream
+                    .memcpy_stod(b)
+                    .map_err(|e| format!("htod b: {:?}", e))?;
+                let mut d_c = stream
+                    .alloc_zeros::<f32>(c_need)
+                    .map_err(|e| format!("alloc c: {:?}", e))?;
+                let gemm_cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
+                let cfg = StridedBatchedConfig::<f32> {
+                    gemm: gemm_cfg,
+                    batch_size: batch_i32,
+                    stride_a: stride_b,
+                    stride_b: stride_a,
+                    stride_c,
+                };
+                unsafe { blas.gemm_strided_batched(cfg, &d_b, &d_a, &mut d_c) }
+                    .map_err(|e| format!("sgemm_strided_batched: {:?}", e))?;
+                stream
+                    .memcpy_dtov(&d_c)
+                    .map_err(|e| format!("dtoh c: {:?}", e))
+            }
+            MatmulTensorCorePolicy::Performance => {
+                let d_a = stream
+                    .memcpy_stod(a)
+                    .map_err(|e| format!("htod a: {:?}", e))?;
+                let d_b = stream
+                    .memcpy_stod(b)
+                    .map_err(|e| format!("htod b: {:?}", e))?;
+                let mut d_c = stream
+                    .alloc_zeros::<f32>(c_need)
+                    .map_err(|e| format!("alloc c: {:?}", e))?;
+                match launch_cublaslt_f32_strided(
+                    stream.clone(),
+                    &d_a,
+                    &d_b,
+                    &mut d_c,
+                    batch,
+                    m,
+                    k,
+                    n,
+                    trans_a,
+                    trans_b,
+                    stride_a,
+                    stride_b,
+                    stride_c,
+                ) {
+                    Ok(()) => stream
+                        .memcpy_dtov(&d_c)
+                        .map_err(|e| format!("dtoh c: {:?}", e)),
+                    Err(err) => {
+                        let blas =
+                            CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
+                        let gemm_cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
+                        let cfg = StridedBatchedConfig::<f32> {
+                            gemm: gemm_cfg,
+                            batch_size: batch_i32,
+                            stride_a: stride_b,
+                            stride_b: stride_a,
+                            stride_c,
+                        };
+                        unsafe { blas.gemm_strided_batched(cfg, &d_b, &d_a, &mut d_c) }
+                            .map_err(|e| format!("sgemm_strided_batched: {:?}", e))?;
+                        let mut host = stream
+                            .memcpy_dtov(&d_c)
+                            .map_err(|e| format!("dtoh c: {:?}", e))?;
+                        host.shrink_to_fit();
+                        if cfg!(debug_assertions) {
+                            eprintln!(
+                                "cublasLt strided fast path failed ({err}), fallback to cuBLAS"
+                            );
+                        }
+                        Ok(host)
+                    }
+                }
+            }
+            MatmulTensorCorePolicy::Float16 => {
+                let cfg = build_cublaslt_config_row_major_strided(
+                    m, k, n, trans_a, trans_b, batch, stride_a, stride_b, stride_c,
+                )?;
+                let a_half: Vec<f16> = a.iter().map(|&v| f16::from_f32(v)).collect();
+                let b_half: Vec<f16> = b.iter().map(|&v| f16::from_f32(v)).collect();
+                let d_a = stream
+                    .memcpy_stod(&a_half)
+                    .map_err(|e| format!("htod a[f16]: {:?}", e))?;
+                let d_b = stream
+                    .memcpy_stod(&b_half)
+                    .map_err(|e| format!("htod b[f16]: {:?}", e))?;
+                let mut d_c = stream
+                    .alloc_zeros::<f16>(c_need)
+                    .map_err(|e| format!("alloc c[f16]: {:?}", e))?;
+                launch_cublaslt_half::<f16, _, _>(
+                    stream.clone(),
+                    &d_a,
+                    &d_b,
+                    &mut d_c,
+                    cfg,
+                )?;
+                let host_half = stream
+                    .memcpy_dtov(&d_c)
+                    .map_err(|e| format!("dtoh c[f16]: {:?}", e))?;
+                Ok(host_half.into_iter().map(|v| f32::from(v)).collect())
+            }
+            MatmulTensorCorePolicy::BFloat16 => {
+                let cfg = build_cublaslt_config_row_major_strided(
+                    m, k, n, trans_a, trans_b, batch, stride_a, stride_b, stride_c,
+                )?;
+                let a_half: Vec<bf16> = a.iter().map(|&v| bf16::from_f32(v)).collect();
+                let b_half: Vec<bf16> = b.iter().map(|&v| bf16::from_f32(v)).collect();
+                let d_a = stream
+                    .memcpy_stod(&a_half)
+                    .map_err(|e| format!("htod a[bf16]: {:?}", e))?;
+                let d_b = stream
+                    .memcpy_stod(&b_half)
+                    .map_err(|e| format!("htod b[bf16]: {:?}", e))?;
+                let mut d_c = stream
+                    .alloc_zeros::<bf16>(c_need)
+                    .map_err(|e| format!("alloc c[bf16]: {:?}", e))?;
+                launch_cublaslt_half::<bf16, _, _>(
+                    stream.clone(),
+                    &d_a,
+                    &d_b,
+                    &mut d_c,
+                    cfg,
+                )?;
+                let host_half = stream
+                    .memcpy_dtov(&d_c)
+                    .map_err(|e| format!("dtoh c[bf16]: {:?}", e))?;
+                Ok(host_half.into_iter().map(|v| f32::from(v)).collect())
+            }
+        }
     }
 
-    pub fn matmul_f32_ex_device<A: DevicePtr<f32>, B: DevicePtr<f32>, Cc: DevicePtrMut<f32>>(
+    pub fn matmul_f32_ex_device<I: DevicePtr<f32>, Cc: DevicePtrMut<f32>>(
         stream: Arc<CudaStream>,
-        a: &A,
-        b: &B,
+        a: &I,
+        b: &I,
         c: &mut Cc,
         m: usize,
         k: usize,
@@ -768,25 +1304,62 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         trans_a: bool,
         trans_b: bool,
     ) -> CoreResult<()> {
-        let (ap, _) = a.device_ptr(&stream);
-        let (bp, _) = b.device_ptr(&stream);
-        let (cp, _) = c.device_ptr_mut(&stream);
-        if cp == ap || cp == bp {
-            return Err("matmul_f32_ex_device: output aliases input".into());
-        }
-        let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
-        let cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
-        unsafe { blas.gemm(cfg, b, a, c) }.map_err(|e| format!("sgemm: {:?}", e))
+        matmul_f32_ex_device_with_policy(
+            stream,
+            a,
+            b,
+            c,
+            m,
+            k,
+            n,
+            trans_a,
+            trans_b,
+            MatmulTensorCorePolicy::Accuracy,
+        )
     }
 
-    pub fn matmul_batched_f32_strided_device<
-        A: DevicePtr<f32>,
-        B: DevicePtr<f32>,
-        Cc: DevicePtrMut<f32>,
-    >(
+    pub fn matmul_f32_ex_device_with_policy<I: DevicePtr<f32>, Cc: DevicePtrMut<f32>>(
         stream: Arc<CudaStream>,
-        a: &A,
-        b: &B,
+        a: &I,
+        b: &I,
+        c: &mut Cc,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+        policy: MatmulTensorCorePolicy,
+    ) -> CoreResult<()> {
+        ensure_no_alias(&stream, a, b, c, "matmul_f32_ex_device")?;
+        match policy {
+            MatmulTensorCorePolicy::Accuracy => {
+                let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
+                let cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
+                unsafe { blas.gemm(cfg, b, a, c) }.map_err(|e| format!("sgemm: {:?}", e))
+            }
+            MatmulTensorCorePolicy::Performance => launch_cublaslt_f32(
+                stream,
+                a,
+                b,
+                c,
+                m,
+                k,
+                n,
+                trans_a,
+                trans_b,
+            )
+            .map_err(|e| format!("cublasLt matmul: {e}")),
+            MatmulTensorCorePolicy::Float16 | MatmulTensorCorePolicy::BFloat16 => Err(
+                "matmul_f32_ex_device_with_policy: Float16/BFloat16 require host-side conversion"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn matmul_batched_f32_strided_device<I: DevicePtr<f32>, Cc: DevicePtrMut<f32>>(
+        stream: Arc<CudaStream>,
+        a: &I,
+        b: &I,
         c: &mut Cc,
         batch: usize,
         m: usize,
@@ -798,23 +1371,77 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         stride_b: i64,
         stride_c: i64,
     ) -> CoreResult<()> {
-        let (ap, _) = a.device_ptr(&stream);
-        let (bp, _) = b.device_ptr(&stream);
-        let (cp, _) = c.device_ptr_mut(&stream);
-        if cp == ap || cp == bp {
-            return Err("matmul_batched_f32_strided_device: output aliases input".into());
-        }
-        let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
-        let gemm_cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
-        let batch_i32 = usize_to_i32("matmul_batched_f32_strided_device batch", batch)?;
-        let cfg = StridedBatchedConfig::<f32> {
-            gemm: gemm_cfg,
-            batch_size: batch_i32,
-            stride_a: stride_b,
-            stride_b: stride_a,
+        matmul_batched_f32_strided_device_with_policy(
+            stream,
+            a,
+            b,
+            c,
+            batch,
+            m,
+            k,
+            n,
+            trans_a,
+            trans_b,
+            stride_a,
+            stride_b,
             stride_c,
-        };
-        unsafe { blas.gemm_strided_batched(cfg, b, a, c) }.map_err(|e| format!("sgemm_strided_batched: {:?}", e))
+            MatmulTensorCorePolicy::Accuracy,
+        )
+    }
+
+    pub fn matmul_batched_f32_strided_device_with_policy<I: DevicePtr<f32>, Cc: DevicePtrMut<f32>>(
+        stream: Arc<CudaStream>,
+        a: &I,
+        b: &I,
+        c: &mut Cc,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+        stride_a: i64,
+        stride_b: i64,
+        stride_c: i64,
+        policy: MatmulTensorCorePolicy,
+    ) -> CoreResult<()> {
+        ensure_no_alias(&stream, a, b, c, "matmul_batched_f32_strided_device")?;
+        let batch_i32 = usize_to_i32("matmul_batched_f32_strided_device batch", batch)?;
+        match policy {
+            MatmulTensorCorePolicy::Accuracy => {
+                let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
+                let gemm_cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
+                let cfg = StridedBatchedConfig::<f32> {
+                    gemm: gemm_cfg,
+                    batch_size: batch_i32,
+                    stride_a: stride_b,
+                    stride_b: stride_a,
+                    stride_c,
+                };
+                unsafe { blas.gemm_strided_batched(cfg, b, a, c) }
+                    .map_err(|e| format!("sgemm_strided_batched: {:?}", e))
+            }
+            MatmulTensorCorePolicy::Performance => launch_cublaslt_f32_strided(
+                stream,
+                a,
+                b,
+                c,
+                batch,
+                m,
+                k,
+                n,
+                trans_a,
+                trans_b,
+                stride_a,
+                stride_b,
+                stride_c,
+            )
+            .map_err(|e| format!("cublasLt sgemm_strided_batched: {e}")),
+            MatmulTensorCorePolicy::Float16 | MatmulTensorCorePolicy::BFloat16 => Err(
+                "matmul_batched_f32_strided_device_with_policy: Float16/BFloat16 require host-side conversion"
+                    .into(),
+            ),
+        }
     }
 
     pub fn reduce_sum_f32(values: &[f32]) -> CoreResult<f32> {
@@ -1169,7 +1796,12 @@ mod rocm {
 }
 
 #[cfg(feature = "gpu-cuda")]
-pub use cuda::{matmul_batched_f32_strided_device, matmul_f32_ex_device};
+pub use cuda::{
+    matmul_batched_f32_strided_device,
+    matmul_batched_f32_strided_device_with_policy,
+    matmul_f32_ex_device,
+    matmul_f32_ex_device_with_policy,
+};
 
 #[cfg(all(test, feature = "gpu-cuda"))]
 mod tests {
@@ -1300,6 +1932,85 @@ mod tests {
             let expected = super::matmul_cpu_ex(a_block, b_block, m, k, n, false, false);
             let gpu_block = &gpu[b * stride_c as usize..][..m * n];
             assert_close(gpu_block, &expected);
+        }
+    }
+
+    #[test]
+    fn matmul_tensor_policies_match_cpu() {
+        if !cuda_available() {
+            eprintln!("skipping matmul_tensor_policies_match_cpu: no CUDA device");
+            return;
+        }
+        let m = 3;
+        let k = 4;
+        let n = 2;
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.03).cos()).collect();
+        let cpu = super::matmul_cpu_ex(&a, &b, m, k, n, false, false);
+        let precise = super::cuda::matmul_f32_ex_with_policy(
+            &a,
+            &b,
+            m,
+            k,
+            n,
+            false,
+            false,
+            MatmulTensorCorePolicy::Accuracy,
+        )
+        .expect("accuracy matmul");
+        assert_close(&precise, &cpu);
+
+        let fast = super::cuda::matmul_f32_ex_with_policy(
+            &a,
+            &b,
+            m,
+            k,
+            n,
+            false,
+            false,
+            MatmulTensorCorePolicy::Performance,
+        )
+        .expect("performance matmul");
+        assert_close(&fast, &cpu);
+
+        if let Ok(res) = super::cuda::matmul_f32_ex_with_policy(
+            &a,
+            &b,
+            m,
+            k,
+            n,
+            false,
+            false,
+            MatmulTensorCorePolicy::Float16,
+        ) {
+            for (lhs, rhs) in res.iter().zip(cpu.iter()) {
+                assert!(
+                    (lhs - rhs).abs() < 5e-2,
+                    "float16 mismatch: {lhs} vs {rhs}"
+                );
+            }
+        } else {
+            eprintln!("skipping float16 tensor core check");
+        }
+
+        if let Ok(res) = super::cuda::matmul_f32_ex_with_policy(
+            &a,
+            &b,
+            m,
+            k,
+            n,
+            false,
+            false,
+            MatmulTensorCorePolicy::BFloat16,
+        ) {
+            for (lhs, rhs) in res.iter().zip(cpu.iter()) {
+                assert!(
+                    (lhs - rhs).abs() < 5e-2,
+                    "bfloat16 mismatch: {lhs} vs {rhs}"
+                );
+            }
+        } else {
+            eprintln!("skipping bfloat16 tensor core check");
         }
     }
 
