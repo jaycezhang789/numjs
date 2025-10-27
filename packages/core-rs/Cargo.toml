@@ -36,7 +36,7 @@ openblas-src = { version = "0.10", optional = true, default-features = false, fe
 blis-src = { version = "0.2", optional = true, default-features = false, features = ["cblas"] }
 intel-mkl-src = { version = "0.8", optional = true, default-features = false }
 rayon = { version = "1.10", optional = true }
-cudarc = { version = "0.11", optional = true, default-features = false, features = ["driver", "nvrtc", "cublas"] }
+cudarc = { version = "0.17.3", optional = true, default-features = false, features = ["driver", "nvrtc", "cublas", "dynamic-linking"] }
 once_cell = { version = "1.19", optional = true }
 rustfft = "6"
 sprs = { version = "0.11", optional = true }

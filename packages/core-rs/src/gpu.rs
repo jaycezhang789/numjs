@@ -80,7 +80,7 @@ mod cuda {
     use super::*;
     use cudarc::cublas::sys::cublasOperation_t;
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-    use cudarc::driver::{CudaDevice, CudaFunction, LaunchConfig};
+    use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
     use once_cell::sync::Lazy;
     use std::collections::BTreeSet;
@@ -88,7 +88,6 @@ mod cuda {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    const MODULE_NAME: &str = "numjs_cuda_core";
     /// Must stay in sync with the CUB block size used in `reduce_sum_f32`.
     const THREADS_PER_BLOCK: u32 = 256;
 
@@ -137,28 +136,35 @@ extern "C" __global__ void reduce_sum_f32(
 "#;
 
     struct CudaState {
-        device: Arc<CudaDevice>,
+        _ctx: Arc<CudaContext>,
+        stream: Arc<CudaStream>,
         blas: Arc<CudaBlas>,
-        reduce: CudaFunction,
-        matmul_fallback: Option<CudaFunction>,
+        matmul_kernel: CudaFunction,
+        reduce_kernel: CudaFunction,
     }
 
     static CUDA_STATE: Lazy<Result<CudaState, String>> = Lazy::new(|| {
-        let device = CudaDevice::new(0).map_err(|err| err.to_string())?;
-        let blas = CudaBlas::new(device.clone()).map_err(|err| err.to_string())?;
+        let ctx =
+            CudaContext::new(0).map_err(|err| format!("cuda context init failed: {err:?}"))?;
+        let stream = ctx.default_stream();
+        let blas = CudaBlas::new(stream.clone())
+            .map_err(|err| format!("cublas handle init failed: {err:?}"))?;
         let ptx = compile_cuda_module()?;
-        device
-            .load_ptx(ptx, MODULE_NAME, &["matmul_f32", "reduce_sum_f32"])
-            .map_err(|err| err.to_string())?;
-        let reduce = device
-            .get_func(MODULE_NAME, "reduce_sum_f32")
-            .ok_or_else(|| "cuda reduce kernel not found".to_string())?;
-        let matmul_fallback = device.get_func(MODULE_NAME, "matmul_f32");
+        let module = ctx
+            .load_module(ptx)
+            .map_err(|err| format!("cuda load module failed: {err:?}"))?;
+        let matmul_kernel = module
+            .load_function("matmul_f32")
+            .map_err(|err| format!("cuda load matmul kernel failed: {err:?}"))?;
+        let reduce_kernel = module
+            .load_function("reduce_sum_f32")
+            .map_err(|err| format!("cuda load reduce kernel failed: {err:?}"))?;
         Ok(CudaState {
-            device,
+            _ctx: ctx,
+            stream,
             blas: Arc::new(blas),
-            reduce,
-            matmul_fallback,
+            matmul_kernel,
+            reduce_kernel,
         })
     });
 
@@ -250,24 +256,23 @@ extern "C" __global__ void reduce_sum_f32(
         if total_elems == 0 {
             return Ok(Vec::new());
         }
+        let cfg = launch_config_for_len(total_elems)?;
         let m_i32 = i32::try_from(m)
             .map_err(|_| "cuda matmul: m dimension exceeds i32::MAX".to_string())?;
         let k_i32 = i32::try_from(k)
             .map_err(|_| "cuda matmul: k dimension exceeds i32::MAX".to_string())?;
         let n_i32 = i32::try_from(n)
             .map_err(|_| "cuda matmul: n dimension exceeds i32::MAX".to_string())?;
-
-        let device = &state.device;
-        let a_dev = device
-            .htod_sync_copy(a)
-            .map_err(|err| format!("cuda htod_sync_copy(lhs): {err}"))?;
-        let b_dev = device
-            .htod_sync_copy(b)
-            .map_err(|err| format!("cuda htod_sync_copy(rhs): {err}"))?;
-        let mut c_dev = device
+        let stream = &state.stream;
+        let a_dev = stream
+            .memcpy_stod(a)
+            .map_err(|err| format!("cuda memcpy_stod(lhs): {err:?}"))?;
+        let b_dev = stream
+            .memcpy_stod(b)
+            .map_err(|err| format!("cuda memcpy_stod(rhs): {err:?}"))?;
+        let mut c_dev = stream
             .alloc_zeros::<f32>(total_elems)
-            .map_err(|err| format!("cuda alloc_zeros(out): {err}"))?;
-
+            .map_err(|err| format!("cuda alloc_zeros(out): {err:?}"))?;
         let gemm_cfg = GemmConfig {
             transa: cublasOperation_t::CUBLAS_OP_N,
             transb: cublasOperation_t::CUBLAS_OP_N,
@@ -281,31 +286,32 @@ extern "C" __global__ void reduce_sum_f32(
             ldc: n_i32 as c_int,
         };
 
-        let blas = &state.blas;
-        if let Err(err) = unsafe { blas.gemm(gemm_cfg, &b_dev, &a_dev, &mut c_dev) }
-            .map_err(|err| format!("cuda cublas sgemm failed: {err}"))
-        {
-            if let Some(kernel) = state.matmul_fallback.as_ref() {
-                let cfg = launch_config_for_len(total_elems)?;
-                unsafe {
-                    kernel
-                        .clone()
-                        .launch(cfg, (&a_dev, &b_dev, &mut c_dev, m_i32, k_i32, n_i32))
-                }
-                .map_err(|launch_err| {
-                    format!("cuda matmul fallback launch failed: {launch_err}")
-                })?;
-            } else {
-                return Err(err.into());
-            }
+        let gemm_result = unsafe { state.blas.gemm(gemm_cfg, &b_dev, &a_dev, &mut c_dev) }
+            .map_err(|err| format!("cuda cublas sgemm failed: {err:?}"));
+        if let Err(cublas_err) = gemm_result {
+            let mut launch = stream.launch_builder(&state.matmul_kernel);
+            launch
+                .arg(&a_dev)
+                .arg(&b_dev)
+                .arg(&mut c_dev)
+                .arg(&m_i32)
+                .arg(&k_i32)
+                .arg(&n_i32);
+            let _ = unsafe {
+                launch.launch(cfg).map_err(|launch_err| {
+                    format!(
+                        "cuda matmul fallback launch failed after cuBLAS error ({cublas_err}): {launch_err:?}"
+                    )
+                })?
+            };
         }
 
-        device
+        stream
             .synchronize()
-            .map_err(|err| format!("cuda device synchronize: {err}"))?;
-        let host = device
-            .dtoh_sync_copy(&c_dev)
-            .map_err(|err| format!("cuda dtoh(out): {err}"))?;
+            .map_err(|err| format!("cuda stream synchronize: {err:?}"))?;
+        let host = stream
+            .memcpy_dtov(&c_dev)
+            .map_err(|err| format!("cuda memcpy_dtov(out): {err:?}"))?;
         Ok(host)
     }
 
@@ -317,29 +323,31 @@ extern "C" __global__ void reduce_sum_f32(
             return Err("cuda reduce: input length exceeds i32::MAX".into());
         }
         let state = resolve_state()?;
-        let device = &state.device;
-        let input_dev = device
-            .htod_sync_copy(values)
-            .map_err(|err| format!("cuda htod_sync_copy(input): {err}"))?;
-        let mut output_dev = device
+        let stream = &state.stream;
+        let input_dev = stream
+            .memcpy_stod(values)
+            .map_err(|err| format!("cuda memcpy_stod(input): {err:?}"))?;
+        let mut output_dev = stream
             .alloc_zeros::<f32>(1)
-            .map_err(|err| format!("cuda alloc_zeros(sum): {err}"))?;
+            .map_err(|err| format!("cuda alloc_zeros(sum): {err:?}"))?;
         let cfg = launch_config_for_len(values.len())?;
         let len_i32 = i32::try_from(values.len())
             .map_err(|_| "cuda reduce: input length exceeds i32::MAX".to_string())?;
-        unsafe {
-            state
-                .reduce
-                .clone()
-                .launch(cfg, (&input_dev, &mut output_dev, len_i32))
-        }
-        .map_err(|err| format!("cuda reduce launch failed: {err}"))?;
-        device
+        let mut launch = stream.launch_builder(&state.reduce_kernel);
+        launch.arg(&input_dev);
+        launch.arg(&mut output_dev);
+        launch.arg(&len_i32);
+        let _ = unsafe {
+            launch
+                .launch(cfg)
+                .map_err(|err| format!("cuda reduce launch failed: {err:?}"))?
+        };
+        stream
             .synchronize()
-            .map_err(|err| format!("cuda device synchronize: {err}"))?;
-        let host = device
-            .dtoh_sync_copy(&output_dev)
-            .map_err(|err| format!("cuda dtoh(sum): {err}"))?;
+            .map_err(|err| format!("cuda stream synchronize: {err:?}"))?;
+        let host = stream
+            .memcpy_dtov(&output_dev)
+            .map_err(|err| format!("cuda memcpy_dtov(sum): {err:?}"))?;
         Ok(host[0])
     }
 }
