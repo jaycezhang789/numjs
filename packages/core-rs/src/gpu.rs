@@ -48,6 +48,35 @@ pub enum NanPolicy {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub enum SumPrecisionPolicy {
+    Default,
+    Float64,
+    Kahan,
+}
+
+impl Default for SumPrecisionPolicy {
+    fn default() -> Self {
+        SumPrecisionPolicy::Default
+    }
+}
+
+fn sum_f32_as_f64(values: &[f32]) -> f32 {
+    values.iter().fold(0.0f64, |acc, &v| acc + v as f64) as f32
+}
+
+fn sum_f32_kahan(values: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    let mut c = 0.0f32;
+    for &value in values {
+        let y = value - c;
+        let t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    sum
+}
+
+#[derive(Clone, Copy, Debug)]
 pub enum MatmulTensorCorePolicy {
     /// 优先精度，保持 FP32 计算路径（默认）
     Accuracy,
@@ -66,13 +95,25 @@ impl Default for MatmulTensorCorePolicy {
 }
 
 pub fn reduce_sum_f32(values: &[f32]) -> CoreResult<f32> {
+    reduce_sum_f32_with_policy(values, SumPrecisionPolicy::Default)
+}
+
+pub fn reduce_sum_f32_with_policy(
+    values: &[f32],
+    policy: SumPrecisionPolicy,
+) -> CoreResult<f32> {
     #[cfg(feature = "gpu-cuda")]
     {
         if cuda::is_available() {
-            return cuda::reduce_sum_f32(values);
+            return cuda::reduce_sum_f32_with_policy(values, policy);
         }
     }
-    Ok(values.iter().copied().sum())
+    let result = match policy {
+        SumPrecisionPolicy::Default => values.iter().copied().sum(),
+        SumPrecisionPolicy::Float64 => sum_f32_as_f64(values),
+        SumPrecisionPolicy::Kahan => sum_f32_kahan(values),
+    };
+    Ok(result)
 }
 
 pub fn reduce_max_f32(values: &[f32]) -> CoreResult<f32> {
@@ -390,7 +431,7 @@ fn matmul_cpu_ex(
 #[cfg(feature = "gpu-cuda")]
 mod cuda {
     use super::CoreResult;
-    use crate::gpu::{MatmulTensorCorePolicy, NanPolicy};
+    use crate::gpu::{MatmulTensorCorePolicy, NanPolicy, SumPrecisionPolicy};
     use cudarc::cublas::sys::cublasOperation_t;
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
     use cudarc::cublaslt::safe::{CudaBlasLT, Matmul, MatmulConfig};
@@ -1506,10 +1547,21 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
                 let host = stream
                     .memcpy_dtov(&next)
                     .map_err(|e| format!("dtoh: {:?}", e))?;
-                return Ok(host.into_iter().next().unwrap_or(0.0));
-            }
-            current = next;
-            current_len = blocks as usize;
+                  return Ok(host.into_iter().next().unwrap_or(0.0));
+              }
+              current = next;
+              current_len = blocks as usize;
+          }
+    }
+
+    pub fn reduce_sum_f32_with_policy(
+        values: &[f32],
+        policy: SumPrecisionPolicy,
+    ) -> CoreResult<f32> {
+        match policy {
+            SumPrecisionPolicy::Default => reduce_sum_f32(values),
+            SumPrecisionPolicy::Float64 => Ok(super::sum_f32_as_f64(values)),
+            SumPrecisionPolicy::Kahan => Ok(super::sum_f32_kahan(values)),
         }
     }
 

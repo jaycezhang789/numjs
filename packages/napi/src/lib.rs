@@ -8,7 +8,7 @@ use napi_derive::napi;
 use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
 use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
-use num_rs_core::gpu::{self, MatmulTensorCorePolicy};
+use num_rs_core::gpu::{self, MatmulTensorCorePolicy, SumPrecisionPolicy};
 use num_rs_core::sparse::{self, CsrMatrixView};
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
@@ -271,6 +271,25 @@ fn parse_tensor_core_policy(policy: Option<String>) -> Result<MatmulTensorCorePo
         other => {
             return Err(Error::from_reason(format!(
                 "gpu_matmul: unknown tensorCorePolicy '{other}'"
+            )));
+        }
+    };
+    Ok(policy)
+}
+
+fn parse_sum_precision(policy: Option<String>) -> Result<SumPrecisionPolicy> {
+    let default_policy = SumPrecisionPolicy::Default;
+    let Some(value) = policy else {
+        return Ok(default_policy);
+    };
+    let normalized = value.trim().to_ascii_lowercase();
+    let policy = match normalized.as_str() {
+        "" | "default" => SumPrecisionPolicy::Default,
+        "float64" | "fp64" => SumPrecisionPolicy::Float64,
+        "kahan" => SumPrecisionPolicy::Kahan,
+        other => {
+            return Err(Error::from_reason(format!(
+                "gpu_sum: unknown sumPrecision '{other}'"
             )));
         }
     };
@@ -699,15 +718,16 @@ pub fn ifft2d(env: Env, real: &Matrix, imag: &Matrix) -> Result<JsObject> {
 }
 
 #[napi]
-pub fn gpu_sum(matrix: &Matrix, dtype: Option<String>) -> Result<Matrix> {
+pub fn gpu_sum(matrix: &Matrix, dtype: Option<String>, precision: Option<String>) -> Result<Matrix> {
     let target = match dtype {
         Some(value) => Some(value.parse::<DType>().map_err(map_core_error)?),
         None => None,
     };
+    let policy = parse_sum_precision(precision)?;
     if let Some(_kind) = gpu::active_backend_kind() {
         let buffer = ensure_float32_buffer(matrix.buffer())?;
         let view = buffer.try_as_slice::<f32>().map_err(map_core_error)?;
-        match gpu::reduce_sum_f32(view) {
+        match gpu::reduce_sum_f32_with_policy(view, policy) {
             Ok(total) => {
                 let base = MatrixBuffer::from_vec(vec![total], 1, 1).map_err(map_core_error)?;
                 let mut result = Matrix::from_buffer(base);

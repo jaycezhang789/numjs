@@ -64,6 +64,8 @@ export type WebGpuInitOptions = {
 
 export type MatmulTensorCorePolicy = "accuracy" | "performance" | "float16" | "bfloat16";
 
+export type SumPrecisionPolicy = "default" | "float64" | "kahan";
+
 export type GpuMatmulOptions = {
   mode?: GpuExecutionMode;
   tensorCorePolicy?: MatmulTensorCorePolicy;
@@ -2768,6 +2770,7 @@ export const UINT64_MAX = 0xffffffffffffffffn;
 
 export type ReduceOptions = {
   dtype?: DType;
+  sumPrecision?: SumPrecisionPolicy;
 };
 
 export type GpuReduceOptions = ReduceOptions & {
@@ -2954,11 +2957,16 @@ function castReduceResult(result: Matrix, target?: DType): Matrix {
 }
 
 function sumInJs(matrix: Matrix, options: ReduceOptions): Matrix {
-  const accumulatorDType = reductionAccumulatorDType(matrix.dtype);
-  const working =
+  const precision = options.sumPrecision ?? "default";
+  let accumulatorDType = reductionAccumulatorDType(matrix.dtype);
+  let working =
     matrix.dtype === accumulatorDType
       ? matrix
       : matrix.astype(accumulatorDType, { copy: true });
+  if (precision === "float64" && accumulatorDType !== "float64") {
+    working = matrix.astype("float64", { copy: true });
+    accumulatorDType = "float64";
+  }
   const array = working.toArray();
   switch (accumulatorDType) {
     case "int64": {
@@ -3149,6 +3157,9 @@ function dotInJs(a: Matrix, b: Matrix, options: ReduceOptions): Matrix {
 }
 
 export function sum(matrix: Matrix, options: ReduceOptions = {}): Matrix {
+  if (options.sumPrecision && options.sumPrecision !== "default") {
+    return sumInJs(matrix, options);
+  }
   const backend = ensureBackend();
   const target = options.dtype ?? null;
   if (backend.sum) {
@@ -3164,17 +3175,25 @@ export async function sumAsync(
   matrix: Matrix,
   options: GpuReduceOptions = {}
 ): Promise<Matrix> {
-  const { mode = "auto", dtype } = options;
+  const { mode = "auto", dtype, sumPrecision } = options;
   if (isNode) {
     const backend = ensureBackend();
     const nativeGpuSum =
       (backend as Record<string, unknown>).gpu_sum ?? (backend as Record<string, unknown>).gpuSum;
     if (typeof nativeGpuSum === "function") {
       try {
-        const handle = (nativeGpuSum as (
-          source: BackendMatrixHandle,
-          dtype: string | null
-        ) => BackendMatrixHandle)(getHandle(matrix), dtype ?? null);
+        const precisionValue = sumPrecision ?? "default";
+        const handle =
+          nativeGpuSum.length >= 3
+            ? (nativeGpuSum as (
+                source: BackendMatrixHandle,
+                dtype: string | null,
+                precision?: SumPrecisionPolicy
+              ) => BackendMatrixHandle)(getHandle(matrix), dtype ?? null, precisionValue)
+            : (nativeGpuSum as (source: BackendMatrixHandle, dtype: string | null) => BackendMatrixHandle)(
+                getHandle(matrix),
+                dtype ?? null
+              );
         const resolvedDType = getMatrixDTypeFromHandle(handle) ?? (dtype ?? "float32");
         const metadata =
           resolvedDType === "fixed64"
@@ -3192,6 +3211,9 @@ export async function sumAsync(
     const reduceOptions: ReduceOptions = {};
     if (dtype) {
       reduceOptions.dtype = dtype;
+    }
+    if (sumPrecision) {
+      reduceOptions.sumPrecision = sumPrecision;
     }
     return Promise.resolve(sum(matrix, reduceOptions));
   }

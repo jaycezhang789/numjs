@@ -35,7 +35,7 @@ use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
 use nalgebra::{DMatrix, SymmetricEigen};
 
 pub use compress::compress;
-pub use gpu::{MatmulTensorCorePolicy, NanPolicy};
+pub use gpu::{MatmulTensorCorePolicy, NanPolicy, SumPrecisionPolicy};
 pub use error::codes;
 pub use metrics::{copy_bytes_total, reset_copy_bytes, take_copy_bytes};
 #[cfg(feature = "gpu-cuda")]
