@@ -227,6 +227,9 @@ pub fn matmul_f32_with_policy(
             return cuda::matmul_f32_with_policy(a, b, m, k, n, policy);
         }
     }
+    if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
+        return Err("matmul_f32_with_policy: non-Accuracy policies require CUDA backend".into());
+    }
     Ok(matmul_cpu(a, b, m, k, n))
 }
 
@@ -266,6 +269,11 @@ pub fn matmul_f32_ex_with_policy(
         if cuda::is_available() {
             return cuda::matmul_f32_ex_with_policy(a, b, m, k, n, trans_a, trans_b, policy);
         }
+    }
+    if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
+        return Err(
+            "matmul_f32_ex_with_policy: non-Accuracy policies require CUDA backend".into(),
+        );
     }
     Ok(matmul_cpu_ex(a, b, m, k, n, trans_a, trans_b))
 }
@@ -311,6 +319,11 @@ pub fn matmul_batched_f32_with_policy(
                 a, b, batch, m, k, n, trans_a, trans_b, policy,
             );
         }
+    }
+    if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
+        return Err(
+            "matmul_batched_f32_with_policy: non-Accuracy policies require CUDA backend".into(),
+        );
     }
     let mut out = vec![0.0f32; batch.saturating_mul(m.saturating_mul(n))];
     let a_each = m.saturating_mul(k);
@@ -376,6 +389,9 @@ pub fn matmul_batched_f32_strided_with_policy(
                 a, b, batch, m, k, n, trans_a, trans_b, stride_a, stride_b, stride_c, policy,
             );
         }
+    }
+    if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
+        return Err("matmul_batched_f32_strided_with_policy: non-Accuracy policies require CUDA backend".into());
     }
     let need_a = (m as i64) * (k as i64);
     let need_b = (k as i64) * (n as i64);
