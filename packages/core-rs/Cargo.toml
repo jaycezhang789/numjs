@@ -55,3 +55,7 @@ required-features = ["sparse-native"]
 [[bench]]
 name = "sparse"
 harness = false
+
+[[bench]]
+name = "gpu_vs_cpu"
+harness = false
