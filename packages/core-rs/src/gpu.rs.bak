@@ -1,0 +1,817 @@
+use crate::CoreResult;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuBackendKind {
+    #[cfg(feature = "gpu-cuda")]
+    Cuda,
+    #[cfg(feature = "gpu-rocm")]
+    Rocm,
+    }`n}}
+
+impl GpuBackendKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "gpu-cuda")]
+            GpuBackendKind::Cuda => "cuda",
+            #[cfg(feature = "gpu-rocm")]
+            GpuBackendKind::Rocm => "rocm",
+            #[allow(unreachable_patterns)]
+            _ => "unknown",
+    }`n}        }
+    }`n}    }
+    }`n}}
+
+pub fn active_backend_kind() -> Option<GpuBackendKind> {
+    #[cfg(feature = "gpu-cuda")]
+    {
+        if cuda::is_available() {
+            return Some(GpuBackendKind::Cuda);
+    }`n}        }
+    }`n}    }
+    #[cfg(feature = "gpu-rocm")]
+    {
+        if rocm::is_available() {
+            return Some(GpuBackendKind::Rocm);
+    }`n}        }
+    }`n}    }
+    None
+    }`n}}
+
+pub fn backend_name() -> Option<&'static str> {
+    active_backend_kind().map(|kind| kind.as_str())
+    }`n}}
+
+pub fn reduce_max_f32(values: &[f32]) -> CoreResult<f32> { reduce_max_f32_with_policy(values, NanPolicy::Ignore) }
+
+pub fn argmax_f32(values: &[f32]) -> CoreResult<usize> { argmax_f32_with_policy(values, NanPolicy::Ignore) }
+
+pub fn matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> CoreResult<Vec<f32>> {
+    #[cfg(feature = "gpu-cuda")]
+    {
+        if cuda::is_available() {
+            return cuda::matmul_f32(a, b, m, k, n);
+    }`n}        }
+    }`n}    }
+    #[cfg(feature = "gpu-rocm")]
+    {
+        if rocm::is_available() {
+            return rocm::matmul_f32(a, b, m, k, n);
+    }`n}        }
+    }`n}    }
+    let _ = (a, b, m, k, n);
+    Err("GPU matmul backend not available".into())
+    }`n}}
+
+#[derive(Clone, Copy, Debug)]
+pub enum NanPolicy { Ignore, Propagate }
+
+pub fn reduce_max_f32_with_policy(values: &[f32], policy: NanPolicy) -> CoreResult<f32> {
+    #[cfg(feature = "gpu-cuda")]
+    {
+        if cuda::is_available() {
+            return cuda::reduce_max_f32_with_policy(values, policy);
+    }`n}        }
+    }`n}    }
+    let _ = (values, policy);
+    Err("GPU reduce_max backend not available".into())
+    }`n}}
+
+pub fn argmax_f32_with_policy(values: &[f32], policy: NanPolicy) -> CoreResult<usize> {
+    #[cfg(feature = "gpu-cuda")]
+    {
+        if cuda::is_available() {
+            return cuda::argmax_f32_with_policy(values, policy);
+    }`n}        }
+    }`n}    }
+    let _ = (values, policy);
+    Err("GPU argmax backend not available".into())
+    }`n}}
+
+pub fn matmul_f32_ex(
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    trans_a: bool,
+    trans_b: bool,
+) -> CoreResult<Vec<f32>> {
+    #[cfg(feature = "gpu-cuda")]
+    {
+        if cuda::is_available() {
+            return cuda::matmul_f32_ex(a, b, m, k, n, trans_a, trans_b);
+    }`n}        }
+    }`n}    }
+    let _ = (a, b, m, k, n, trans_a, trans_b);
+    Err("GPU matmul_ex backend not available".into())
+    }`n}}
+
+pub fn matmul_batched_f32(
+    a: &[f32],
+    b: &[f32],
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    trans_a: bool,
+    trans_b: bool,
+) -> CoreResult<Vec<f32>> {
+    #[cfg(feature = "gpu-cuda")]
+    {
+        if cuda::is_available() {
+            return cuda::matmul_batched_f32(a, b, batch, m, k, n, trans_a, trans_b);
+    }`n}        }
+
+pub fn matmul_batched_f32_strided(
+    a: &[f32],
+    b: &[f32],
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    trans_a: bool,
+    trans_b: bool,
+    stride_a: i64,
+    stride_b: i64,
+    stride_c: i64,
+) -> CoreResult<Vec<f32>> {
+    #[cfg(feature = "gpu-cuda")]
+    {
+        if cuda::is_available() {
+            return cuda::matmul_batched_f32_strided(a, b, batch, m, k, n, trans_a, trans_b, stride_a, stride_b, stride_c);
+    }`n}        }
+    }`n}    }
+    let _ = (a, b, batch, m, k, n, trans_a, trans_b, stride_a, stride_b, stride_c);
+    Err("GPU batched matmul (strided) backend not available".into())
+    }`n}}
+    }`n}    }
+    let _ = (a, b, batch, m, k, n, trans_a, trans_b);
+    Err("GPU batched matmul backend not available".into())
+    }`n}}
+
+#[cfg(feature = "gpu-cuda")]
+mod cuda {
+    use crate::CoreResult; use crate::gpu::NanPolicy;
+    use cudarc::cublas::sys::cublasOperation_t;
+    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
+    use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg, DevicePtr};
+    use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
+    use once_cell::sync::Lazy;
+    use std::collections::BTreeSet;
+    use std::os::raw::c_int;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    /// Must stay in sync with the CUB block size used in `reduce_sum_f32`.
+    const THREADS_PER_BLOCK: u32 = 256;
+
+    const CUDA_KERNEL_SOURCE: &str = r#"
+#define BLOCK_SIZE 256
+
+extern "C" __global__ void matmul_f32(
+    const float* __restrict__ lhs,
+    const float* __restrict__ rhs,
+    float* __restrict__ out,
+    int m,
+    int k,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = m * n;
+    if (idx >= total) { return; }
+    int row = idx / n;
+    int col = idx % n;
+    float acc = 0.0f;
+    for (int i = 0; i < k; ++i) {
+        acc += lhs[row * k + i] * rhs[i * n + col];
+    }`n}    }
+    out[idx] = acc;
+    }`n}}
+
+// Two-pass sum reduction: stage 1 writes per-block partial sums.
+extern "C" __global__ void reduce_sum_stage1(
+    const float* __restrict__ input,
+    float* __restrict__ partial,
+    int length
+) {
+    __shared__ float sdata[BLOCK_SIZE];
+    int tid = threadIdx.x;
+    int grid_size = blockDim.x * gridDim.x;
+    int index = blockIdx.x * blockDim.x + tid;
+    float sum = 0.0f;
+    while (index < length) {
+        sum += input[index];
+        index += grid_size;
+    }`n}    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+    }`n}        }
+        __syncthreads();
+    }`n}    }
+    if (tid == 0) {
+        partial[blockIdx.x] = sdata[0];
+    }`n}    }
+    }`n}}
+
+// Two-pass max/argmax reduction: stage 1 writes per-block winners (ignore NaN).
+extern "C" __global__ void reduce_max_stage1_ignore_nan(
+    const float* __restrict__ input,
+    float* __restrict__ partial_vals,
+    int* __restrict__ partial_idx,
+    int length
+) {
+    __shared__ float svals[BLOCK_SIZE];
+    __shared__ int sidx[BLOCK_SIZE];
+    int tid = threadIdx.x;
+    int grid_size = blockDim.x * gridDim.x;
+    int index = blockIdx.x * blockDim.x + tid;
+    float vmax = -3.402823466e38f;
+    int imax = -1;
+    while (index < length) {
+        float v = input[index];
+        if (v > vmax) {
+            vmax = v;
+            imax = index;
+    }`n}        }
+        index += grid_size;
+    }`n}    }
+    svals[tid] = vmax;
+    sidx[tid] = imax;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (svals[tid + stride] > svals[tid]) {
+                svals[tid] = svals[tid + stride];
+                sidx[tid] = sidx[tid + stride];
+    }`n}            }
+    }`n}        }
+        __syncthreads();
+    }`n}    }
+    if (tid == 0) {
+        partial_vals[blockIdx.x] = svals[0];
+        partial_idx[blockIdx.x] = sidx[0];
+    }`n}    }
+    }`n}}
+
+// Two-pass max/argmax reduction: stage 1 writes per-block winners (propagate NaN).
+extern "C" __global__ void reduce_max_stage1_propagate_nan(
+    const float* __restrict__ input,
+    float* __restrict__ partial_vals,
+    int* __restrict__ partial_idx,
+    int length
+) {
+    __shared__ float svals[BLOCK_SIZE];
+    __shared__ int sidx[BLOCK_SIZE];
+    int tid = threadIdx.x;
+    int grid_size = blockDim.x * gridDim.x;
+    int index = blockIdx.x * blockDim.x + tid;
+    float vmax = -3.402823466e38f;
+    int imax = -1;
+    bool has_nan = false;
+    while (index < length) {
+        float v = input[index];
+        if (isnan(v)) { vmax = v; imax = index; has_nan = true; break; }
+        if (v > vmax) { vmax = v; imax = index; }
+        index += grid_size;
+    }`n}    }
+    svals[tid] = vmax;
+    sidx[tid] = imax;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float a = svals[tid];
+            float b = svals[tid + stride];
+            if (isnan(a) || isnan(b)) {
+                svals[tid] = (isnan(a) ? a : b);
+                sidx[tid] = (isnan(a) ? sidx[tid] : sidx[tid + stride]);
+            } else if (b > a) {
+                svals[tid] = b; sidx[tid] = sidx[tid + stride];
+    }`n}            }
+    }`n}        }
+        __syncthreads();
+    }`n}    }
+    if (tid == 0) {
+        partial_vals[blockIdx.x] = svals[0];
+        partial_idx[blockIdx.x] = sidx[0];
+    }`n}    }
+    }`n}}
+"#;
+
+    struct CudaState {
+        _ctx: Arc<CudaContext>,
+        stream: Arc<CudaStream>,
+        blas: Arc<CudaBlas>,
+        matmul_kernel: CudaFunction,
+        reduce_sum_stage1: CudaFunction,
+        reduce_max_stage1_ignore: CudaFunction,
+        reduce_max_stage1_propagate: CudaFunction,
+        // Temporary buffers pool (ping-pong) to reduce allocs in multi-pass reductions
+        tmp_sum_a: Mutex<Option<CudaSlice<f32>>>,
+        tmp_sum_b: Mutex<Option<CudaSlice<f32>>>,
+        tmp_max_vals_a: Mutex<Option<CudaSlice<f32>>>,
+        tmp_max_vals_b: Mutex<Option<CudaSlice<f32>>>,
+        tmp_max_idx_a: Mutex<Option<CudaSlice<i32>>>,
+        tmp_max_idx_b: Mutex<Option<CudaSlice<i32>>>,
+    }`n}    }
+
+    static CUDA_STATE: Lazy<Result<CudaState, String>> = Lazy::new(|| {
+        let ctx =
+            CudaContext::new(0).map_err(|err| format!("cuda context init failed: {err:?}"))?;
+        let stream = ctx.default_stream();
+        let blas = CudaBlas::new(stream.clone())
+            .map_err(|err| format!("cublas handle init failed: {err:?}"))?;
+        let ptx = compile_cuda_module()?;
+        let module = ctx
+            .load_module(ptx)
+            .map_err(|err| format!("cuda load module failed: {err:?}"))?;
+        let matmul_kernel = module
+            .load_function("matmul_f32")
+            .map_err(|err| format!("cuda load matmul kernel failed: {err:?}"))?;
+        let reduce_sum_stage1 = module
+            .load_function("reduce_sum_stage1")
+            .map_err(|err| format!("cuda load reduce_sum_stage1 failed: {err:?}"))?;
+        let reduce_max_stage1_ignore = module
+            .load_function("reduce_max_stage1_ignore_nan")
+            .map_err(|err| format!("cuda load reduce_max_stage1_ignore_nan failed: {err:?}"))?;
+        let reduce_max_stage1_propagate = module
+            .load_function("reduce_max_stage1_propagate_nan")
+            .map_err(|err| format!("cuda load reduce_max_stage1_propagate_nan failed: {err:?}"))?;
+        Ok(CudaState {
+            _ctx: ctx,
+            stream,
+            blas: Arc::new(blas),
+            matmul_kernel,
+            reduce_sum_stage1,
+            reduce_max_stage1_ignore,
+            reduce_max_stage1_propagate,
+            tmp_sum_a: Mutex::new(None),
+            tmp_sum_b: Mutex::new(None),
+            tmp_max_vals_a: Mutex::new(None),
+            tmp_max_vals_b: Mutex::new(None),
+            tmp_max_idx_a: Mutex::new(None),
+            tmp_max_idx_b: Mutex::new(None),
+        })
+    });
+
+    fn ensure_tmp_f32_pair(state: &CudaState, min_len: usize) -> Result<(CudaSlice<f32>, CudaSlice<f32>), String> {
+        let stream = &state.stream;
+        let mut a = state.tmp_sum_a.lock().unwrap();
+        let mut b = state.tmp_sum_b.lock().unwrap();
+        if a.as_ref().map(|s| s.len()).unwrap_or(0) < min_len {
+            *a = Some(stream.alloc_zeros::<f32>(min_len).map_err(|e| format!("cuda alloc_zeros(tmp_sum_a): {e:?}"))?);
+    }`n}        }
+        if b.as_ref().map(|s| s.len()).unwrap_or(0) < min_len {
+            *b = Some(stream.alloc_zeros::<f32>(min_len).map_err(|e| format!("cuda alloc_zeros(tmp_sum_b): {e:?}"))?);
+    }`n}        }
+        Ok((a.as_ref().unwrap().clone(), b.as_ref().unwrap().clone()))
+    }`n}    }
+
+    fn ensure_tmp_max_pair(state: &CudaState, min_len: usize) -> Result<(CudaSlice<f32>, CudaSlice<f32>, CudaSlice<i32>, CudaSlice<i32>), String> {
+        let stream = &state.stream;
+        let mut va = state.tmp_max_vals_a.lock().unwrap();
+        let mut vb = state.tmp_max_vals_b.lock().unwrap();
+        let mut ia = state.tmp_max_idx_a.lock().unwrap();
+        let mut ib = state.tmp_max_idx_b.lock().unwrap();
+        if va.as_ref().map(|s| s.len()).unwrap_or(0) < min_len {
+            *va = Some(stream.alloc_zeros::<f32>(min_len).map_err(|e| format!("cuda alloc_zeros(tmp_max_vals_a): {e:?}"))?);
+    }`n}        }
+        if vb.as_ref().map(|s| s.len()).unwrap_or(0) < min_len {
+            *vb = Some(stream.alloc_zeros::<f32>(min_len).map_err(|e| format!("cuda alloc_zeros(tmp_max_vals_b): {e:?}"))?);
+    }`n}        }
+        if ia.as_ref().map(|s| s.len()).unwrap_or(0) < min_len {
+            *ia = Some(stream.alloc_zeros::<i32>(min_len).map_err(|e| format!("cuda alloc_zeros(tmp_max_idx_a): {e:?}"))?);
+    }`n}        }
+        if ib.as_ref().map(|s| s.len()).unwrap_or(0) < min_len {
+            *ib = Some(stream.alloc_zeros::<i32>(min_len).map_err(|e| format!("cuda alloc_zeros(tmp_max_idx_b): {e:?}"))?);
+    }`n}        }
+        Ok((va.as_ref().unwrap().clone(), vb.as_ref().unwrap().clone(), ia.as_ref().unwrap().clone(), ib.as_ref().unwrap().clone()))
+    }`n}    }
+
+    fn compile_cuda_module() -> Result<cudarc::nvrtc::Ptx, String> {
+        let mut opts = CompileOptions::default();
+        opts.include_paths = cuda_include_paths();
+        opts.use_fast_math = Some(true);
+        match compile_ptx_with_opts(CUDA_KERNEL_SOURCE, opts) {
+            Ok(ptx) => Ok(ptx),
+            Err(CompileError::CompileError { log, .. }) => {
+                Err(format!("nvrtc compile failed: {}", log.to_string_lossy()))
+    }`n}            }
+            Err(err) => Err(format!("nvrtc compile failed: {err:?}")),
+    }`n}        }
+    }`n}    }
+
+    fn cuda_include_paths() -> Vec<String> {
+        let mut paths = BTreeSet::new();
+        for key in ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"] {
+            if let Ok(base) = std::env::var(key) {
+                let candidate = PathBuf::from(&base).join("include");
+                if candidate.exists() {
+                    paths.insert(candidate.to_string_lossy().into_owned());
+    }`n}                }
+    }`n}            }
+    }`n}        }
+        if let Ok(path) = std::env::var("CUDA_INC_PATH") {
+            let candidate = PathBuf::from(path);
+            if candidate.exists() {
+                paths.insert(candidate.to_string_lossy().into_owned());
+    }`n}            }
+    }`n}        }
+        paths.into_iter().collect()
+    }`n}    }
+
+    fn resolve_state() -> Result<&'static CudaState, String> {
+        CUDA_STATE.as_ref().map_err(|err| err.clone())
+    }`n}    }
+
+    pub fn is_available() -> bool {
+        CUDA_STATE.is_ok()
+    }`n}    }
+
+    fn launch_config_for_len(len: usize) -> Result<LaunchConfig, String> {
+        let threads_per_block = THREADS_PER_BLOCK as usize;
+        let blocks = if len == 0 {
+            0
+        } else {
+            ((len - 1) / threads_per_block) + 1
+        };
+        if blocks > u32::MAX as usize {
+            return Err("cuda launch: grid dimension overflow".into());
+    }`n}        }
+        Ok(LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (THREADS_PER_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }`n}    }
+
+    pub fn matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> CoreResult<Vec<f32>> {
+        let state = resolve_state()?;
+        let lhs_elems = m
+            .checked_mul(k)
+            .ok_or_else(|| "cuda matmul: lhs dimension overflow".to_string())?;
+        if a.len() != lhs_elems {
+            return Err(format!(
+                "cuda matmul: lhs length mismatch (expected {lhs_elems}, got {})",
+                a.len()
+            )
+            .into());
+    }`n}        }
+        let rhs_elems = k
+            .checked_mul(n)
+            .ok_or_else(|| "cuda matmul: rhs dimension overflow".to_string())?;
+        if b.len() != rhs_elems {
+            return Err(format!(
+                "cuda matmul: rhs length mismatch (expected {rhs_elems}, got {})",
+                b.len()
+            )
+            .into());
+    }`n}        }
+        let total_elems = m
+            .checked_mul(n)
+            .ok_or_else(|| "cuda matmul: output dimension overflow".to_string())?;
+        if total_elems > i32::MAX as usize {
+            return Err("cuda matmul: output element count exceeds i32::MAX".into());
+    }`n}        }
+        if total_elems == 0 {
+            return Ok(Vec::new());
+    }`n}        }
+        let cfg = launch_config_for_len(total_elems)?;
+        let m_i32 = i32::try_from(m)
+            .map_err(|_| "cuda matmul: m dimension exceeds i32::MAX".to_string())?;
+        let k_i32 = i32::try_from(k)
+            .map_err(|_| "cuda matmul: k dimension exceeds i32::MAX".to_string())?;
+        let n_i32 = i32::try_from(n)
+            .map_err(|_| "cuda matmul: n dimension exceeds i32::MAX".to_string())?;
+        let stream = &state.stream;
+        let a_dev = stream
+            .memcpy_stod(a)
+            .map_err(|err| format!("cuda memcpy_stod(lhs): {err:?}"))?;
+        let b_dev = stream
+            .memcpy_stod(b)
+            .map_err(|err| format!("cuda memcpy_stod(rhs): {err:?}"))?;
+        let mut c_dev = stream
+            .alloc_zeros::<f32>(total_elems)
+            .map_err(|err| format!("cuda alloc_zeros(out): {err:?}"))?;
+        let gemm_cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n_i32 as c_int,
+            n: m_i32 as c_int,
+            k: k_i32 as c_int,
+            alpha: 1.0f32,
+            lda: n_i32 as c_int,
+            ldb: k_i32 as c_int,
+            beta: 0.0f32,
+            ldc: n_i32 as c_int,
+        };
+
+        let gemm_result = unsafe { state.blas.gemm(gemm_cfg, &b_dev, &a_dev, &mut c_dev) }
+            .map_err(|err| format!("cuda cublas sgemm failed: {err:?}"));
+        if let Err(cublas_err) = gemm_result {
+            let mut launch = stream.launch_builder(&state.matmul_kernel);
+            launch
+                .arg(&a_dev)
+                .arg(&b_dev)
+                .arg(&mut c_dev)
+                .arg(&m_i32)
+                .arg(&k_i32)
+                .arg(&n_i32);
+            let _ = unsafe {
+                launch.launch(cfg).map_err(|launch_err| {
+                    format!(
+                        "cuda matmul fallback launch failed after cuBLAS error ({cublas_err}): {launch_err:?}"
+                    )
+                })?
+            };
+    }`n}        }
+
+        stream
+            .synchronize()
+            .map_err(|err| format!("cuda stream synchronize: {err:?}"))?;
+        let host = stream
+            .memcpy_dtov(&c_dev)
+            .map_err(|err| format!("cuda memcpy_dtov(out): {err:?}"))?;
+        Ok(host)
+    }`n}    }
+
+        pub fn reduce_max_f32_with_policy(values: &[f32], policy: NanPolicy) -> CoreResult<f32> {
+        if values.is_empty() {
+            return Ok(f32::NEG_INFINITY);
+    }`n}        }
+        if values.len() > i32::MAX as usize {
+            return Err("cuda reduce_max: input length exceeds i32::MAX".into());
+    }`n}        }
+        let state = resolve_state()?;
+        let stream = &state.stream;
+        let mut curr = stream
+            .memcpy_stod(values)
+            .map_err(|err| format!("cuda memcpy_stod(input): {err:?}"))?;
+        let mut len = values.len(); let max_blocks = if len == 0 { 1 } else { ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1 }; let (vals_a, vals_b, idx_a, idx_b) = ensure_tmp_max_pair(state, max_blocks)?; let mut use_a = true; loop {
+            let blocks = if len == 0 { 1 } else { ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1 } as usize;
+            let mut partial_vals = if use_a { vals_a.clone() } else { vals_b.clone() };
+            let mut partial_idx = if use_a { idx_a.clone() } else { idx_b.clone() };
+            let cfg = launch_config_for_len(len)?;
+            let len_i32 = i32::try_from(len)
+                .map_err(|_| "cuda reduce_max: length exceeds i32::MAX".to_string())?;
+            let mut launch = match policy { NanPolicy::Ignore => stream.launch_builder(&state.reduce_max_stage1_ignore), NanPolicy::Propagate => stream.launch_builder(&state.reduce_max_stage1_propagate), };
+            launch.arg(&curr);
+            launch.arg(&mut partial_vals);
+            launch.arg(&mut partial_idx);
+            launch.arg(&len_i32);
+            unsafe { launch.launch(cfg) }
+                .map_err(|err| format!("cuda reduce_max_stage1 launch failed: {err:?}"))?;
+            stream
+                .synchronize()
+                .map_err(|err| format!("cuda stream synchronize: {err:?}"))?;
+            if blocks == 1 {
+                let host = stream
+                    .memcpy_dtov(&partial_vals)
+                    .map_err(|err| format!("cuda memcpy_dtov(max): {err:?}"))?;
+                return Ok(host[0]);
+    }`n}            }
+            curr = partial_vals;
+            len = blocks; use_a = !use_a; }
+    }`n}    }
+
+    pub fn argmax_f32_with_policy(values: &[f32], policy: NanPolicy) -> CoreResult<usize> {
+        if values.is_empty() {
+            return Err("cuda argmax: input is empty".into());
+    }`n}        }
+        if values.len() > i32::MAX as usize {
+            return Err("cuda argmax: input length exceeds i32::MAX".into());
+    }`n}        }
+        let state = resolve_state()?;
+        let stream = &state.stream;
+        let mut curr = stream
+            .memcpy_stod(values)
+            .map_err(|err| format!("cuda memcpy_stod(input): {err:?}"))?;
+        let mut len = values.len(); let max_blocks = if len == 0 { 1 } else { ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1 }; let (vals_a, vals_b, idx_a, idx_b) = ensure_tmp_max_pair(state, max_blocks)?; let mut use_a = true; loop {
+            let blocks = if len == 0 { 1 } else { ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1 } as usize;
+            let mut partial_vals = if use_a { vals_a.clone() } else { vals_b.clone() };
+            let mut partial_idx = if use_a { idx_a.clone() } else { idx_b.clone() };
+            let cfg = launch_config_for_len(len)?;
+            let len_i32 = i32::try_from(len)
+                .map_err(|_| "cuda argmax: length exceeds i32::MAX".to_string())?;
+            let mut launch = match policy { NanPolicy::Ignore => stream.launch_builder(&state.reduce_max_stage1_ignore), NanPolicy::Propagate => stream.launch_builder(&state.reduce_max_stage1_propagate), };
+            launch.arg(&curr);
+            launch.arg(&mut partial_vals);
+            launch.arg(&mut partial_idx);
+            launch.arg(&len_i32);
+            unsafe { launch.launch(cfg) }
+                .map_err(|err| format!("cuda reduce_max_stage1 launch failed: {err:?}"))?;
+            stream
+                .synchronize()
+                .map_err(|err| format!("cuda stream synchronize: {err:?}"))?;
+            if blocks == 1 {
+                let host_idx = stream
+                    .memcpy_dtov(&partial_idx)
+                    .map_err(|err| format!("cuda memcpy_dtov(argmax): {err:?}"))?;
+                return Ok(host_idx[0] as usize);
+    }`n}            }
+            curr = partial_vals;
+            len = blocks; use_a = !use_a; }
+    }`n}    }
+
+    fn compute_gemm_mapping(
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> Result<(
+        cublasOperation_t,
+        cublasOperation_t,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        usize,
+        usize,
+    ), String> {
+        let m_out = if trans_a { k } else { m };
+        let n_out = if trans_b { k } else { n };
+        let shared = if trans_a { m } else { k };
+        if shared > i32::MAX as usize || m_out > i32::MAX as usize || n_out > i32::MAX as usize {
+            return Err("cuda matmul_ex: dims exceed i32::MAX".into());
+    }`n}        }
+        let transa = if trans_b { cublasOperation_t::CUBLAS_OP_N } else { cublasOperation_t::CUBLAS_OP_T };
+        let transb = if trans_a { cublasOperation_t::CUBLAS_OP_N } else { cublasOperation_t::CUBLAS_OP_T };
+        let m_c = n_out as i32;
+        let n_c = m_out as i32;
+        let k_c = shared as i32;
+        let lda = n as i32;  // rows of B_col
+        let ldb = k as i32;  // rows of A_col
+        let ldc = n_out as i32; // rows of C_col
+        Ok((transa, transb, m_c, n_c, k_c, lda, ldb, ldc, m_out, n_out))
+    }`n}    }
+
+    pub fn matmul_f32_ex(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> CoreResult<Vec<f32>> {
+        let state = resolve_state()?;
+        let (_ta, _tb, _m_c, _n_c, _k_c, _lda, _ldb, _ldc, m_out, n_out) = compute_gemm_mapping(m, k, n, trans_a, trans_b)?;
+        let stream = &state.stream;
+        let a_dev = stream.memcpy_stod(a).map_err(|e| format!("cuda memcpy_stod(lhs): {e:?}"))?;
+        let b_dev = stream.memcpy_stod(b).map_err(|e| format!("cuda memcpy_stod(rhs): {e:?}"))?;
+        let mut c_dev = stream.alloc_zeros::<f32>(m_out * n_out).map_err(|e| format!("cuda alloc_zeros(out): {e:?}"))?;
+        matmul_f32_ex_device(&a_dev, &b_dev, &mut c_dev, m, k, n, trans_a, trans_b)?;
+        let host = stream.memcpy_dtov(&c_dev).map_err(|e| format!("cuda memcpy_dtov(out): {e:?}"))?;
+        Ok(host)
+    }`n}    }
+
+    pub fn matmul_f32_ex_device(
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> CoreResult<()> {
+        // alias detection: disallow output aliasing inputs
+        let stream = &resolve_state()?.stream;
+        let (pa, _) = a.device_ptr(stream);
+        let (pb, _) = b.device_ptr(stream);
+        let (pc, _) = c.device_ptr(stream);
+        if pc == pa || pc == pb {
+            return Err("cuda matmul_ex_device: output aliases input".into());
+    }`n}        }
+        let (transa, transb, m_c, n_c, k_c, lda, ldb, ldc, _m_out, _n_out) = compute_gemm_mapping(m, k, n, trans_a, trans_b)?;
+        let cfg = GemmConfig { transa, transb, m: m_c, n: n_c, k: k_c, alpha: 1.0f32, lda, ldb, beta: 0.0f32, ldc };
+        { let state = resolve_state()?; unsafe { state.blas.gemm(cfg, b, a, c) } }.map_err(|e| format!("cuda cublas sgemm (ex) failed: {e:?}"))?;
+        Ok(())
+    }`n}    }
+
+    pub fn matmul_batched_f32(
+        a: &[f32],
+        b: &[f32],
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> CoreResult<Vec<f32>> {
+        let state = resolve_state()?;
+        let (_ta, _tb, _m_c, _n_c, _k_c, _lda, _ldb, _ldc, m_out, n_out) = compute_gemm_mapping(m, k, n, trans_a, trans_b)?;
+        let stream = &state.stream;
+        if a.len() != batch * m * k { return Err("cuda batched matmul: lhs length mismatch".into()); }
+        if b.len() != batch * k * n { return Err("cuda batched matmul: rhs length mismatch".into()); }
+        let a_dev = stream.memcpy_stod(a).map_err(|e| format!("cuda memcpy_stod(lhs): {e:?}"))?;
+        let b_dev = stream.memcpy_stod(b).map_err(|e| format!("cuda memcpy_stod(rhs): {e:?}"))?;
+        let mut c_dev = stream.alloc_zeros::<f32>(batch * m_out * n_out).map_err(|e| format!("cuda alloc_zeros(out): {e:?}"))?;
+        matmul_batched_f32_device(&a_dev, &b_dev, &mut c_dev, batch, m, k, n, trans_a, trans_b)?;
+        let host = stream.memcpy_dtov(&c_dev).map_err(|e| format!("cuda memcpy_dtov(out): {e:?}"))?;
+        Ok(host)
+    }`n}    }
+
+    pub fn matmul_batched_f32_device(
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> CoreResult<()> {
+        // alias detection
+        let stream = &resolve_state()?.stream;
+        let (pa, _) = a.device_ptr(stream);
+        let (pb, _) = b.device_ptr(stream);
+        let (pc, _) = c.device_ptr(stream);
+        if pc == pa || pc == pb {
+            return Err("cuda matmul_batched_device: output aliases input".into());
+    }`n}        }
+        let (transa, transb, m_c, n_c, k_c, lda, ldb, ldc, m_out, n_out) = compute_gemm_mapping(m, k, n, trans_a, trans_b)?;
+        let stride_a = (m * k) as i64;
+        let stride_b = (k * n) as i64;
+        let stride_c = (m_out * n_out) as i64;
+        let cfg = StridedBatchedConfig { gemm: GemmConfig { transa, transb, m: m_c, n: n_c, k: k_c, alpha: 1.0f32, lda, ldb, beta: 0.0f32, ldc }, batch_size: i32::try_from(batch).map_err(|_| "batch exceeds i32::MAX")?, stride_a, stride_b, stride_c };
+        { let state = resolve_state()?; unsafe { state.blas.gemm_strided_batched(cfg, b, a, c) } }.map_err(|e| format!("cuda cublas sgemm_strided_batched failed: {e:?}"))?;
+        Ok(())
+    }`n}    }
+
+    pub fn matmul_batched_f32_strided_device(
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+        stride_a: i64,
+        stride_b: i64,
+        stride_c: i64,
+    ) -> CoreResult<()> {
+        // alias detection
+        let stream = &resolve_state()?.stream;
+        let (pa, _) = a.device_ptr(stream);
+        let (pb, _) = b.device_ptr(stream);
+        let (pc, _) = c.device_ptr(stream);
+        if pc == pa || pc == pb {
+            return Err("cuda matmul_batched_strided_device: output aliases input".into());
+    }`n}        }
+        let (transa, transb, m_c, n_c, k_c, lda, ldb, ldc, _m_out, _n_out) = compute_gemm_mapping(m, k, n, trans_a, trans_b)?;
+        // Note: cuBLAS call order is (B, A) due to row-major mapping
+        let cfg = StridedBatchedConfig {
+            gemm: GemmConfig { transa, transb, m: m_c, n: n_c, k: k_c, alpha: 1.0f32, lda, ldb, beta: 0.0f32, ldc },
+            batch_size: i32::try_from(batch).map_err(|_| "batch exceeds i32::MAX")?,
+            stride_a: stride_b, // B first
+            stride_b: stride_a, // A second
+            stride_c,
+        };
+        { let state = resolve_state()?; unsafe { state.blas.gemm_strided_batched(cfg, b, a, c) } }
+            .map_err(|e| format!("cuda cublas sgemm_strided_batched (custom stride) failed: {e:?}"))?;
+        Ok(())
+    }`n}    }
+    }`n}}
+
+#[cfg(feature = "gpu-rocm")]
+mod rocm {
+    use crate::CoreResult; use crate::gpu::NanPolicy;
+
+    pub fn is_available() -> bool {
+        false
+    }`n}    }
+
+    pub fn matmul_f32(
+        _a: &[f32],
+        _b: &[f32],
+        _m: usize,
+        _k: usize,
+        _n: usize,
+    ) -> CoreResult<Vec<f32>> {
+        Err("ROCm backend not yet implemented".into())
+    }`n}    }
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+    }`n}}
+
