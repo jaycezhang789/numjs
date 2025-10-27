@@ -75,12 +75,73 @@ pub fn reduce_sum_f32(values: &[f32]) -> CoreResult<f32> {
     Err("GPU reduce backend not available".into())
 }
 
+pub fn reduce_max_f32(values: &[f32]) -> CoreResult<f32> {
+    #[cfg(feature = "gpu-cuda")]
+    {
+        if cuda::is_available() {
+            return cuda::reduce_max_f32(values);
+        }
+    }
+    let _ = values;
+    Err("GPU reduce_max backend not available".into())
+}
+
+pub fn argmax_f32(values: &[f32]) -> CoreResult<usize> {
+    #[cfg(feature = "gpu-cuda")]
+    {
+        if cuda::is_available() {
+            return cuda::argmax_f32(values);
+        }
+    }
+    let _ = values;
+    Err("GPU argmax backend not available".into())
+}
+
+pub fn matmul_f32_ex(
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    trans_a: bool,
+    trans_b: bool,
+) -> CoreResult<Vec<f32>> {
+    #[cfg(feature = "gpu-cuda")]
+    {
+        if cuda::is_available() {
+            return cuda::matmul_f32_ex(a, b, m, k, n, trans_a, trans_b);
+        }
+    }
+    let _ = (a, b, m, k, n, trans_a, trans_b);
+    Err("GPU matmul_ex backend not available".into())
+}
+
+pub fn matmul_batched_f32(
+    a: &[f32],
+    b: &[f32],
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    trans_a: bool,
+    trans_b: bool,
+) -> CoreResult<Vec<f32>> {
+    #[cfg(feature = "gpu-cuda")]
+    {
+        if cuda::is_available() {
+            return cuda::matmul_batched_f32(a, b, batch, m, k, n, trans_a, trans_b);
+        }
+    }
+    let _ = (a, b, batch, m, k, n, trans_a, trans_b);
+    Err("GPU batched matmul backend not available".into())
+}
+
 #[cfg(feature = "gpu-cuda")]
 mod cuda {
-    use super::*;
+    use crate::CoreResult;
     use cudarc::cublas::sys::cublasOperation_t;
-    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-    use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
+    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
+    use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::{compile_ptx_with_opts, CompileError, CompileOptions};
     use once_cell::sync::Lazy;
     use std::collections::BTreeSet;
@@ -92,7 +153,7 @@ mod cuda {
     const THREADS_PER_BLOCK: u32 = 256;
 
     const CUDA_KERNEL_SOURCE: &str = r#"
-#include <cub/block/block_reduce.cuh>
+#define BLOCK_SIZE 256
 
 extern "C" __global__ void matmul_f32(
     const float* __restrict__ lhs,
@@ -114,23 +175,71 @@ extern "C" __global__ void matmul_f32(
     out[idx] = acc;
 }
 
-extern "C" __global__ void reduce_sum_f32(
+// Two-pass sum reduction: stage 1 writes per-block partial sums.
+extern "C" __global__ void reduce_sum_stage1(
     const float* __restrict__ input,
-    float* __restrict__ output,
+    float* __restrict__ partial,
     int length
 ) {
-    using BlockReduce = cub::BlockReduce<float, 256>;
-    __shared__ typename BlockReduce::TempStorage storage;
-    float thread_sum = 0.0f;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-    while (idx < length) {
-        thread_sum += input[idx];
-        idx += stride;
+    __shared__ float sdata[BLOCK_SIZE];
+    int tid = threadIdx.x;
+    int grid_size = blockDim.x * gridDim.x;
+    int index = blockIdx.x * blockDim.x + tid;
+    float sum = 0.0f;
+    while (index < length) {
+        sum += input[index];
+        index += grid_size;
     }
-    float block_sum = BlockReduce(storage).Sum(thread_sum);
-    if (threadIdx.x == 0) {
-        atomicAdd(output, block_sum);
+    sdata[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial[blockIdx.x] = sdata[0];
+    }
+}
+
+// Two-pass max/argmax reduction: stage 1 writes per-block winners.
+extern "C" __global__ void reduce_max_stage1(
+    const float* __restrict__ input,
+    float* __restrict__ partial_vals,
+    int* __restrict__ partial_idx,
+    int length
+) {
+    __shared__ float svals[BLOCK_SIZE];
+    __shared__ int sidx[BLOCK_SIZE];
+    int tid = threadIdx.x;
+    int grid_size = blockDim.x * gridDim.x;
+    int index = blockIdx.x * blockDim.x + tid;
+    float vmax = -3.402823466e38f;
+    int imax = -1;
+    while (index < length) {
+        float v = input[index];
+        if (v > vmax) {
+            vmax = v;
+            imax = index;
+        }
+        index += grid_size;
+    }
+    svals[tid] = vmax;
+    sidx[tid] = imax;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (svals[tid + stride] > svals[tid]) {
+                svals[tid] = svals[tid + stride];
+                sidx[tid] = sidx[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial_vals[blockIdx.x] = svals[0];
+        partial_idx[blockIdx.x] = sidx[0];
     }
 }
 "#;
@@ -140,7 +249,8 @@ extern "C" __global__ void reduce_sum_f32(
         stream: Arc<CudaStream>,
         blas: Arc<CudaBlas>,
         matmul_kernel: CudaFunction,
-        reduce_kernel: CudaFunction,
+        reduce_sum_stage1: CudaFunction,
+        reduce_max_stage1: CudaFunction,
     }
 
     static CUDA_STATE: Lazy<Result<CudaState, String>> = Lazy::new(|| {
@@ -156,15 +266,19 @@ extern "C" __global__ void reduce_sum_f32(
         let matmul_kernel = module
             .load_function("matmul_f32")
             .map_err(|err| format!("cuda load matmul kernel failed: {err:?}"))?;
-        let reduce_kernel = module
-            .load_function("reduce_sum_f32")
-            .map_err(|err| format!("cuda load reduce kernel failed: {err:?}"))?;
+        let reduce_sum_stage1 = module
+            .load_function("reduce_sum_stage1")
+            .map_err(|err| format!("cuda load reduce_sum_stage1 failed: {err:?}"))?;
+        let reduce_max_stage1 = module
+            .load_function("reduce_max_stage1")
+            .map_err(|err| format!("cuda load reduce_max_stage1 failed: {err:?}"))?;
         Ok(CudaState {
             _ctx: ctx,
             stream,
             blas: Arc::new(blas),
             matmul_kernel,
-            reduce_kernel,
+            reduce_sum_stage1,
+            reduce_max_stage1,
         })
     });
 
@@ -324,37 +438,258 @@ extern "C" __global__ void reduce_sum_f32(
         }
         let state = resolve_state()?;
         let stream = &state.stream;
-        let input_dev = stream
+        let mut curr = stream
             .memcpy_stod(values)
             .map_err(|err| format!("cuda memcpy_stod(input): {err:?}"))?;
-        let mut output_dev = stream
-            .alloc_zeros::<f32>(1)
-            .map_err(|err| format!("cuda alloc_zeros(sum): {err:?}"))?;
-        let cfg = launch_config_for_len(values.len())?;
-        let len_i32 = i32::try_from(values.len())
-            .map_err(|_| "cuda reduce: input length exceeds i32::MAX".to_string())?;
-        let mut launch = stream.launch_builder(&state.reduce_kernel);
-        launch.arg(&input_dev);
-        launch.arg(&mut output_dev);
-        launch.arg(&len_i32);
-        let _ = unsafe {
-            launch
-                .launch(cfg)
-                .map_err(|err| format!("cuda reduce launch failed: {err:?}"))?
-        };
-        stream
-            .synchronize()
-            .map_err(|err| format!("cuda stream synchronize: {err:?}"))?;
-        let host = stream
-            .memcpy_dtov(&output_dev)
-            .map_err(|err| format!("cuda memcpy_dtov(sum): {err:?}"))?;
-        Ok(host[0])
+        let mut len = values.len();
+        loop {
+            let blocks = if len == 0 {
+                1
+            } else {
+                ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1
+            } as usize;
+            let mut partial = stream
+                .alloc_zeros::<f32>(blocks)
+                .map_err(|err| format!("cuda alloc_zeros(partials): {err:?}"))?;
+            let cfg = launch_config_for_len(len)?;
+            let len_i32 = i32::try_from(len)
+                .map_err(|_| "cuda reduce: length exceeds i32::MAX".to_string())?;
+            let mut launch = stream.launch_builder(&state.reduce_sum_stage1);
+            launch.arg(&curr);
+            launch.arg(&mut partial);
+            launch.arg(&len_i32);
+            unsafe { launch.launch(cfg) }
+                .map_err(|err| format!("cuda reduce_sum_stage1 launch failed: {err:?}"))?;
+            stream
+                .synchronize()
+                .map_err(|err| format!("cuda stream synchronize: {err:?}"))?;
+            if blocks == 1 {
+                let host = stream
+                    .memcpy_dtov(&partial)
+                    .map_err(|err| format!("cuda memcpy_dtov(sum): {err:?}"))?;
+                return Ok(host[0]);
+            }
+            curr = partial;
+            len = blocks;
+        }
+    }
+
+    pub fn reduce_max_f32(values: &[f32]) -> CoreResult<f32> {
+        if values.is_empty() {
+            return Ok(f32::NEG_INFINITY);
+        }
+        if values.len() > i32::MAX as usize {
+            return Err("cuda reduce_max: input length exceeds i32::MAX".into());
+        }
+        let state = resolve_state()?;
+        let stream = &state.stream;
+        let mut curr = stream
+            .memcpy_stod(values)
+            .map_err(|err| format!("cuda memcpy_stod(input): {err:?}"))?;
+        let mut len = values.len();
+        loop {
+            let blocks = if len == 0 {
+                1
+            } else {
+                ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1
+            } as usize;
+            let mut partial_vals = stream
+                .alloc_zeros::<f32>(blocks)
+                .map_err(|err| format!("cuda alloc_zeros(partial_vals): {err:?}"))?;
+            let mut partial_idx = stream
+                .alloc_zeros::<i32>(blocks)
+                .map_err(|err| format!("cuda alloc_zeros(partial_idx): {err:?}"))?;
+            let cfg = launch_config_for_len(len)?;
+            let len_i32 = i32::try_from(len)
+                .map_err(|_| "cuda reduce_max: length exceeds i32::MAX".to_string())?;
+            let mut launch = stream.launch_builder(&state.reduce_max_stage1);
+            launch.arg(&curr);
+            launch.arg(&mut partial_vals);
+            launch.arg(&mut partial_idx);
+            launch.arg(&len_i32);
+            unsafe { launch.launch(cfg) }
+                .map_err(|err| format!("cuda reduce_max_stage1 launch failed: {err:?}"))?;
+            stream
+                .synchronize()
+                .map_err(|err| format!("cuda stream synchronize: {err:?}"))?;
+            if blocks == 1 {
+                let host = stream
+                    .memcpy_dtov(&partial_vals)
+                    .map_err(|err| format!("cuda memcpy_dtov(max): {err:?}"))?;
+                return Ok(host[0]);
+            }
+            curr = partial_vals;
+            len = blocks;
+        }
+    }
+
+    pub fn argmax_f32(values: &[f32]) -> CoreResult<usize> {
+        if values.is_empty() {
+            return Err("cuda argmax: input is empty".into());
+        }
+        if values.len() > i32::MAX as usize {
+            return Err("cuda argmax: input length exceeds i32::MAX".into());
+        }
+        let state = resolve_state()?;
+        let stream = &state.stream;
+        let mut curr = stream
+            .memcpy_stod(values)
+            .map_err(|err| format!("cuda memcpy_stod(input): {err:?}"))?;
+        let mut len = values.len();
+        loop {
+            let blocks = if len == 0 {
+                1
+            } else {
+                ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1
+            } as usize;
+            let mut partial_vals = stream
+                .alloc_zeros::<f32>(blocks)
+                .map_err(|err| format!("cuda alloc_zeros(partial_vals): {err:?}"))?;
+            let mut partial_idx = stream
+                .alloc_zeros::<i32>(blocks)
+                .map_err(|err| format!("cuda alloc_zeros(partial_idx): {err:?}"))?;
+            let cfg = launch_config_for_len(len)?;
+            let len_i32 = i32::try_from(len)
+                .map_err(|_| "cuda argmax: length exceeds i32::MAX".to_string())?;
+            let mut launch = stream.launch_builder(&state.reduce_max_stage1);
+            launch.arg(&curr);
+            launch.arg(&mut partial_vals);
+            launch.arg(&mut partial_idx);
+            launch.arg(&len_i32);
+            unsafe { launch.launch(cfg) }
+                .map_err(|err| format!("cuda reduce_max_stage1 launch failed: {err:?}"))?;
+            stream
+                .synchronize()
+                .map_err(|err| format!("cuda stream synchronize: {err:?}"))?;
+            if blocks == 1 {
+                let host_idx = stream
+                    .memcpy_dtov(&partial_idx)
+                    .map_err(|err| format!("cuda memcpy_dtov(argmax): {err:?}"))?;
+                return Ok(host_idx[0] as usize);
+            }
+            curr = partial_vals;
+            len = blocks;
+        }
+    }
+
+    fn compute_gemm_mapping(
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> Result<(
+        cublasOperation_t,
+        cublasOperation_t,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        usize,
+        usize,
+    ), String> {
+        let m_out = if trans_a { k } else { m };
+        let n_out = if trans_b { k } else { n };
+        let shared = if trans_a { m } else { k };
+        if shared > i32::MAX as usize || m_out > i32::MAX as usize || n_out > i32::MAX as usize {
+            return Err("cuda matmul_ex: dims exceed i32::MAX".into());
+        }
+        let transa = if trans_b { cublasOperation_t::CUBLAS_OP_N } else { cublasOperation_t::CUBLAS_OP_T };
+        let transb = if trans_a { cublasOperation_t::CUBLAS_OP_N } else { cublasOperation_t::CUBLAS_OP_T };
+        let m_c = n_out as i32;
+        let n_c = m_out as i32;
+        let k_c = shared as i32;
+        let lda = n as i32;  // rows of B_col
+        let ldb = k as i32;  // rows of A_col
+        let ldc = n_out as i32; // rows of C_col
+        Ok((transa, transb, m_c, n_c, k_c, lda, ldb, ldc, m_out, n_out))
+    }
+
+    pub fn matmul_f32_ex(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> CoreResult<Vec<f32>> {
+        let state = resolve_state()?;
+        let (_ta, _tb, _m_c, _n_c, _k_c, _lda, _ldb, _ldc, m_out, n_out) = compute_gemm_mapping(m, k, n, trans_a, trans_b)?;
+        let stream = &state.stream;
+        let a_dev = stream.memcpy_stod(a).map_err(|e| format!("cuda memcpy_stod(lhs): {e:?}"))?;
+        let b_dev = stream.memcpy_stod(b).map_err(|e| format!("cuda memcpy_stod(rhs): {e:?}"))?;
+        let mut c_dev = stream.alloc_zeros::<f32>(m_out * n_out).map_err(|e| format!("cuda alloc_zeros(out): {e:?}"))?;
+        matmul_f32_ex_device(&a_dev, &b_dev, &mut c_dev, m, k, n, trans_a, trans_b)?;
+        let host = stream.memcpy_dtov(&c_dev).map_err(|e| format!("cuda memcpy_dtov(out): {e:?}"))?;
+        Ok(host)
+    }
+
+    pub fn matmul_f32_ex_device(
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> CoreResult<()> {
+        let (transa, transb, m_c, n_c, k_c, lda, ldb, ldc, _m_out, _n_out) = compute_gemm_mapping(m, k, n, trans_a, trans_b)?;
+        let cfg = GemmConfig { transa, transb, m: m_c, n: n_c, k: k_c, alpha: 1.0f32, lda, ldb, beta: 0.0f32, ldc };
+        { let state = resolve_state()?; unsafe { state.blas.gemm(cfg, b, a, c) } }.map_err(|e| format!("cuda cublas sgemm (ex) failed: {e:?}"))?;
+        Ok(())
+    }
+
+    pub fn matmul_batched_f32(
+        a: &[f32],
+        b: &[f32],
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> CoreResult<Vec<f32>> {
+        let state = resolve_state()?;
+        let (_ta, _tb, _m_c, _n_c, _k_c, _lda, _ldb, _ldc, m_out, n_out) = compute_gemm_mapping(m, k, n, trans_a, trans_b)?;
+        let stream = &state.stream;
+        if a.len() != batch * m * k { return Err("cuda batched matmul: lhs length mismatch".into()); }
+        if b.len() != batch * k * n { return Err("cuda batched matmul: rhs length mismatch".into()); }
+        let a_dev = stream.memcpy_stod(a).map_err(|e| format!("cuda memcpy_stod(lhs): {e:?}"))?;
+        let b_dev = stream.memcpy_stod(b).map_err(|e| format!("cuda memcpy_stod(rhs): {e:?}"))?;
+        let mut c_dev = stream.alloc_zeros::<f32>(batch * m_out * n_out).map_err(|e| format!("cuda alloc_zeros(out): {e:?}"))?;
+        matmul_batched_f32_device(&a_dev, &b_dev, &mut c_dev, batch, m, k, n, trans_a, trans_b)?;
+        let host = stream.memcpy_dtov(&c_dev).map_err(|e| format!("cuda memcpy_dtov(out): {e:?}"))?;
+        Ok(host)
+    }
+
+    pub fn matmul_batched_f32_device(
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> CoreResult<()> {
+        let (transa, transb, m_c, n_c, k_c, lda, ldb, ldc, m_out, n_out) = compute_gemm_mapping(m, k, n, trans_a, trans_b)?;
+        let stride_a = (m * k) as i64;
+        let stride_b = (k * n) as i64;
+        let stride_c = (m_out * n_out) as i64;
+        let cfg = StridedBatchedConfig { gemm: GemmConfig { transa, transb, m: m_c, n: n_c, k: k_c, alpha: 1.0f32, lda, ldb, beta: 0.0f32, ldc }, batch_size: i32::try_from(batch).map_err(|_| "batch exceeds i32::MAX")?, stride_a, stride_b, stride_c };
+        { let state = resolve_state()?; unsafe { state.blas.gemm_strided_batched(cfg, b, a, c) } }.map_err(|e| format!("cuda cublas sgemm_strided_batched failed: {e:?}"))?;
+        Ok(())
     }
 }
 
 #[cfg(feature = "gpu-rocm")]
 mod rocm {
-    use super::*;
+    use crate::CoreResult;
 
     pub fn is_available() -> bool {
         false
