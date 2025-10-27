@@ -147,7 +147,7 @@ mod cuda {
     use std::collections::BTreeSet;
     use std::os::raw::c_int;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// Must stay in sync with the CUB block size used in `reduce_sum_f32`.
     const THREADS_PER_BLOCK: u32 = 256;
@@ -251,6 +251,13 @@ extern "C" __global__ void reduce_max_stage1(
         matmul_kernel: CudaFunction,
         reduce_sum_stage1: CudaFunction,
         reduce_max_stage1: CudaFunction,
+        // Temporary buffers pool (ping-pong) to reduce allocs in multi-pass reductions
+        tmp_sum_a: Mutex<Option<CudaSlice<f32>>>,
+        tmp_sum_b: Mutex<Option<CudaSlice<f32>>>,
+        tmp_max_vals_a: Mutex<Option<CudaSlice<f32>>>,
+        tmp_max_vals_b: Mutex<Option<CudaSlice<f32>>>,
+        tmp_max_idx_a: Mutex<Option<CudaSlice<i32>>>,
+        tmp_max_idx_b: Mutex<Option<CudaSlice<i32>>>,
     }
 
     static CUDA_STATE: Lazy<Result<CudaState, String>> = Lazy::new(|| {
@@ -279,8 +286,48 @@ extern "C" __global__ void reduce_max_stage1(
             matmul_kernel,
             reduce_sum_stage1,
             reduce_max_stage1,
+            tmp_sum_a: Mutex::new(None),
+            tmp_sum_b: Mutex::new(None),
+            tmp_max_vals_a: Mutex::new(None),
+            tmp_max_vals_b: Mutex::new(None),
+            tmp_max_idx_a: Mutex::new(None),
+            tmp_max_idx_b: Mutex::new(None),
         })
     });
+
+    fn ensure_tmp_f32_pair(state: &CudaState, min_len: usize) -> Result<(CudaSlice<f32>, CudaSlice<f32>), String> {
+        let stream = &state.stream;
+        let mut a = state.tmp_sum_a.lock().unwrap();
+        let mut b = state.tmp_sum_b.lock().unwrap();
+        if a.as_ref().map(|s| s.len()).unwrap_or(0) < min_len {
+            *a = Some(stream.alloc_zeros::<f32>(min_len).map_err(|e| format!("cuda alloc_zeros(tmp_sum_a): {e:?}"))?);
+        }
+        if b.as_ref().map(|s| s.len()).unwrap_or(0) < min_len {
+            *b = Some(stream.alloc_zeros::<f32>(min_len).map_err(|e| format!("cuda alloc_zeros(tmp_sum_b): {e:?}"))?);
+        }
+        Ok((a.as_ref().unwrap().clone(), b.as_ref().unwrap().clone()))
+    }
+
+    fn ensure_tmp_max_pair(state: &CudaState, min_len: usize) -> Result<(CudaSlice<f32>, CudaSlice<f32>, CudaSlice<i32>, CudaSlice<i32>), String> {
+        let stream = &state.stream;
+        let mut va = state.tmp_max_vals_a.lock().unwrap();
+        let mut vb = state.tmp_max_vals_b.lock().unwrap();
+        let mut ia = state.tmp_max_idx_a.lock().unwrap();
+        let mut ib = state.tmp_max_idx_b.lock().unwrap();
+        if va.as_ref().map(|s| s.len()).unwrap_or(0) < min_len {
+            *va = Some(stream.alloc_zeros::<f32>(min_len).map_err(|e| format!("cuda alloc_zeros(tmp_max_vals_a): {e:?}"))?);
+        }
+        if vb.as_ref().map(|s| s.len()).unwrap_or(0) < min_len {
+            *vb = Some(stream.alloc_zeros::<f32>(min_len).map_err(|e| format!("cuda alloc_zeros(tmp_max_vals_b): {e:?}"))?);
+        }
+        if ia.as_ref().map(|s| s.len()).unwrap_or(0) < min_len {
+            *ia = Some(stream.alloc_zeros::<i32>(min_len).map_err(|e| format!("cuda alloc_zeros(tmp_max_idx_a): {e:?}"))?);
+        }
+        if ib.as_ref().map(|s| s.len()).unwrap_or(0) < min_len {
+            *ib = Some(stream.alloc_zeros::<i32>(min_len).map_err(|e| format!("cuda alloc_zeros(tmp_max_idx_b): {e:?}"))?);
+        }
+        Ok((va.as_ref().unwrap().clone(), vb.as_ref().unwrap().clone(), ia.as_ref().unwrap().clone(), ib.as_ref().unwrap().clone()))
+    }
 
     fn compile_cuda_module() -> Result<cudarc::nvrtc::Ptx, String> {
         let mut opts = CompileOptions::default();
@@ -441,16 +488,9 @@ extern "C" __global__ void reduce_max_stage1(
         let mut curr = stream
             .memcpy_stod(values)
             .map_err(|err| format!("cuda memcpy_stod(input): {err:?}"))?;
-        let mut len = values.len();
-        loop {
-            let blocks = if len == 0 {
-                1
-            } else {
-                ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1
-            } as usize;
-            let mut partial = stream
-                .alloc_zeros::<f32>(blocks)
-                .map_err(|err| format!("cuda alloc_zeros(partials): {err:?}"))?;
+        let mut len = values.len(); let max_blocks = if len == 0 { 1 } else { ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1 }; let (buf_a, buf_b) = ensure_tmp_f32_pair(state, max_blocks)?; let mut use_a = true; loop {
+            let blocks = if len == 0 { 1 } else { ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1 } as usize;
+            let mut partial = if use_a { buf_a.clone() } else { buf_b.clone() };
             let cfg = launch_config_for_len(len)?;
             let len_i32 = i32::try_from(len)
                 .map_err(|_| "cuda reduce: length exceeds i32::MAX".to_string())?;
@@ -470,8 +510,7 @@ extern "C" __global__ void reduce_max_stage1(
                 return Ok(host[0]);
             }
             curr = partial;
-            len = blocks;
-        }
+            len = blocks; use_a = !use_a; }
     }
 
     pub fn reduce_max_f32(values: &[f32]) -> CoreResult<f32> {
@@ -486,19 +525,10 @@ extern "C" __global__ void reduce_max_stage1(
         let mut curr = stream
             .memcpy_stod(values)
             .map_err(|err| format!("cuda memcpy_stod(input): {err:?}"))?;
-        let mut len = values.len();
-        loop {
-            let blocks = if len == 0 {
-                1
-            } else {
-                ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1
-            } as usize;
-            let mut partial_vals = stream
-                .alloc_zeros::<f32>(blocks)
-                .map_err(|err| format!("cuda alloc_zeros(partial_vals): {err:?}"))?;
-            let mut partial_idx = stream
-                .alloc_zeros::<i32>(blocks)
-                .map_err(|err| format!("cuda alloc_zeros(partial_idx): {err:?}"))?;
+        let mut len = values.len(); let max_blocks = if len == 0 { 1 } else { ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1 }; let (vals_a, vals_b, idx_a, idx_b) = ensure_tmp_max_pair(state, max_blocks)?; let mut use_a = true; loop {
+            let blocks = if len == 0 { 1 } else { ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1 } as usize;
+            let mut partial_vals = if use_a { vals_a.clone() } else { vals_b.clone() };
+            let mut partial_idx = if use_a { idx_a.clone() } else { idx_b.clone() };
             let cfg = launch_config_for_len(len)?;
             let len_i32 = i32::try_from(len)
                 .map_err(|_| "cuda reduce_max: length exceeds i32::MAX".to_string())?;
@@ -519,8 +549,7 @@ extern "C" __global__ void reduce_max_stage1(
                 return Ok(host[0]);
             }
             curr = partial_vals;
-            len = blocks;
-        }
+            len = blocks; use_a = !use_a; }
     }
 
     pub fn argmax_f32(values: &[f32]) -> CoreResult<usize> {
@@ -535,19 +564,10 @@ extern "C" __global__ void reduce_max_stage1(
         let mut curr = stream
             .memcpy_stod(values)
             .map_err(|err| format!("cuda memcpy_stod(input): {err:?}"))?;
-        let mut len = values.len();
-        loop {
-            let blocks = if len == 0 {
-                1
-            } else {
-                ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1
-            } as usize;
-            let mut partial_vals = stream
-                .alloc_zeros::<f32>(blocks)
-                .map_err(|err| format!("cuda alloc_zeros(partial_vals): {err:?}"))?;
-            let mut partial_idx = stream
-                .alloc_zeros::<i32>(blocks)
-                .map_err(|err| format!("cuda alloc_zeros(partial_idx): {err:?}"))?;
+        let mut len = values.len(); let max_blocks = if len == 0 { 1 } else { ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1 }; let (vals_a, vals_b, idx_a, idx_b) = ensure_tmp_max_pair(state, max_blocks)?; let mut use_a = true; loop {
+            let blocks = if len == 0 { 1 } else { ((len - 1) / (THREADS_PER_BLOCK as usize)) + 1 } as usize;
+            let mut partial_vals = if use_a { vals_a.clone() } else { vals_b.clone() };
+            let mut partial_idx = if use_a { idx_a.clone() } else { idx_b.clone() };
             let cfg = launch_config_for_len(len)?;
             let len_i32 = i32::try_from(len)
                 .map_err(|_| "cuda argmax: length exceeds i32::MAX".to_string())?;
@@ -568,8 +588,7 @@ extern "C" __global__ void reduce_max_stage1(
                 return Ok(host_idx[0] as usize);
             }
             curr = partial_vals;
-            len = blocks;
-        }
+            len = blocks; use_a = !use_a; }
     }
 
     fn compute_gemm_mapping(
@@ -709,3 +728,5 @@ mod rocm {
         Err("ROCm backend not yet implemented".into())
     }
 }
+
+
