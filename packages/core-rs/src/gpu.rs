@@ -452,8 +452,8 @@ mod cuda {
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
     use cudarc::cublaslt::safe::{CudaBlasLT, Matmul, MatmulConfig};
     use cudarc::driver::{
-        CudaContext, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig,
-        PushKernelArg,
+        CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
+        LaunchConfig, PushKernelArg,
     };
     use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
     use half::{bf16, f16};
@@ -461,12 +461,11 @@ mod cuda {
 
 const REDUCE_KERNEL_SRC: &str = r#"
 #include <math.h>
-#define BLOCK_SIZE 256
 
 extern "C" __global__ void reduce_sum_stage1(const float* __restrict__ input,
                                              float* __restrict__ partial,
                                              int length) {
-    __shared__ float sdata[BLOCK_SIZE];
+    extern __shared__ float sdata[];
     int tid = threadIdx.x;
     int global = blockIdx.x * blockDim.x + tid;
     int stride = blockDim.x * gridDim.x;
@@ -490,7 +489,7 @@ extern "C" __global__ void reduce_sum_stage1(const float* __restrict__ input,
 extern "C" __global__ void reduce_max_stage1_ignore_nan(const float* __restrict__ input,
                                                         float* __restrict__ partial,
                                                         int length) {
-    __shared__ float smax[BLOCK_SIZE];
+    extern __shared__ float smax[];
     int tid = threadIdx.x;
     int global = blockIdx.x * blockDim.x + tid;
     int stride = blockDim.x * gridDim.x;
@@ -521,8 +520,9 @@ extern "C" __global__ void argmax_stage1_ignore_nan(const float* __restrict__ in
                                                     float* __restrict__ pmax,
                                                     int* __restrict__ pidx,
                                                     int length) {
-    __shared__ float smax[BLOCK_SIZE];
-    __shared__ int sarg[BLOCK_SIZE];
+    extern __shared__ unsigned char smem[];
+    float* smax = reinterpret_cast<float*>(smem);
+    int* sarg = reinterpret_cast<int*>(smem + blockDim.x * sizeof(float));
     int tid = threadIdx.x;
     int global = blockIdx.x * blockDim.x + tid;
     int stride = blockDim.x * gridDim.x;
@@ -564,8 +564,9 @@ extern "C" __global__ void argmax_stage_reduce(const float* __restrict__ values_
                                                float* __restrict__ values_out,
                                                int* __restrict__ idx_out,
                                                int length) {
-    __shared__ float smax[BLOCK_SIZE];
-    __shared__ int sidx[BLOCK_SIZE];
+    extern __shared__ unsigned char smem[];
+    float* smax = reinterpret_cast<float*>(smem);
+    int* sidx = reinterpret_cast<int*>(smem + blockDim.x * sizeof(float));
     int tid = threadIdx.x;
     int global = blockIdx.x * blockDim.x + tid;
     int stride = blockDim.x * gridDim.x;
@@ -606,7 +607,7 @@ extern "C" __global__ void argmax_stage_reduce(const float* __restrict__ values_
 extern "C" __global__ void first_nan_index_stage1(const float* __restrict__ input,
                                                   int* __restrict__ pmin,
                                                   int length) {
-    __shared__ int smin[BLOCK_SIZE];
+    extern __shared__ int smin[];
     int tid = threadIdx.x;
     int global = blockIdx.x * blockDim.x + tid;
     int stride = blockDim.x * gridDim.x;
@@ -636,7 +637,7 @@ extern "C" __global__ void first_nan_index_stage1(const float* __restrict__ inpu
 extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
                                                   int* __restrict__ partial,
                                                   int length) {
-    __shared__ int smin[BLOCK_SIZE];
+    extern __shared__ int smin[];
     int tid = threadIdx.x;
     int global = blockIdx.x * blockDim.x + tid;
     int stride = blockDim.x * gridDim.x;
@@ -1029,9 +1030,6 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
         }
     }
 
-    const REDUCE_BLOCK_DIM: u32 = 256;
-    const REDUCE_BLOCK_DIM_USIZE: usize = REDUCE_BLOCK_DIM as usize;
-
     fn usize_to_i32(label: &str, value: usize) -> Result<i32, String> {
         if value > i32::MAX as usize {
             Err(format!("{label}: {value} exceeds i32::MAX"))
@@ -1048,17 +1046,16 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
         }
     }
 
-    fn blocks_for_len(label: &str, len: usize) -> Result<u32, String> {
+    fn blocks_for_len(label: &str, len: usize, block_dim: u32) -> Result<u32, String> {
         if len == 0 {
             return Ok(1);
         }
+        let block_dim = block_dim.max(1) as usize;
         let adjusted = len
-            .checked_add(REDUCE_BLOCK_DIM_USIZE - 1)
+            .checked_add(block_dim - 1)
             .ok_or_else(|| format!("{label}: length overflow computing grid dim"))?;
-        let blocks = adjusted / REDUCE_BLOCK_DIM_USIZE;
-        if blocks == 0 {
-            return Ok(1);
-        }
+        let blocks = adjusted / block_dim;
+        let blocks = blocks.max(1);
         if blocks > u32::MAX as usize {
             return Err(format!("{label}: grid_dim.x exceeds u32::MAX"));
         }
@@ -1076,6 +1073,39 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
             return Err(format!("{label}: stride product exceeds usize::MAX"));
         }
         Ok(product as usize)
+    }
+
+    extern "C" fn smem_per_thread_f32(block_size: i32) -> usize {
+        (block_size as usize) * std::mem::size_of::<f32>()
+    }
+
+    extern "C" fn smem_per_thread_f32_i32(block_size: i32) -> usize {
+        (block_size as usize) * (std::mem::size_of::<f32>() + std::mem::size_of::<i32>())
+    }
+
+    extern "C" fn smem_per_thread_i32(block_size: i32) -> usize {
+        (block_size as usize) * std::mem::size_of::<i32>()
+    }
+
+    fn select_block_dim(
+        func: &CudaFunction,
+        smem_fn: extern "C" fn(i32) -> usize,
+    ) -> Result<u32, String> {
+        let block = match func.occupancy_max_potential_block_size(smem_fn, 0, 0, None) {
+            Ok((block, _)) if block > 0 => block as u32,
+            _ => 256,
+        };
+        Ok(block.clamp(64, 1024))
+    }
+
+    fn shared_mem_bytes(block_dim: u32, bytes_per_thread: usize) -> Result<u32, String> {
+        let total = (block_dim as usize)
+            .checked_mul(bytes_per_thread)
+            .ok_or_else(|| "shared memory size overflow".to_string())?;
+        if total > u32::MAX as usize {
+            return Err("shared memory size exceeds u32::MAX".into());
+        }
+        Ok(total as u32)
     }
 
     const MATMUL_TILE_DIM: u32 = 16;
@@ -2012,20 +2042,22 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
         let func = module
             .load_function("reduce_sum_stage1")
             .map_err(|e| format!("get func: {:?}", e))?;
+        let block_dim = select_block_dim(&func, smem_per_thread_f32)?;
+        let shared = shared_mem_bytes(block_dim, std::mem::size_of::<f32>())?;
         let mut current = stream
             .memcpy_stod(values)
             .map_err(|e| format!("htod: {:?}", e))?;
         let mut current_len = n;
         loop {
             let len_i32 = usize_to_i32("reduce_sum length", current_len)?;
-            let blocks = blocks_for_len("reduce_sum length", current_len)?;
+            let blocks = blocks_for_len("reduce_sum length", current_len, block_dim)?;
             let mut next: CudaSlice<f32> = stream
                 .alloc_zeros(blocks as usize)
                 .map_err(|e| format!("alloc tmp: {:?}", e))?;
             let cfg = LaunchConfig {
                 grid_dim: (blocks, 1, 1),
-                block_dim: (REDUCE_BLOCK_DIM, 1, 1),
-                shared_mem_bytes: 0,
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: shared,
             };
             unsafe {
                 stream
@@ -2072,6 +2104,8 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
         let k_max = module
             .load_function("reduce_max_stage1_ignore_nan")
             .map_err(|e| format!("get func: {:?}", e))?;
+        let block_dim_max = select_block_dim(&k_max, smem_per_thread_f32)?;
+        let shared_max = shared_mem_bytes(block_dim_max, std::mem::size_of::<f32>())?;
         let mut current = stream
             .memcpy_stod(values)
             .map_err(|e| format!("htod: {:?}", e))?;
@@ -2082,15 +2116,21 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
             let k_nan_reduce = module
                 .load_function("min_index_stage_reduce")
                 .map_err(|e| format!("get func: {:?}", e))?;
-            let nan_blocks = blocks_for_len("reduce_max first_nan length", n)?;
+            let block_dim_nan = select_block_dim(&k_nan, smem_per_thread_i32)?;
+            let shared_nan = shared_mem_bytes(block_dim_nan, std::mem::size_of::<i32>())?;
+            let block_dim_nan_reduce =
+                select_block_dim(&k_nan_reduce, smem_per_thread_i32)?;
+            let shared_nan_reduce =
+                shared_mem_bytes(block_dim_nan_reduce, std::mem::size_of::<i32>())?;
+            let nan_blocks = blocks_for_len("reduce_max first_nan length", n, block_dim_nan)?;
             let mut nan_current = stream
                 .alloc_zeros::<i32>(nan_blocks as usize)
                 .map_err(|e| format!("alloc tmp_nan: {:?}", e))?;
             let len_i32 = usize_to_i32("reduce_max first_nan length", n)?;
             let cfg = LaunchConfig {
                 grid_dim: (nan_blocks, 1, 1),
-                block_dim: (REDUCE_BLOCK_DIM, 1, 1),
-                shared_mem_bytes: 0,
+                block_dim: (block_dim_nan, 1, 1),
+                shared_mem_bytes: shared_nan,
             };
             unsafe {
                 stream
@@ -2103,15 +2143,19 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
             .map_err(|e| format!("launch first_nan: {:?}", e))?;
             let mut nan_len = nan_blocks as usize;
             while nan_len > 1 {
-                let blocks = blocks_for_len("reduce_max first_nan partial length", nan_len)?;
+                let blocks = blocks_for_len(
+                    "reduce_max first_nan partial length",
+                    nan_len,
+                    block_dim_nan_reduce,
+                )?;
                 let mut next_nan = stream
                     .alloc_zeros::<i32>(blocks as usize)
                     .map_err(|e| format!("alloc next_nan: {:?}", e))?;
                 let len_i32 = usize_to_i32("reduce_max first_nan partial length", nan_len)?;
                 let cfg = LaunchConfig {
                     grid_dim: (blocks, 1, 1),
-                    block_dim: (REDUCE_BLOCK_DIM, 1, 1),
-                    shared_mem_bytes: 0,
+                    block_dim: (block_dim_nan_reduce, 1, 1),
+                    shared_mem_bytes: shared_nan_reduce,
                 };
                 unsafe {
                     stream
@@ -2136,14 +2180,14 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
         let mut current_len = n;
         loop {
             let len_i32 = usize_to_i32("reduce_max length", current_len)?;
-            let blocks = blocks_for_len("reduce_max length", current_len)?;
+            let blocks = blocks_for_len("reduce_max length", current_len, block_dim_max)?;
             let mut next = stream
                 .alloc_zeros::<f32>(blocks as usize)
                 .map_err(|e| format!("alloc tmp: {:?}", e))?;
             let cfg = LaunchConfig {
                 grid_dim: (blocks, 1, 1),
-                block_dim: (REDUCE_BLOCK_DIM, 1, 1),
-                shared_mem_bytes: 0,
+                block_dim: (block_dim_max, 1, 1),
+                shared_mem_bytes: shared_max,
             };
             unsafe {
                 stream
@@ -2180,6 +2224,11 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
         let k_argmax = module
             .load_function("argmax_stage1_ignore_nan")
             .map_err(|e| format!("get func: {:?}", e))?;
+        let block_dim_argmax = select_block_dim(&k_argmax, smem_per_thread_f32_i32)?;
+        let shared_argmax = shared_mem_bytes(
+            block_dim_argmax,
+            std::mem::size_of::<f32>() + std::mem::size_of::<i32>(),
+        )?;
         let current = stream
             .memcpy_stod(values)
             .map_err(|e| format!("htod: {:?}", e))?;
@@ -2190,15 +2239,21 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
             let k_nan_reduce = module
                 .load_function("min_index_stage_reduce")
                 .map_err(|e| format!("get func: {:?}", e))?;
-            let nan_blocks = blocks_for_len("argmax first_nan length", n)?;
+            let block_dim_nan = select_block_dim(&k_nan, smem_per_thread_i32)?;
+            let shared_nan = shared_mem_bytes(block_dim_nan, std::mem::size_of::<i32>())?;
+            let block_dim_nan_reduce =
+                select_block_dim(&k_nan_reduce, smem_per_thread_i32)?;
+            let shared_nan_reduce =
+                shared_mem_bytes(block_dim_nan_reduce, std::mem::size_of::<i32>())?;
+            let nan_blocks = blocks_for_len("argmax first_nan length", n, block_dim_nan)?;
             let mut nan_current = stream
                 .alloc_zeros::<i32>(nan_blocks as usize)
                 .map_err(|e| format!("alloc tmp_nan: {:?}", e))?;
             let len_i32 = usize_to_i32("argmax first_nan length", n)?;
             let cfg = LaunchConfig {
                 grid_dim: (nan_blocks, 1, 1),
-                block_dim: (REDUCE_BLOCK_DIM, 1, 1),
-                shared_mem_bytes: 0,
+                block_dim: (block_dim_nan, 1, 1),
+                shared_mem_bytes: shared_nan,
             };
             unsafe {
                 stream
@@ -2211,15 +2266,19 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
             .map_err(|e| format!("launch first_nan: {:?}", e))?;
             let mut nan_len = nan_blocks as usize;
             while nan_len > 1 {
-                let blocks = blocks_for_len("argmax first_nan partial length", nan_len)?;
+                let blocks = blocks_for_len(
+                    "argmax first_nan partial length",
+                    nan_len,
+                    block_dim_nan_reduce,
+                )?;
                 let mut next_nan = stream
                     .alloc_zeros::<i32>(blocks as usize)
                     .map_err(|e| format!("alloc next_nan: {:?}", e))?;
                 let len_i32 = usize_to_i32("argmax first_nan partial length", nan_len)?;
                 let cfg = LaunchConfig {
                     grid_dim: (blocks, 1, 1),
-                    block_dim: (REDUCE_BLOCK_DIM, 1, 1),
-                    shared_mem_bytes: 0,
+                    block_dim: (block_dim_nan_reduce, 1, 1),
+                    shared_mem_bytes: shared_nan_reduce,
                 };
                 unsafe {
                     stream
@@ -2242,7 +2301,7 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
             }
         }
         let len_i32 = usize_to_i32("argmax length", n)?;
-        let mut blocks = blocks_for_len("argmax length", n)?;
+        let mut blocks = blocks_for_len("argmax length", n, block_dim_argmax)?;
         let mut vals = stream
             .alloc_zeros::<f32>(blocks as usize)
             .map_err(|e| format!("alloc pmax: {:?}", e))?;
@@ -2251,8 +2310,8 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
             .map_err(|e| format!("alloc pidx: {:?}", e))?;
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
-            block_dim: (REDUCE_BLOCK_DIM, 1, 1),
-            shared_mem_bytes: 0,
+            block_dim: (block_dim_argmax, 1, 1),
+            shared_mem_bytes: shared_argmax,
         };
         unsafe {
             stream
@@ -2267,9 +2326,19 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
         let k_argmax_reduce = module
             .load_function("argmax_stage_reduce")
             .map_err(|e| format!("get func: {:?}", e))?;
+        let block_dim_argmax_reduce =
+            select_block_dim(&k_argmax_reduce, smem_per_thread_f32_i32)?;
+        let shared_argmax_reduce = shared_mem_bytes(
+            block_dim_argmax_reduce,
+            std::mem::size_of::<f32>() + std::mem::size_of::<i32>(),
+        )?;
         let mut current_len = blocks as usize;
         while current_len > 1 {
-            blocks = blocks_for_len("argmax partial length", current_len)?;
+            blocks = blocks_for_len(
+                "argmax partial length",
+                current_len,
+                block_dim_argmax_reduce,
+            )?;
             let mut next_vals = stream
                 .alloc_zeros::<f32>(blocks as usize)
                 .map_err(|e| format!("alloc next_vals: {:?}", e))?;
@@ -2279,8 +2348,8 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
             let len_i32 = usize_to_i32("argmax partial length", current_len)?;
             let cfg = LaunchConfig {
                 grid_dim: (blocks, 1, 1),
-                block_dim: (REDUCE_BLOCK_DIM, 1, 1),
-                shared_mem_bytes: 0,
+                block_dim: (block_dim_argmax_reduce, 1, 1),
+                shared_mem_bytes: shared_argmax_reduce,
             };
             unsafe {
                 stream
