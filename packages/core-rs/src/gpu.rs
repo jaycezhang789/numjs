@@ -459,7 +459,7 @@ mod cuda {
     use half::{bf16, f16};
     use std::{collections::HashSet, env, fs, path::PathBuf, sync::Arc};
 
-    const REDUCE_KERNEL_SRC: &str = r#"
+const REDUCE_KERNEL_SRC: &str = r#"
 #include <math.h>
 #define BLOCK_SIZE 256
 
@@ -664,6 +664,133 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
 }
 "#;
 
+    const MATMUL_KERNEL_SRC: &str = r#"
+#define TILE_M 16
+#define TILE_N 16
+#define TILE_K 16
+
+__device__ __forceinline__ float load_a(const float* A,
+                                        int row,
+                                        int col,
+                                        int m,
+                                        int k,
+                                        int lda,
+                                        bool trans_a) {
+    if (trans_a) {
+        if (col < k && row < m) {
+            return A[col * lda + row];
+        }
+    } else {
+        if (row < m && col < k) {
+            return A[row * lda + col];
+        }
+    }
+    return 0.0f;
+}
+
+__device__ __forceinline__ float load_b(const float* B,
+                                        int row,
+                                        int col,
+                                        int k,
+                                        int n,
+                                        int ldb,
+                                        bool trans_b) {
+    if (trans_b) {
+        if (col < n && row < k) {
+            return B[col * ldb + row];
+        }
+    } else {
+        if (row < k && col < n) {
+            return B[row * ldb + col];
+        }
+    }
+    return 0.0f;
+}
+
+extern "C" __global__ void matmul_tiled(const float* __restrict__ A,
+                                        const float* __restrict__ B,
+                                        float* __restrict__ C,
+                                        int m,
+                                        int k,
+                                        int n,
+                                        int lda,
+                                        int ldb,
+                                        int ldc,
+                                        int trans_a,
+                                        int trans_b) {
+    __shared__ float As[TILE_M][TILE_K];
+    __shared__ float Bs[TILE_K][TILE_N];
+    int row = blockIdx.y * TILE_M + threadIdx.y;
+    int col = blockIdx.x * TILE_N + threadIdx.x;
+    float acc = 0.0f;
+    int tiles = (k + TILE_K - 1) / TILE_K;
+    for (int t = 0; t < tiles; ++t) {
+        int a_col = t * TILE_K + threadIdx.x;
+        int b_row = t * TILE_K + threadIdx.y;
+        As[threadIdx.y][threadIdx.x] =
+            load_a(A, row, a_col, m, k, lda, trans_a != 0);
+        Bs[threadIdx.y][threadIdx.x] =
+            load_b(B, b_row, col, k, n, ldb, trans_b != 0);
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < TILE_K; ++kk) {
+            acc += As[threadIdx.y][kk] * Bs[kk][threadIdx.x];
+        }
+        __syncthreads();
+    }
+    if (row < m && col < n) {
+        C[row * ldc + col] = acc;
+    }
+}
+
+extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
+                                                const float* __restrict__ B,
+                                                float* __restrict__ C,
+                                                int m,
+                                                int k,
+                                                int n,
+                                                int lda,
+                                                int ldb,
+                                                int ldc,
+                                                long long stride_a,
+                                                long long stride_b,
+                                                long long stride_c,
+                                                int trans_a,
+                                                int trans_b,
+                                                int batch) {
+    int batch_idx = blockIdx.z;
+    if (batch_idx >= batch) {
+        return;
+    }
+    const float* Abase = A + batch_idx * stride_a;
+    const float* Bbase = B + batch_idx * stride_b;
+    float* Cbase = C + batch_idx * stride_c;
+    __shared__ float As[TILE_M][TILE_K];
+    __shared__ float Bs[TILE_K][TILE_N];
+    int row = blockIdx.y * TILE_M + threadIdx.y;
+    int col = blockIdx.x * TILE_N + threadIdx.x;
+    float acc = 0.0f;
+    int tiles = (k + TILE_K - 1) / TILE_K;
+    for (int t = 0; t < tiles; ++t) {
+        int a_col = t * TILE_K + threadIdx.x;
+        int b_row = t * TILE_K + threadIdx.y;
+        As[threadIdx.y][threadIdx.x] =
+            load_a(Abase, row, a_col, m, k, lda, trans_a != 0);
+        Bs[threadIdx.y][threadIdx.x] =
+            load_b(Bbase, b_row, col, k, n, ldb, trans_b != 0);
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < TILE_K; ++kk) {
+            acc += As[threadIdx.y][kk] * Bs[kk][threadIdx.x];
+        }
+        __syncthreads();
+    }
+    if (row < m && col < n) {
+        Cbase[row * ldc + col] = acc;
+    }
+}
+"#;
+
     pub fn is_available() -> bool {
         match CudaContext::new(0) {
             Ok(ctx) => {
@@ -710,6 +837,15 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         opts.include_paths = nvrtc_include_paths();
         let ptx =
             compile_ptx_with_opts(REDUCE_KERNEL_SRC, opts).map_err(|e| format!("nvrtc: {:?}", e))?;
+        ctx.load_module(ptx)
+            .map_err(|e| format!("load module: {:?}", e))
+    }
+
+    fn load_matmul_module(ctx: &Arc<CudaContext>) -> Result<Arc<CudaModule>, String> {
+        let mut opts = CompileOptions::default();
+        opts.include_paths = nvrtc_include_paths();
+        let ptx =
+            compile_ptx_with_opts(MATMUL_KERNEL_SRC, opts).map_err(|e| format!("nvrtc: {:?}", e))?;
         ctx.load_module(ptx)
             .map_err(|e| format!("load module: {:?}", e))
     }
@@ -942,6 +1078,168 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         Ok(product as usize)
     }
 
+    const MATMUL_TILE_DIM: u32 = 16;
+
+    fn grid_dim_for(label: &str, len: usize) -> Result<u32, String> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let tile = MATMUL_TILE_DIM as usize;
+        let adjusted = len
+            .checked_add(tile - 1)
+            .ok_or_else(|| format!("{label}: overflow computing grid dimension"))?;
+        let blocks = adjusted / tile;
+        if blocks > u32::MAX as usize {
+            return Err(format!("{label}: grid_dim exceeds u32::MAX"));
+        }
+        Ok(blocks as u32)
+    }
+
+    fn leading_dims(
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> Result<(i32, i32, i32), String> {
+        let lda = if trans_a { m } else { k };
+        let ldb = if trans_b { k } else { n };
+        let ldc = n;
+        Ok((
+            usize_to_i32("matmul lda", lda)?,
+            usize_to_i32("matmul ldb", ldb)?,
+            usize_to_i32("matmul ldc", ldc)?,
+        ))
+    }
+
+    fn launch_matmul_tiled(
+        stream: Arc<CudaStream>,
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> Result<(), String> {
+        if m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+        let ctx = stream.context().clone();
+        let module = load_matmul_module(&ctx)?;
+        let func = module
+            .load_function("matmul_tiled")
+            .map_err(|e| format!("load matmul_tiled: {:?}", e))?;
+        let grid_x = grid_dim_for("matmul grid x", n)?;
+        let grid_y = grid_dim_for("matmul grid y", m)?;
+        if grid_x == 0 || grid_y == 0 {
+            return Ok(());
+        }
+        let (lda, ldb, ldc) = leading_dims(m, k, n, trans_a, trans_b)?;
+        let m_i = usize_to_i32("matmul m", m)?;
+        let k_i = usize_to_i32("matmul k", k)?;
+        let n_i = usize_to_i32("matmul n", n)?;
+        let trans_a_i = if trans_a { 1 } else { 0 };
+        let trans_b_i = if trans_b { 1 } else { 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, grid_y, 1),
+            block_dim: (MATMUL_TILE_DIM, MATMUL_TILE_DIM, 1),
+            shared_mem_bytes: 0,
+        };
+        let (a_ptr, _sync_a) = a.device_ptr(&stream);
+        let (b_ptr, _sync_b) = b.device_ptr(&stream);
+        let (c_ptr, _sync_c) = c.device_ptr_mut(&stream);
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&a_ptr)
+                .arg(&b_ptr)
+                .arg(&c_ptr)
+                .arg(&m_i)
+                .arg(&k_i)
+                .arg(&n_i)
+                .arg(&lda)
+                .arg(&ldb)
+                .arg(&ldc)
+                .arg(&trans_a_i)
+                .arg(&trans_b_i)
+                .launch(cfg)
+        }
+        .map(|_| ())
+        .map_err(|e| format!("launch matmul_tiled: {:?}", e))
+    }
+
+    fn launch_matmul_tiled_strided(
+        stream: Arc<CudaStream>,
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        c: &mut CudaSlice<f32>,
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+        stride_a: i64,
+        stride_b: i64,
+        stride_c: i64,
+    ) -> Result<(), String> {
+        if batch == 0 || m == 0 || n == 0 || k == 0 {
+            return Ok(());
+        }
+        let ctx = stream.context().clone();
+        let module = load_matmul_module(&ctx)?;
+        let func = module
+            .load_function("matmul_tiled_strided")
+            .map_err(|e| format!("load matmul_tiled_strided: {:?}", e))?;
+        let grid_x = grid_dim_for("matmul grid x", n)?;
+        let grid_y = grid_dim_for("matmul grid y", m)?;
+        if grid_x == 0 || grid_y == 0 {
+            return Ok(());
+        }
+        let grid_z = usize_to_i32("matmul batch size", batch)?;
+        if grid_z <= 0 {
+            return Ok(());
+        }
+        let (lda, ldb, ldc) = leading_dims(m, k, n, trans_a, trans_b)?;
+        let m_i = usize_to_i32("matmul m", m)?;
+        let k_i = usize_to_i32("matmul k", k)?;
+        let n_i = usize_to_i32("matmul n", n)?;
+        let trans_a_i = if trans_a { 1 } else { 0 };
+        let trans_b_i = if trans_b { 1 } else { 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, grid_y, grid_z as u32),
+            block_dim: (MATMUL_TILE_DIM, MATMUL_TILE_DIM, 1),
+            shared_mem_bytes: 0,
+        };
+        let (a_ptr, _sync_a) = a.device_ptr(&stream);
+        let (b_ptr, _sync_b) = b.device_ptr(&stream);
+        let (c_ptr, _sync_c) = c.device_ptr_mut(&stream);
+        unsafe {
+            stream
+                .launch_builder(&func)
+                .arg(&a_ptr)
+                .arg(&b_ptr)
+                .arg(&c_ptr)
+                .arg(&m_i)
+                .arg(&k_i)
+                .arg(&n_i)
+                .arg(&lda)
+                .arg(&ldb)
+                .arg(&ldc)
+                .arg(&stride_a)
+                .arg(&stride_b)
+                .arg(&stride_c)
+                .arg(&trans_a_i)
+                .arg(&trans_b_i)
+                .arg(&grid_z)
+                .launch(cfg)
+        }
+        .map(|_| ())
+        .map_err(|e| format!("launch matmul_tiled_strided: {:?}", e))
+    }
+
     #[allow(dead_code)]
     pub fn matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> CoreResult<Vec<f32>> {
         matmul_f32_ex_with_policy(
@@ -1012,7 +1310,6 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         let stream = ctx.default_stream();
         match policy {
             MatmulTensorCorePolicy::Accuracy => {
-                let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
                 let d_a = stream
                     .memcpy_stod(a)
                     .map_err(|e| format!("htod a: {:?}", e))?;
@@ -1023,11 +1320,51 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
                     .alloc_zeros::<f32>(total)
                     .map_err(|e| format!("alloc c: {:?}", e))?;
                 let cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
-                unsafe { blas.gemm(cfg, &d_b, &d_a, &mut d_c) }
-                    .map_err(|e| format!("sgemm: {:?}", e))?;
-                stream
-                    .memcpy_dtov(&d_c)
-                    .map_err(|e| format!("dtoh c: {:?}", e))
+                match CudaBlas::new(stream.clone()) {
+                    Ok(blas) => match unsafe { blas.gemm(cfg, &d_b, &d_a, &mut d_c) } {
+                        Ok(()) => stream
+                            .memcpy_dtov(&d_c)
+                            .map_err(|e| format!("dtoh c: {:?}", e)),
+                        Err(err) => {
+                            if cfg!(debug_assertions) {
+                                eprintln!("cuBLAS sgemm failed ({err:?}), falling back to tiled kernel");
+                            }
+                            launch_matmul_tiled(
+                                stream.clone(),
+                                &d_a,
+                                &d_b,
+                                &mut d_c,
+                                m,
+                                k,
+                                n,
+                                trans_a,
+                                trans_b,
+                            )?;
+                            stream
+                                .memcpy_dtov(&d_c)
+                                .map_err(|e| format!("dtoh c: {:?}", e))
+                        }
+                    },
+                    Err(err) => {
+                        if cfg!(debug_assertions) {
+                            eprintln!("cuBLAS unavailable ({err:?}), using tiled kernel fallback");
+                        }
+                        launch_matmul_tiled(
+                            stream.clone(),
+                            &d_a,
+                            &d_b,
+                            &mut d_c,
+                            m,
+                            k,
+                            n,
+                            trans_a,
+                            trans_b,
+                        )?;
+                        stream
+                            .memcpy_dtov(&d_c)
+                            .map_err(|e| format!("dtoh c: {:?}", e))
+                    }
+                }
             }
             MatmulTensorCorePolicy::Performance => {
                 let d_a = stream
@@ -1055,19 +1392,59 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
                         .map_err(|e| format!("dtoh c: {:?}", e)),
                     Err(err) => {
                         // 回退到传统 cuBLAS
-                        let blas =
-                            CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
                         let cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
-                        unsafe { blas.gemm(cfg, &d_b, &d_a, &mut d_c) }
-                            .map_err(|e| format!("sgemm: {:?}", e))?;
-                        let mut host = stream
-                            .memcpy_dtov(&d_c)
-                            .map_err(|e| format!("dtoh c: {:?}", e))?;
-                        host.shrink_to_fit();
                         if cfg!(debug_assertions) {
-                            eprintln!("cublasLt fast path failed ({err}), fallback to cuBLAS");
+                            eprintln!("cublasLt fast path failed ({err}), attempting cuBLAS fallback");
                         }
-                        Ok(host)
+                        match CudaBlas::new(stream.clone()) {
+                            Ok(blas) => match unsafe { blas.gemm(cfg, &d_b, &d_a, &mut d_c) } {
+                                Ok(()) => stream
+                                    .memcpy_dtov(&d_c)
+                                    .map_err(|e| format!("dtoh c: {:?}", e)),
+                                Err(gemm_err) => {
+                                    if cfg!(debug_assertions) {
+                                        eprintln!(
+                                            "cuBLAS fallback failed ({gemm_err:?}), using tiled kernel"
+                                        );
+                                    }
+                                    launch_matmul_tiled(
+                                        stream.clone(),
+                                        &d_a,
+                                        &d_b,
+                                        &mut d_c,
+                                        m,
+                                        k,
+                                        n,
+                                        trans_a,
+                                        trans_b,
+                                    )?;
+                                    stream
+                                        .memcpy_dtov(&d_c)
+                                        .map_err(|e| format!("dtoh c: {:?}", e))
+                                }
+                            },
+                            Err(blas_err) => {
+                                if cfg!(debug_assertions) {
+                                    eprintln!(
+                                        "cuBLAS unavailable ({blas_err:?}), using tiled kernel fallback"
+                                    );
+                                }
+                                launch_matmul_tiled(
+                                    stream.clone(),
+                                    &d_a,
+                                    &d_b,
+                                    &mut d_c,
+                                    m,
+                                    k,
+                                    n,
+                                    trans_a,
+                                    trans_b,
+                                )?;
+                                stream
+                                    .memcpy_dtov(&d_c)
+                                    .map_err(|e| format!("dtoh c: {:?}", e))
+                            }
+                        }
                     }
                 }
             }
@@ -1238,7 +1615,6 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
         let stream = ctx.default_stream();
         match policy {
             MatmulTensorCorePolicy::Accuracy => {
-                let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
                 let d_a = stream
                     .memcpy_stod(a)
                     .map_err(|e| format!("htod a: {:?}", e))?;
@@ -1256,11 +1632,64 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
                     stride_b: stride_a,
                     stride_c,
                 };
-                unsafe { blas.gemm_strided_batched(cfg, &d_b, &d_a, &mut d_c) }
-                    .map_err(|e| format!("sgemm_strided_batched: {:?}", e))?;
-                stream
-                    .memcpy_dtov(&d_c)
-                    .map_err(|e| format!("dtoh c: {:?}", e))
+                match CudaBlas::new(stream.clone()) {
+                    Ok(blas) => match unsafe { blas.gemm_strided_batched(cfg, &d_b, &d_a, &mut d_c) }
+                    {
+                        Ok(()) => stream
+                            .memcpy_dtov(&d_c)
+                            .map_err(|e| format!("dtoh c: {:?}", e)),
+                        Err(err) => {
+                            if cfg!(debug_assertions) {
+                                eprintln!(
+                                    "cuBLAS strided batched sgemm failed ({err:?}), using tiled kernel fallback"
+                                );
+                            }
+                            launch_matmul_tiled_strided(
+                                stream.clone(),
+                                &d_a,
+                                &d_b,
+                                &mut d_c,
+                                batch,
+                                m,
+                                k,
+                                n,
+                                trans_a,
+                                trans_b,
+                                stride_a,
+                                stride_b,
+                                stride_c,
+                            )?;
+                            stream
+                                .memcpy_dtov(&d_c)
+                                .map_err(|e| format!("dtoh c: {:?}", e))
+                        }
+                    },
+                    Err(err) => {
+                        if cfg!(debug_assertions) {
+                            eprintln!(
+                                "cuBLAS unavailable ({err:?}) for strided batched, using tiled kernel fallback"
+                            );
+                        }
+                        launch_matmul_tiled_strided(
+                            stream.clone(),
+                            &d_a,
+                            &d_b,
+                            &mut d_c,
+                            batch,
+                            m,
+                            k,
+                            n,
+                            trans_a,
+                            trans_b,
+                            stride_a,
+                            stride_b,
+                            stride_c,
+                        )?;
+                        stream
+                            .memcpy_dtov(&d_c)
+                            .map_err(|e| format!("dtoh c: {:?}", e))
+                    }
+                }
             }
             MatmulTensorCorePolicy::Performance => {
                 let d_a = stream
@@ -1291,8 +1720,11 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
                         .memcpy_dtov(&d_c)
                         .map_err(|e| format!("dtoh c: {:?}", e)),
                     Err(err) => {
-                        let blas =
-                            CudaBlas::new(stream.clone()).map_err(|e| format!("cublas: {:?}", e))?;
+                        if cfg!(debug_assertions) {
+                            eprintln!(
+                                "cublasLt strided fast path failed ({err}), attempting cuBLAS fallback"
+                            );
+                        }
                         let gemm_cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
                         let cfg = StridedBatchedConfig::<f32> {
                             gemm: gemm_cfg,
@@ -1301,18 +1733,63 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
                             stride_b: stride_a,
                             stride_c,
                         };
-                        unsafe { blas.gemm_strided_batched(cfg, &d_b, &d_a, &mut d_c) }
-                            .map_err(|e| format!("sgemm_strided_batched: {:?}", e))?;
-                        let mut host = stream
-                            .memcpy_dtov(&d_c)
-                            .map_err(|e| format!("dtoh c: {:?}", e))?;
-                        host.shrink_to_fit();
-                        if cfg!(debug_assertions) {
-                            eprintln!(
-                                "cublasLt strided fast path failed ({err}), fallback to cuBLAS"
-                            );
+                        match CudaBlas::new(stream.clone()) {
+                            Ok(blas) => match unsafe { blas.gemm_strided_batched(cfg, &d_b, &d_a, &mut d_c) } {
+                                Ok(()) => stream
+                                    .memcpy_dtov(&d_c)
+                                    .map_err(|e| format!("dtoh c: {:?}", e)),
+                                Err(gemm_err) => {
+                                    if cfg!(debug_assertions) {
+                                        eprintln!(
+                                            "cuBLAS strided fallback failed ({gemm_err:?}), using tiled kernel"
+                                        );
+                                    }
+                                    launch_matmul_tiled_strided(
+                                        stream.clone(),
+                                        &d_a,
+                                        &d_b,
+                                        &mut d_c,
+                                        batch,
+                                        m,
+                                        k,
+                                        n,
+                                        trans_a,
+                                        trans_b,
+                                        stride_a,
+                                        stride_b,
+                                        stride_c,
+                                    )?;
+                                    stream
+                                        .memcpy_dtov(&d_c)
+                                        .map_err(|e| format!("dtoh c: {:?}", e))
+                                }
+                            },
+                            Err(blas_err) => {
+                                if cfg!(debug_assertions) {
+                                    eprintln!(
+                                        "cuBLAS unavailable ({blas_err:?}) for strided fallback, using tiled kernel"
+                                    );
+                                }
+                                launch_matmul_tiled_strided(
+                                    stream.clone(),
+                                    &d_a,
+                                    &d_b,
+                                    &mut d_c,
+                                    batch,
+                                    m,
+                                    k,
+                                    n,
+                                    trans_a,
+                                    trans_b,
+                                    stride_a,
+                                    stride_b,
+                                    stride_c,
+                                )?;
+                                stream
+                                    .memcpy_dtov(&d_c)
+                                    .map_err(|e| format!("dtoh c: {:?}", e))
+                            }
                         }
-                        Ok(host)
                     }
                 }
             }
