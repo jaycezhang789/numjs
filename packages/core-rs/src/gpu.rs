@@ -666,6 +666,8 @@ extern "C" __global__ void min_index_stage_reduce(const int* __restrict__ input,
 "#;
 
     const MATMUL_KERNEL_SRC: &str = r#"
+#include <cuda_runtime.h>
+#include <stdint.h>
 #define TILE_M 16
 #define TILE_N 16
 #define TILE_K 16
@@ -788,6 +790,652 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
     }
     if (row < m && col < n) {
         Cbase[row * ldc + col] = acc;
+    }
+}
+
+extern "C" __global__ void matmul_tiled_64(const float* __restrict__ A,
+                                           const float* __restrict__ B,
+                                           float* __restrict__ C,
+                                           int m,
+                                           int k,
+                                           int n,
+                                           int lda,
+                                           int ldb,
+                                           int ldc,
+                                           int trans_a,
+                                           int trans_b) {
+    const int TILE_M = 64;
+    const int TILE_N = 64;
+    const int TILE_K = 16;
+    const int VEC = 4;
+    const int THREADS_X = TILE_N / VEC;
+    const int THREADS_Y = TILE_M / VEC;
+    if (threadIdx.x >= THREADS_X || threadIdx.y >= THREADS_Y) {
+        return;
+    }
+    __shared__ float As[TILE_M][TILE_K];
+    __shared__ float Bs[TILE_K][TILE_N];
+    const int lane_x = threadIdx.x;
+    const int lane_y = threadIdx.y;
+    int row_idx[VEC];
+    int col_idx[VEC];
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) {
+        row_idx[v] = lane_y + v * THREADS_Y;
+        col_idx[v] = lane_x * VEC + v;
+    }
+    float acc[VEC][VEC];
+#pragma unroll
+    for (int r = 0; r < VEC; ++r) {
+#pragma unroll
+        for (int c = 0; c < VEC; ++c) {
+            acc[r][c] = 0.0f;
+        }
+    }
+    int tiles = (k + TILE_K - 1) / TILE_K;
+    for (int tile = 0; tile < tiles; ++tile) {
+        int k_col = tile * TILE_K + lane_x;
+#pragma unroll
+        for (int v = 0; v < VEC; ++v) {
+            int row_local = row_idx[v];
+            int global_row = blockIdx.y * TILE_M + row_local;
+            float val = 0.0f;
+            if (global_row < m && k_col < k) {
+                if (trans_a) {
+                    val = A[k_col * lda + global_row];
+                } else {
+                    val = A[global_row * lda + k_col];
+                }
+            }
+            As[row_local][lane_x] = val;
+        }
+        int k_row = lane_y;
+        int global_k = tile * TILE_K + k_row;
+        int col_base = lane_x * VEC;
+        int global_col_base = blockIdx.x * TILE_N + col_base;
+        float vals[VEC];
+        if (global_k < k) {
+            int can_vector = 0;
+            if (!trans_b) {
+                if (global_col_base + VEC - 1 < n) {
+                    can_vector = 1;
+                }
+            } else {
+                if (global_k + VEC - 1 < k) {
+                    can_vector = 1;
+                }
+            }
+            if (can_vector) {
+                if (!trans_b) {
+                    const float* ptr = B + global_k * ldb + global_col_base;
+                    if ((((uintptr_t)ptr) & 15) == 0) {
+                        float4 vec = *reinterpret_cast<const float4*>(ptr);
+                        vals[0] = vec.x;
+                        vals[1] = vec.y;
+                        vals[2] = vec.z;
+                        vals[3] = vec.w;
+                    } else {
+                        vals[0] = ptr[0];
+                        vals[1] = ptr[1];
+                        vals[2] = ptr[2];
+                        vals[3] = ptr[3];
+                    }
+                } else {
+                    const float* ptr = B + global_col_base * ldb + global_k;
+                    if ((((uintptr_t)ptr) & 15) == 0) {
+                        float4 vec = *reinterpret_cast<const float4*>(ptr);
+                        vals[0] = vec.x;
+                        vals[1] = vec.y;
+                        vals[2] = vec.z;
+                        vals[3] = vec.w;
+                    } else {
+                        vals[0] = ptr[0];
+                        vals[1] = ptr[1];
+                        vals[2] = ptr[2];
+                        vals[3] = ptr[3];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int v = 0; v < VEC; ++v) {
+                    int global_col = global_col_base + v;
+                    vals[v] = load_b(B, global_k, global_col, k, n, ldb, trans_b != 0);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int v = 0; v < VEC; ++v) {
+                vals[v] = 0.0f;
+            }
+        }
+#pragma unroll
+        for (int v = 0; v < VEC; ++v) {
+            int col_local = col_base + v;
+            Bs[k_row][col_local] = vals[v];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < TILE_K; ++kk) {
+            float b_vals[VEC];
+#pragma unroll
+            for (int v = 0; v < VEC; ++v) {
+                b_vals[v] = Bs[kk][col_idx[v]];
+            }
+#pragma unroll
+            for (int r = 0; r < VEC; ++r) {
+                float a_val = As[row_idx[r]][kk];
+#pragma unroll
+                for (int c = 0; c < VEC; ++c) {
+                    acc[r][c] += a_val * b_vals[c];
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < VEC; ++r) {
+        int row_local = row_idx[r];
+        int global_row = blockIdx.y * TILE_M + row_local;
+        if (global_row < m) {
+#pragma unroll
+            for (int c = 0; c < VEC; ++c) {
+                int col_local = col_idx[c];
+                int global_col = blockIdx.x * TILE_N + col_local;
+                if (global_col < n) {
+                    C[global_row * ldc + global_col] = acc[r][c];
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void matmul_tiled_64_strided(const float* __restrict__ A,
+                                                   const float* __restrict__ B,
+                                                   float* __restrict__ C,
+                                                   int m,
+                                                   int k,
+                                                   int n,
+                                                   int lda,
+                                                   int ldb,
+                                                   int ldc,
+                                                   long long stride_a,
+                                                   long long stride_b,
+                                                   long long stride_c,
+                                                   int trans_a,
+                                                   int trans_b,
+                                                   int batch) {
+    const int TILE_M = 64;
+    const int TILE_N = 64;
+    const int TILE_K = 16;
+    const int VEC = 4;
+    const int THREADS_X = TILE_N / VEC;
+    const int THREADS_Y = TILE_M / VEC;
+    if (threadIdx.x >= THREADS_X || threadIdx.y >= THREADS_Y) {
+        return;
+    }
+    int batch_idx = blockIdx.z;
+    if (batch_idx >= batch) {
+        return;
+    }
+    const float* Abase = A + batch_idx * stride_a;
+    const float* Bbase = B + batch_idx * stride_b;
+    float* Cbase = C + batch_idx * stride_c;
+    __shared__ float As[TILE_M][TILE_K];
+    __shared__ float Bs[TILE_K][TILE_N];
+    const int lane_x = threadIdx.x;
+    const int lane_y = threadIdx.y;
+    int row_idx[VEC];
+    int col_idx[VEC];
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) {
+        row_idx[v] = lane_y + v * THREADS_Y;
+        col_idx[v] = lane_x * VEC + v;
+    }
+    float acc[VEC][VEC];
+#pragma unroll
+    for (int r = 0; r < VEC; ++r) {
+#pragma unroll
+        for (int c = 0; c < VEC; ++c) {
+            acc[r][c] = 0.0f;
+        }
+    }
+    int tiles = (k + TILE_K - 1) / TILE_K;
+    for (int tile = 0; tile < tiles; ++tile) {
+        int k_col = tile * TILE_K + lane_x;
+#pragma unroll
+        for (int v = 0; v < VEC; ++v) {
+            int row_local = row_idx[v];
+            int global_row = blockIdx.y * TILE_M + row_local;
+            float val = 0.0f;
+            if (global_row < m && k_col < k) {
+                if (trans_a) {
+                    val = Abase[k_col * lda + global_row];
+                } else {
+                    val = Abase[global_row * lda + k_col];
+                }
+            }
+            As[row_local][lane_x] = val;
+        }
+        int k_row = lane_y;
+        int global_k = tile * TILE_K + k_row;
+        int col_base = lane_x * VEC;
+        int global_col_base = blockIdx.x * TILE_N + col_base;
+        float vals[VEC];
+        if (global_k < k) {
+            int can_vector = 0;
+            if (!trans_b) {
+                if (global_col_base + VEC - 1 < n) {
+                    can_vector = 1;
+                }
+            } else {
+                if (global_k + VEC - 1 < k) {
+                    can_vector = 1;
+                }
+            }
+            if (can_vector) {
+                if (!trans_b) {
+                    const float* ptr = Bbase + global_k * ldb + global_col_base;
+                    if ((((uintptr_t)ptr) & 15) == 0) {
+                        float4 vec = *reinterpret_cast<const float4*>(ptr);
+                        vals[0] = vec.x;
+                        vals[1] = vec.y;
+                        vals[2] = vec.z;
+                        vals[3] = vec.w;
+                    } else {
+                        vals[0] = ptr[0];
+                        vals[1] = ptr[1];
+                        vals[2] = ptr[2];
+                        vals[3] = ptr[3];
+                    }
+                } else {
+                    const float* ptr = Bbase + global_col_base * ldb + global_k;
+                    if ((((uintptr_t)ptr) & 15) == 0) {
+                        float4 vec = *reinterpret_cast<const float4*>(ptr);
+                        vals[0] = vec.x;
+                        vals[1] = vec.y;
+                        vals[2] = vec.z;
+                        vals[3] = vec.w;
+                    } else {
+                        vals[0] = ptr[0];
+                        vals[1] = ptr[1];
+                        vals[2] = ptr[2];
+                        vals[3] = ptr[3];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int v = 0; v < VEC; ++v) {
+                    int global_col = global_col_base + v;
+                    vals[v] = load_b(Bbase, global_k, global_col, k, n, ldb, trans_b != 0);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int v = 0; v < VEC; ++v) {
+                vals[v] = 0.0f;
+            }
+        }
+#pragma unroll
+        for (int v = 0; v < VEC; ++v) {
+            int col_local = col_base + v;
+            Bs[k_row][col_local] = vals[v];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < TILE_K; ++kk) {
+            float b_vals[VEC];
+#pragma unroll
+            for (int v = 0; v < VEC; ++v) {
+                b_vals[v] = Bs[kk][col_idx[v]];
+            }
+#pragma unroll
+            for (int r = 0; r < VEC; ++r) {
+                float a_val = As[row_idx[r]][kk];
+#pragma unroll
+                for (int c = 0; c < VEC; ++c) {
+                    acc[r][c] += a_val * b_vals[c];
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < VEC; ++r) {
+        int row_local = row_idx[r];
+        int global_row = blockIdx.y * TILE_M + row_local;
+        if (global_row < m) {
+#pragma unroll
+            for (int c = 0; c < VEC; ++c) {
+                int col_local = col_idx[c];
+                int global_col = blockIdx.x * TILE_N + col_local;
+                if (global_col < n) {
+                    Cbase[global_row * ldc + global_col] = acc[r][c];
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void matmul_tiled_128(const float* __restrict__ A,
+                                            const float* __restrict__ B,
+                                            float* __restrict__ C,
+                                            int m,
+                                            int k,
+                                            int n,
+                                            int lda,
+                                            int ldb,
+                                            int ldc,
+                                            int trans_a,
+                                            int trans_b) {
+    const int TILE_M = 128;
+    const int TILE_N = 128;
+    const int TILE_K = 32;
+    const int VEC = 4;
+    const int THREADS_X = TILE_N / VEC;
+    const int THREADS_Y = TILE_M / VEC;
+    if (threadIdx.x >= THREADS_X || threadIdx.y >= THREADS_Y) {
+        return;
+    }
+    __shared__ float As[TILE_M][TILE_K];
+    __shared__ float Bs[TILE_K][TILE_N];
+    const int lane_x = threadIdx.x;
+    const int lane_y = threadIdx.y;
+    int row_idx[VEC];
+    int col_idx[VEC];
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) {
+        row_idx[v] = lane_y + v * THREADS_Y;
+        col_idx[v] = lane_x * VEC + v;
+    }
+    float acc[VEC][VEC];
+#pragma unroll
+    for (int r = 0; r < VEC; ++r) {
+#pragma unroll
+        for (int c = 0; c < VEC; ++c) {
+            acc[r][c] = 0.0f;
+        }
+    }
+    int tiles = (k + TILE_K - 1) / TILE_K;
+    for (int tile = 0; tile < tiles; ++tile) {
+        int k_col = tile * TILE_K + lane_x;
+#pragma unroll
+        for (int v = 0; v < VEC; ++v) {
+            int row_local = row_idx[v];
+            int global_row = blockIdx.y * TILE_M + row_local;
+            float val = 0.0f;
+            if (global_row < m && k_col < k) {
+                if (trans_a) {
+                    val = A[k_col * lda + global_row];
+                } else {
+                    val = A[global_row * lda + k_col];
+                }
+            }
+            As[row_local][lane_x] = val;
+        }
+        int k_row = lane_y;
+        int global_k = tile * TILE_K + k_row;
+        int col_base = lane_x * VEC;
+        int global_col_base = blockIdx.x * TILE_N + col_base;
+        float vals[VEC];
+        if (global_k < k) {
+            int can_vector = 0;
+            if (!trans_b) {
+                if (global_col_base + VEC - 1 < n) {
+                    can_vector = 1;
+                }
+            } else {
+                if (global_k + VEC - 1 < k) {
+                    can_vector = 1;
+                }
+            }
+            if (can_vector) {
+                if (!trans_b) {
+                    const float* ptr = B + global_k * ldb + global_col_base;
+                    if ((((uintptr_t)ptr) & 15) == 0) {
+                        float4 vec = *reinterpret_cast<const float4*>(ptr);
+                        vals[0] = vec.x;
+                        vals[1] = vec.y;
+                        vals[2] = vec.z;
+                        vals[3] = vec.w;
+                    } else {
+                        vals[0] = ptr[0];
+                        vals[1] = ptr[1];
+                        vals[2] = ptr[2];
+                        vals[3] = ptr[3];
+                    }
+                } else {
+                    const float* ptr = B + global_col_base * ldb + global_k;
+                    if ((((uintptr_t)ptr) & 15) == 0) {
+                        float4 vec = *reinterpret_cast<const float4*>(ptr);
+                        vals[0] = vec.x;
+                        vals[1] = vec.y;
+                        vals[2] = vec.z;
+                        vals[3] = vec.w;
+                    } else {
+                        vals[0] = ptr[0];
+                        vals[1] = ptr[1];
+                        vals[2] = ptr[2];
+                        vals[3] = ptr[3];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int v = 0; v < VEC; ++v) {
+                    int global_col = global_col_base + v;
+                    vals[v] = load_b(B, global_k, global_col, k, n, ldb, trans_b != 0);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int v = 0; v < VEC; ++v) {
+                vals[v] = 0.0f;
+            }
+        }
+#pragma unroll
+        for (int v = 0; v < VEC; ++v) {
+            int col_local = col_base + v;
+            Bs[k_row][col_local] = vals[v];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < TILE_K; ++kk) {
+            float b_vals[VEC];
+#pragma unroll
+            for (int v = 0; v < VEC; ++v) {
+                b_vals[v] = Bs[kk][col_idx[v]];
+            }
+#pragma unroll
+            for (int r = 0; r < VEC; ++r) {
+                float a_val = As[row_idx[r]][kk];
+#pragma unroll
+                for (int c = 0; c < VEC; ++c) {
+                    acc[r][c] += a_val * b_vals[c];
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < VEC; ++r) {
+        int row_local = row_idx[r];
+        int global_row = blockIdx.y * TILE_M + row_local;
+        if (global_row < m) {
+#pragma unroll
+            for (int c = 0; c < VEC; ++c) {
+                int col_local = col_idx[c];
+                int global_col = blockIdx.x * TILE_N + col_local;
+                if (global_col < n) {
+                    C[global_row * ldc + global_col] = acc[r][c];
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
+                                                    const float* __restrict__ B,
+                                                    float* __restrict__ C,
+                                                    int m,
+                                                    int k,
+                                                    int n,
+                                                    int lda,
+                                                    int ldb,
+                                                    int ldc,
+                                                    long long stride_a,
+                                                    long long stride_b,
+                                                    long long stride_c,
+                                                    int trans_a,
+                                                    int trans_b,
+                                                    int batch) {
+    const int TILE_M = 128;
+    const int TILE_N = 128;
+    const int TILE_K = 32;
+    const int VEC = 4;
+    const int THREADS_X = TILE_N / VEC;
+    const int THREADS_Y = TILE_M / VEC;
+    if (threadIdx.x >= THREADS_X || threadIdx.y >= THREADS_Y) {
+        return;
+    }
+    int batch_idx = blockIdx.z;
+    if (batch_idx >= batch) {
+        return;
+    }
+    const float* Abase = A + batch_idx * stride_a;
+    const float* Bbase = B + batch_idx * stride_b;
+    float* Cbase = C + batch_idx * stride_c;
+    __shared__ float As[TILE_M][TILE_K];
+    __shared__ float Bs[TILE_K][TILE_N];
+    const int lane_x = threadIdx.x;
+    const int lane_y = threadIdx.y;
+    int row_idx[VEC];
+    int col_idx[VEC];
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) {
+        row_idx[v] = lane_y + v * THREADS_Y;
+        col_idx[v] = lane_x * VEC + v;
+    }
+    float acc[VEC][VEC];
+#pragma unroll
+    for (int r = 0; r < VEC; ++r) {
+#pragma unroll
+        for (int c = 0; c < VEC; ++c) {
+            acc[r][c] = 0.0f;
+        }
+    }
+    int tiles = (k + TILE_K - 1) / TILE_K;
+    for (int tile = 0; tile < tiles; ++tile) {
+        int k_col = tile * TILE_K + lane_x;
+#pragma unroll
+        for (int v = 0; v < VEC; ++v) {
+            int row_local = row_idx[v];
+            int global_row = blockIdx.y * TILE_M + row_local;
+            float val = 0.0f;
+            if (global_row < m && k_col < k) {
+                if (trans_a) {
+                    val = Abase[k_col * lda + global_row];
+                } else {
+                    val = Abase[global_row * lda + k_col];
+                }
+            }
+            As[row_local][lane_x] = val;
+        }
+        int k_row = lane_y;
+        int global_k = tile * TILE_K + k_row;
+        int col_base = lane_x * VEC;
+        int global_col_base = blockIdx.x * TILE_N + col_base;
+        float vals[VEC];
+        if (global_k < k) {
+            int can_vector = 0;
+            if (!trans_b) {
+                if (global_col_base + VEC - 1 < n) {
+                    can_vector = 1;
+                }
+            } else {
+                if (global_k + VEC - 1 < k) {
+                    can_vector = 1;
+                }
+            }
+            if (can_vector) {
+                if (!trans_b) {
+                    const float* ptr = Bbase + global_k * ldb + global_col_base;
+                    if ((((uintptr_t)ptr) & 15) == 0) {
+                        float4 vec = *reinterpret_cast<const float4*>(ptr);
+                        vals[0] = vec.x;
+                        vals[1] = vec.y;
+                        vals[2] = vec.z;
+                        vals[3] = vec.w;
+                    } else {
+                        vals[0] = ptr[0];
+                        vals[1] = ptr[1];
+                        vals[2] = ptr[2];
+                        vals[3] = ptr[3];
+                    }
+                } else {
+                    const float* ptr = Bbase + global_col_base * ldb + global_k;
+                    if ((((uintptr_t)ptr) & 15) == 0) {
+                        float4 vec = *reinterpret_cast<const float4*>(ptr);
+                        vals[0] = vec.x;
+                        vals[1] = vec.y;
+                        vals[2] = vec.z;
+                        vals[3] = vec.w;
+                    } else {
+                        vals[0] = ptr[0];
+                        vals[1] = ptr[1];
+                        vals[2] = ptr[2];
+                        vals[3] = ptr[3];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int v = 0; v < VEC; ++v) {
+                    int global_col = global_col_base + v;
+                    vals[v] = load_b(Bbase, global_k, global_col, k, n, ldb, trans_b != 0);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int v = 0; v < VEC; ++v) {
+                vals[v] = 0.0f;
+            }
+        }
+#pragma unroll
+        for (int v = 0; v < VEC; ++v) {
+            int col_local = col_base + v;
+            Bs[k_row][col_local] = vals[v];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < TILE_K; ++kk) {
+            float b_vals[VEC];
+#pragma unroll
+            for (int v = 0; v < VEC; ++v) {
+                b_vals[v] = Bs[kk][col_idx[v]];
+            }
+#pragma unroll
+            for (int r = 0; r < VEC; ++r) {
+                float a_val = As[row_idx[r]][kk];
+#pragma unroll
+                for (int c = 0; c < VEC; ++c) {
+                    acc[r][c] += a_val * b_vals[c];
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < VEC; ++r) {
+        int row_local = row_idx[r];
+        int global_row = blockIdx.y * TILE_M + row_local;
+        if (global_row < m) {
+#pragma unroll
+            for (int c = 0; c < VEC; ++c) {
+                int col_local = col_idx[c];
+                int global_col = blockIdx.x * TILE_N + col_local;
+                if (global_col < n) {
+                    Cbase[global_row * ldc + global_col] = acc[r][c];
+                }
+            }
+        }
     }
 }
 "#;
@@ -1108,13 +1756,11 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
         Ok(total as u32)
     }
 
-    const MATMUL_TILE_DIM: u32 = 16;
-
-    fn grid_dim_for(label: &str, len: usize) -> Result<u32, String> {
+    fn grid_dim_for(label: &str, len: usize, tile: u32) -> Result<u32, String> {
         if len == 0 {
             return Ok(0);
         }
-        let tile = MATMUL_TILE_DIM as usize;
+        let tile = tile.max(1) as usize;
         let adjusted = len
             .checked_add(tile - 1)
             .ok_or_else(|| format!("{label}: overflow computing grid dimension"))?;
@@ -1123,6 +1769,46 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
             return Err(format!("{label}: grid_dim exceeds u32::MAX"));
         }
         Ok(blocks as u32)
+    }
+
+    struct MatmulTileConfig {
+        kernel: &'static str,
+        kernel_strided: &'static str,
+        tile_m: u32,
+        tile_n: u32,
+        block_x: u32,
+        block_y: u32,
+    }
+
+    fn select_matmul_tile_config(m: usize, n: usize, k: usize) -> MatmulTileConfig {
+        if m >= 128 && n >= 128 && k >= 32 {
+            MatmulTileConfig {
+                kernel: "matmul_tiled_128",
+                kernel_strided: "matmul_tiled_128_strided",
+                tile_m: 128,
+                tile_n: 128,
+                block_x: 32,
+                block_y: 32,
+            }
+        } else if m >= 64 && n >= 64 && k >= 16 {
+            MatmulTileConfig {
+                kernel: "matmul_tiled_64",
+                kernel_strided: "matmul_tiled_64_strided",
+                tile_m: 64,
+                tile_n: 64,
+                block_x: 16,
+                block_y: 16,
+            }
+        } else {
+            MatmulTileConfig {
+                kernel: "matmul_tiled",
+                kernel_strided: "matmul_tiled_strided",
+                tile_m: 16,
+                tile_n: 16,
+                block_x: 16,
+                block_y: 16,
+            }
+        }
     }
 
     fn leading_dims(
@@ -1156,13 +1842,14 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
         if m == 0 || n == 0 || k == 0 {
             return Ok(());
         }
+        let tile_cfg = select_matmul_tile_config(m, n, k);
         let ctx = stream.context().clone();
         let module = load_matmul_module(&ctx)?;
         let func = module
-            .load_function("matmul_tiled")
-            .map_err(|e| format!("load matmul_tiled: {:?}", e))?;
-        let grid_x = grid_dim_for("matmul grid x", n)?;
-        let grid_y = grid_dim_for("matmul grid y", m)?;
+            .load_function(tile_cfg.kernel)
+            .map_err(|e| format!("load {}: {:?}", tile_cfg.kernel, e))?;
+        let grid_x = grid_dim_for("matmul grid x", n, tile_cfg.tile_n)?;
+        let grid_y = grid_dim_for("matmul grid y", m, tile_cfg.tile_m)?;
         if grid_x == 0 || grid_y == 0 {
             return Ok(());
         }
@@ -1174,7 +1861,7 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
         let trans_b_i = if trans_b { 1 } else { 0 };
         let cfg = LaunchConfig {
             grid_dim: (grid_x, grid_y, 1),
-            block_dim: (MATMUL_TILE_DIM, MATMUL_TILE_DIM, 1),
+            block_dim: (tile_cfg.block_x, tile_cfg.block_y, 1),
             shared_mem_bytes: 0,
         };
         let (a_ptr, _sync_a) = a.device_ptr(&stream);
@@ -1197,7 +1884,7 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
                 .launch(cfg)
         }
         .map(|_| ())
-        .map_err(|e| format!("launch matmul_tiled: {:?}", e))
+        .map_err(|e| format!("launch {}: {:?}", tile_cfg.kernel, e))
     }
 
     fn launch_matmul_tiled_strided(
@@ -1218,13 +1905,14 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
         if batch == 0 || m == 0 || n == 0 || k == 0 {
             return Ok(());
         }
+        let tile_cfg = select_matmul_tile_config(m, n, k);
         let ctx = stream.context().clone();
         let module = load_matmul_module(&ctx)?;
         let func = module
-            .load_function("matmul_tiled_strided")
-            .map_err(|e| format!("load matmul_tiled_strided: {:?}", e))?;
-        let grid_x = grid_dim_for("matmul grid x", n)?;
-        let grid_y = grid_dim_for("matmul grid y", m)?;
+            .load_function(tile_cfg.kernel_strided)
+            .map_err(|e| format!("load {}: {:?}", tile_cfg.kernel_strided, e))?;
+        let grid_x = grid_dim_for("matmul grid x", n, tile_cfg.tile_n)?;
+        let grid_y = grid_dim_for("matmul grid y", m, tile_cfg.tile_m)?;
         if grid_x == 0 || grid_y == 0 {
             return Ok(());
         }
@@ -1240,7 +1928,7 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
         let trans_b_i = if trans_b { 1 } else { 0 };
         let cfg = LaunchConfig {
             grid_dim: (grid_x, grid_y, grid_z as u32),
-            block_dim: (MATMUL_TILE_DIM, MATMUL_TILE_DIM, 1),
+            block_dim: (tile_cfg.block_x, tile_cfg.block_y, 1),
             shared_mem_bytes: 0,
         };
         let (a_ptr, _sync_a) = a.device_ptr(&stream);
@@ -1267,7 +1955,7 @@ extern "C" __global__ void matmul_tiled_strided(const float* __restrict__ A,
                 .launch(cfg)
         }
         .map(|_| ())
-        .map_err(|e| format!("launch matmul_tiled_strided: {:?}", e))
+        .map_err(|e| format!("launch {}: {:?}", tile_cfg.kernel_strided, e))
     }
 
     #[allow(dead_code)]
