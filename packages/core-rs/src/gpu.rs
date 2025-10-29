@@ -98,10 +98,7 @@ pub fn reduce_sum_f32(values: &[f32]) -> CoreResult<f32> {
     reduce_sum_f32_with_policy(values, SumPrecisionPolicy::Default)
 }
 
-pub fn reduce_sum_f32_with_policy(
-    values: &[f32],
-    policy: SumPrecisionPolicy,
-) -> CoreResult<f32> {
+pub fn reduce_sum_f32_with_policy(values: &[f32], policy: SumPrecisionPolicy) -> CoreResult<f32> {
     #[cfg(feature = "gpu-cuda")]
     {
         if cuda::is_available() {
@@ -271,9 +268,7 @@ pub fn matmul_f32_ex_with_policy(
         }
     }
     if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
-        return Err(
-            "matmul_f32_ex_with_policy: non-Accuracy policies require CUDA backend".into(),
-        );
+        return Err("matmul_f32_ex_with_policy: non-Accuracy policies require CUDA backend".into());
     }
     Ok(matmul_cpu_ex(a, b, m, k, n, trans_a, trans_b))
 }
@@ -391,7 +386,10 @@ pub fn matmul_batched_f32_strided_with_policy(
         }
     }
     if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
-        return Err("matmul_batched_f32_strided_with_policy: non-Accuracy policies require CUDA backend".into());
+        return Err(
+            "matmul_batched_f32_strided_with_policy: non-Accuracy policies require CUDA backend"
+                .into(),
+        );
     }
     let need_a = (m as i64) * (k as i64);
     let need_b = (k as i64) * (n as i64);
@@ -457,9 +455,16 @@ mod cuda {
     };
     use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
     use half::{bf16, f16};
-    use std::{collections::HashSet, env, fs, path::PathBuf, sync::Arc};
+    use std::{
+        collections::HashSet,
+        env, fs,
+        path::PathBuf,
+        sync::{Arc, OnceLock},
+    };
 
-const REDUCE_KERNEL_SRC: &str = r#"
+    static GLOBAL_CONTEXT: OnceLock<Arc<CudaContext>> = OnceLock::new();
+
+    const REDUCE_KERNEL_SRC: &str = r#"
 #include <math.h>
 
 extern "C" __global__ void reduce_sum_stage1(const float* __restrict__ input,
@@ -1441,12 +1446,11 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
 "#;
 
     pub fn is_available() -> bool {
-        match CudaContext::new(0) {
-            Ok(ctx) => {
-                let stream = ctx.default_stream();
-                CudaBlas::new(stream).is_ok()
-            }
-            Err(_) => false,
+        if let Ok(ctx) = global_context() {
+            let stream = ctx.default_stream();
+            CudaBlas::new(stream).is_ok()
+        } else {
+            false
         }
     }
 
@@ -1460,10 +1464,16 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         let m_i = usize_to_i32("gemm m", m)?;
         let n_i = usize_to_i32("gemm n", n)?;
         let k_i = usize_to_i32("gemm k", k)?;
-        let transa_cublas =
-            if trans_b { cublasOperation_t::CUBLAS_OP_T } else { cublasOperation_t::CUBLAS_OP_N };
-        let transb_cublas =
-            if trans_a { cublasOperation_t::CUBLAS_OP_T } else { cublasOperation_t::CUBLAS_OP_N };
+        let transa_cublas = if trans_b {
+            cublasOperation_t::CUBLAS_OP_T
+        } else {
+            cublasOperation_t::CUBLAS_OP_N
+        };
+        let transb_cublas = if trans_a {
+            cublasOperation_t::CUBLAS_OP_T
+        } else {
+            cublasOperation_t::CUBLAS_OP_N
+        };
         let lda = if trans_b { k_i } else { n_i };
         let ldb = if trans_a { m_i } else { k_i };
         let ldc = n_i;
@@ -1484,8 +1494,8 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
     fn load_reduce_module(ctx: &Arc<CudaContext>) -> Result<Arc<CudaModule>, String> {
         let mut opts = CompileOptions::default();
         opts.include_paths = nvrtc_include_paths();
-        let ptx =
-            compile_ptx_with_opts(REDUCE_KERNEL_SRC, opts).map_err(|e| format!("nvrtc: {:?}", e))?;
+        let ptx = compile_ptx_with_opts(REDUCE_KERNEL_SRC, opts)
+            .map_err(|e| format!("nvrtc: {:?}", e))?;
         ctx.load_module(ptx)
             .map_err(|e| format!("load module: {:?}", e))
     }
@@ -1493,8 +1503,8 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
     fn load_matmul_module(ctx: &Arc<CudaContext>) -> Result<Arc<CudaModule>, String> {
         let mut opts = CompileOptions::default();
         opts.include_paths = nvrtc_include_paths();
-        let ptx =
-            compile_ptx_with_opts(MATMUL_KERNEL_SRC, opts).map_err(|e| format!("nvrtc: {:?}", e))?;
+        let ptx = compile_ptx_with_opts(MATMUL_KERNEL_SRC, opts)
+            .map_err(|e| format!("nvrtc: {:?}", e))?;
         ctx.load_module(ptx)
             .map_err(|e| format!("load module: {:?}", e))
     }
@@ -1533,6 +1543,19 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         paths
     }
 
+    fn global_context() -> Result<Arc<CudaContext>, String> {
+        GLOBAL_CONTEXT
+            .get_or_try_init(|| {
+                CudaContext::new(0)
+                    .map_err(|e| format!("cuda: {:?}", e))
+                    .map(Arc::new)
+            })
+            .cloned()
+    }
+
+    fn default_stream() -> Result<Arc<CudaStream>, String> {
+        global_context().map(|ctx| ctx.default_stream())
+    }
     fn path_to_string(path: &PathBuf) -> String {
         path.to_string_lossy().into_owned()
     }
@@ -2015,8 +2038,18 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         trans_b: bool,
         policy: MatmulTensorCorePolicy,
     ) -> CoreResult<Vec<f32>> {
-        let need_a = if trans_a { k.checked_mul(m) } else { m.checked_mul(k) }.ok_or("size overflow")?;
-        let need_b = if trans_b { n.checked_mul(k) } else { k.checked_mul(n) }.ok_or("size overflow")?;
+        let need_a = if trans_a {
+            k.checked_mul(m)
+        } else {
+            m.checked_mul(k)
+        }
+        .ok_or("size overflow")?;
+        let need_b = if trans_b {
+            n.checked_mul(k)
+        } else {
+            k.checked_mul(n)
+        }
+        .ok_or("size overflow")?;
         if a.len() != need_a || b.len() != need_b {
             return Err("matmul_ex: shape mismatch".into());
         }
@@ -2024,7 +2057,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         if total == 0 {
             return Ok(Vec::new());
         }
-        let ctx = CudaContext::new(0).map_err(|e| format!("cuda: {:?}", e))?;
+        let ctx = global_context()?;
         let stream = ctx.default_stream();
         match policy {
             MatmulTensorCorePolicy::Accuracy => {
@@ -2039,30 +2072,32 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
                     .map_err(|e| format!("alloc c: {:?}", e))?;
                 let cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
                 match CudaBlas::new(stream.clone()) {
-                    Ok(blas) => match unsafe { blas.gemm(cfg, &d_b, &d_a, &mut d_c) } {
-                        Ok(()) => stream
-                            .memcpy_dtov(&d_c)
-                            .map_err(|e| format!("dtoh c: {:?}", e)),
-                        Err(err) => {
-                            if cfg!(debug_assertions) {
-                                eprintln!("cuBLAS sgemm failed ({err:?}), falling back to tiled kernel");
-                            }
-                            launch_matmul_tiled(
-                                stream.clone(),
-                                &d_a,
-                                &d_b,
-                                &mut d_c,
-                                m,
-                                k,
-                                n,
-                                trans_a,
-                                trans_b,
-                            )?;
-                            stream
+                    Ok(blas) => {
+                        match unsafe { blas.gemm(cfg, &d_b, &d_a, &mut d_c) } {
+                            Ok(()) => stream
                                 .memcpy_dtov(&d_c)
-                                .map_err(|e| format!("dtoh c: {:?}", e))
+                                .map_err(|e| format!("dtoh c: {:?}", e)),
+                            Err(err) => {
+                                if cfg!(debug_assertions) {
+                                    eprintln!("cuBLAS sgemm failed ({err:?}), falling back to tiled kernel");
+                                }
+                                launch_matmul_tiled(
+                                    stream.clone(),
+                                    &d_a,
+                                    &d_b,
+                                    &mut d_c,
+                                    m,
+                                    k,
+                                    n,
+                                    trans_a,
+                                    trans_b,
+                                )?;
+                                stream
+                                    .memcpy_dtov(&d_c)
+                                    .map_err(|e| format!("dtoh c: {:?}", e))
+                            }
                         }
-                    },
+                    }
                     Err(err) => {
                         if cfg!(debug_assertions) {
                             eprintln!("cuBLAS unavailable ({err:?}), using tiled kernel fallback");
@@ -2112,7 +2147,9 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
                         // 回退到传统 cuBLAS
                         let cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
                         if cfg!(debug_assertions) {
-                            eprintln!("cublasLt fast path failed ({err}), attempting cuBLAS fallback");
+                            eprintln!(
+                                "cublasLt fast path failed ({err}), attempting cuBLAS fallback"
+                            );
                         }
                         match CudaBlas::new(stream.clone()) {
                             Ok(blas) => match unsafe { blas.gemm(cfg, &d_b, &d_a, &mut d_c) } {
@@ -2179,13 +2216,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
                 let mut d_c = stream
                     .alloc_zeros::<f16>(total)
                     .map_err(|e| format!("alloc c[f16]: {:?}", e))?;
-                launch_cublaslt_half::<f16, _, _>(
-                    stream.clone(),
-                    &d_a,
-                    &d_b,
-                    &mut d_c,
-                    cfg,
-                )?;
+                launch_cublaslt_half::<f16, _, _>(stream.clone(), &d_a, &d_b, &mut d_c, cfg)?;
                 let host_half = stream
                     .memcpy_dtov(&d_c)
                     .map_err(|e| format!("dtoh c[f16]: {:?}", e))?;
@@ -2204,13 +2235,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
                 let mut d_c = stream
                     .alloc_zeros::<bf16>(total)
                     .map_err(|e| format!("alloc c[bf16]: {:?}", e))?;
-                launch_cublaslt_half::<bf16, _, _>(
-                    stream.clone(),
-                    &d_a,
-                    &d_b,
-                    &mut d_c,
-                    cfg,
-                )?;
+                launch_cublaslt_half::<bf16, _, _>(stream.clone(), &d_a, &d_b, &mut d_c, cfg)?;
                 let host_half = stream
                     .memcpy_dtov(&d_c)
                     .map_err(|e| format!("dtoh c[bf16]: {:?}", e))?;
@@ -2226,22 +2251,22 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         batch: usize,
         m: usize,
         k: usize,
-    n: usize,
-    trans_a: bool,
-    trans_b: bool,
-) -> CoreResult<Vec<f32>> {
-    matmul_batched_f32_with_policy(
-        a,
-        b,
-        batch,
-        m,
-        k,
-        n,
-        trans_a,
-        trans_b,
-        MatmulTensorCorePolicy::Accuracy,
-    )
-}
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> CoreResult<Vec<f32>> {
+        matmul_batched_f32_with_policy(
+            a,
+            b,
+            batch,
+            m,
+            k,
+            n,
+            trans_a,
+            trans_b,
+            MatmulTensorCorePolicy::Accuracy,
+        )
+    }
 
     pub fn matmul_batched_f32_with_policy(
         a: &[f32],
@@ -2254,8 +2279,18 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         trans_b: bool,
         policy: MatmulTensorCorePolicy,
     ) -> CoreResult<Vec<f32>> {
-        let a_each = if trans_a { k.checked_mul(m) } else { m.checked_mul(k) }.ok_or("size overflow")?;
-        let b_each = if trans_b { n.checked_mul(k) } else { k.checked_mul(n) }.ok_or("size overflow")?;
+        let a_each = if trans_a {
+            k.checked_mul(m)
+        } else {
+            m.checked_mul(k)
+        }
+        .ok_or("size overflow")?;
+        let b_each = if trans_b {
+            n.checked_mul(k)
+        } else {
+            k.checked_mul(n)
+        }
+        .ok_or("size overflow")?;
         let c_each = m.checked_mul(n).ok_or("size overflow")?;
         if a.len() != batch.checked_mul(a_each).ok_or("size overflow")?
             || b.len() != batch.checked_mul(b_each).ok_or("size overflow")?
@@ -2323,13 +2358,16 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         policy: MatmulTensorCorePolicy,
     ) -> CoreResult<Vec<f32>> {
         let batch_i32 = usize_to_i32("matmul_batched_f32_strided batch", batch)?;
-        let a_need = checked_stride_product("matmul_batched_f32_strided stride_a", stride_a, batch)?;
-        let b_need = checked_stride_product("matmul_batched_f32_strided stride_b", stride_b, batch)?;
-        let c_need = checked_stride_product("matmul_batched_f32_strided stride_c", stride_c, batch)?;
+        let a_need =
+            checked_stride_product("matmul_batched_f32_strided stride_a", stride_a, batch)?;
+        let b_need =
+            checked_stride_product("matmul_batched_f32_strided stride_b", stride_b, batch)?;
+        let c_need =
+            checked_stride_product("matmul_batched_f32_strided stride_c", stride_c, batch)?;
         if a.len() < a_need || b.len() < b_need {
             return Err("matmul_batched_f32_strided: buffer too small for given stride".into());
         }
-        let ctx = CudaContext::new(0).map_err(|e| format!("cuda: {:?}", e))?;
+        let ctx = global_context()?;
         let stream = ctx.default_stream();
         match policy {
             MatmulTensorCorePolicy::Accuracy => {
@@ -2351,37 +2389,38 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
                     stride_c,
                 };
                 match CudaBlas::new(stream.clone()) {
-                    Ok(blas) => match unsafe { blas.gemm_strided_batched(cfg, &d_b, &d_a, &mut d_c) }
-                    {
-                        Ok(()) => stream
-                            .memcpy_dtov(&d_c)
-                            .map_err(|e| format!("dtoh c: {:?}", e)),
-                        Err(err) => {
-                            if cfg!(debug_assertions) {
-                                eprintln!(
+                    Ok(blas) => {
+                        match unsafe { blas.gemm_strided_batched(cfg, &d_b, &d_a, &mut d_c) } {
+                            Ok(()) => stream
+                                .memcpy_dtov(&d_c)
+                                .map_err(|e| format!("dtoh c: {:?}", e)),
+                            Err(err) => {
+                                if cfg!(debug_assertions) {
+                                    eprintln!(
                                     "cuBLAS strided batched sgemm failed ({err:?}), using tiled kernel fallback"
                                 );
+                                }
+                                launch_matmul_tiled_strided(
+                                    stream.clone(),
+                                    &d_a,
+                                    &d_b,
+                                    &mut d_c,
+                                    batch,
+                                    m,
+                                    k,
+                                    n,
+                                    trans_a,
+                                    trans_b,
+                                    stride_a,
+                                    stride_b,
+                                    stride_c,
+                                )?;
+                                stream
+                                    .memcpy_dtov(&d_c)
+                                    .map_err(|e| format!("dtoh c: {:?}", e))
                             }
-                            launch_matmul_tiled_strided(
-                                stream.clone(),
-                                &d_a,
-                                &d_b,
-                                &mut d_c,
-                                batch,
-                                m,
-                                k,
-                                n,
-                                trans_a,
-                                trans_b,
-                                stride_a,
-                                stride_b,
-                                stride_c,
-                            )?;
-                            stream
-                                .memcpy_dtov(&d_c)
-                                .map_err(|e| format!("dtoh c: {:?}", e))
                         }
-                    },
+                    }
                     Err(err) => {
                         if cfg!(debug_assertions) {
                             eprintln!(
@@ -2452,7 +2491,9 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
                             stride_c,
                         };
                         match CudaBlas::new(stream.clone()) {
-                            Ok(blas) => match unsafe { blas.gemm_strided_batched(cfg, &d_b, &d_a, &mut d_c) } {
+                            Ok(blas) => match unsafe {
+                                blas.gemm_strided_batched(cfg, &d_b, &d_a, &mut d_c)
+                            } {
                                 Ok(()) => stream
                                     .memcpy_dtov(&d_c)
                                     .map_err(|e| format!("dtoh c: {:?}", e)),
@@ -2526,13 +2567,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
                 let mut d_c = stream
                     .alloc_zeros::<f16>(c_need)
                     .map_err(|e| format!("alloc c[f16]: {:?}", e))?;
-                launch_cublaslt_half::<f16, _, _>(
-                    stream.clone(),
-                    &d_a,
-                    &d_b,
-                    &mut d_c,
-                    cfg,
-                )?;
+                launch_cublaslt_half::<f16, _, _>(stream.clone(), &d_a, &d_b, &mut d_c, cfg)?;
                 let host_half = stream
                     .memcpy_dtov(&d_c)
                     .map_err(|e| format!("dtoh c[f16]: {:?}", e))?;
@@ -2553,13 +2588,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
                 let mut d_c = stream
                     .alloc_zeros::<bf16>(c_need)
                     .map_err(|e| format!("alloc c[bf16]: {:?}", e))?;
-                launch_cublaslt_half::<bf16, _, _>(
-                    stream.clone(),
-                    &d_a,
-                    &d_b,
-                    &mut d_c,
-                    cfg,
-                )?;
+                launch_cublaslt_half::<bf16, _, _>(stream.clone(), &d_a, &d_b, &mut d_c, cfg)?;
                 let host_half = stream
                     .memcpy_dtov(&d_c)
                     .map_err(|e| format!("dtoh c[bf16]: {:?}", e))?;
@@ -2612,18 +2641,10 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
                 let cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
                 unsafe { blas.gemm(cfg, b, a, c) }.map_err(|e| format!("sgemm: {:?}", e))
             }
-            MatmulTensorCorePolicy::Performance => launch_cublaslt_f32(
-                stream,
-                a,
-                b,
-                c,
-                m,
-                k,
-                n,
-                trans_a,
-                trans_b,
-            )
-            .map_err(|e| format!("cublasLt matmul: {e}")),
+            MatmulTensorCorePolicy::Performance => {
+                launch_cublaslt_f32(stream, a, b, c, m, k, n, trans_a, trans_b)
+                    .map_err(|e| format!("cublasLt matmul: {e}"))
+            }
             MatmulTensorCorePolicy::Float16 | MatmulTensorCorePolicy::BFloat16 => Err(
                 "matmul_f32_ex_device_with_policy: Float16/BFloat16 require host-side conversion"
                     .into(),
@@ -2664,7 +2685,10 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         )
     }
 
-    pub fn matmul_batched_f32_strided_device_with_policy<I: DevicePtr<f32>, Cc: DevicePtrMut<f32>>(
+    pub fn matmul_batched_f32_strided_device_with_policy<
+        I: DevicePtr<f32>,
+        Cc: DevicePtrMut<f32>,
+    >(
         stream: Arc<CudaStream>,
         a: &I,
         b: &I,
@@ -2724,7 +2748,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         if n == 0 {
             return Ok(0.0);
         }
-        let ctx = CudaContext::new(0).map_err(|e| format!("cuda: {:?}", e))?;
+        let ctx = global_context()?;
         let stream = ctx.default_stream();
         let module = load_reduce_module(&ctx)?;
         let func = module
@@ -2760,11 +2784,11 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
                 let host = stream
                     .memcpy_dtov(&next)
                     .map_err(|e| format!("dtoh: {:?}", e))?;
-                  return Ok(host.into_iter().next().unwrap_or(0.0));
-              }
-              current = next;
-              current_len = blocks as usize;
-          }
+                return Ok(host.into_iter().next().unwrap_or(0.0));
+            }
+            current = next;
+            current_len = blocks as usize;
+        }
     }
 
     pub fn reduce_sum_f32_with_policy(
@@ -2786,7 +2810,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         if matches!(policy, NanPolicy::Ignore) && !values.iter().any(|v| !v.is_nan()) {
             return Ok(f32::NAN);
         }
-        let ctx = CudaContext::new(0).map_err(|e| format!("cuda: {:?}", e))?;
+        let ctx = global_context()?;
         let stream = ctx.default_stream();
         let module = load_reduce_module(&ctx)?;
         let k_max = module
@@ -2806,8 +2830,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
                 .map_err(|e| format!("get func: {:?}", e))?;
             let block_dim_nan = select_block_dim(&k_nan, smem_per_thread_i32)?;
             let shared_nan = shared_mem_bytes(block_dim_nan, std::mem::size_of::<i32>())?;
-            let block_dim_nan_reduce =
-                select_block_dim(&k_nan_reduce, smem_per_thread_i32)?;
+            let block_dim_nan_reduce = select_block_dim(&k_nan_reduce, smem_per_thread_i32)?;
             let shared_nan_reduce =
                 shared_mem_bytes(block_dim_nan_reduce, std::mem::size_of::<i32>())?;
             let nan_blocks = blocks_for_len("reduce_max first_nan length", n, block_dim_nan)?;
@@ -2906,7 +2929,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         if matches!(policy, NanPolicy::Ignore) && !values.iter().any(|v| !v.is_nan()) {
             return Ok(0);
         }
-        let ctx = CudaContext::new(0).map_err(|e| format!("cuda: {:?}", e))?;
+        let ctx = global_context()?;
         let stream = ctx.default_stream();
         let module = load_reduce_module(&ctx)?;
         let k_argmax = module
@@ -2929,8 +2952,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
                 .map_err(|e| format!("get func: {:?}", e))?;
             let block_dim_nan = select_block_dim(&k_nan, smem_per_thread_i32)?;
             let shared_nan = shared_mem_bytes(block_dim_nan, std::mem::size_of::<i32>())?;
-            let block_dim_nan_reduce =
-                select_block_dim(&k_nan_reduce, smem_per_thread_i32)?;
+            let block_dim_nan_reduce = select_block_dim(&k_nan_reduce, smem_per_thread_i32)?;
             let shared_nan_reduce =
                 shared_mem_bytes(block_dim_nan_reduce, std::mem::size_of::<i32>())?;
             let nan_blocks = blocks_for_len("argmax first_nan length", n, block_dim_nan)?;
@@ -3014,8 +3036,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         let k_argmax_reduce = module
             .load_function("argmax_stage_reduce")
             .map_err(|e| format!("get func: {:?}", e))?;
-        let block_dim_argmax_reduce =
-            select_block_dim(&k_argmax_reduce, smem_per_thread_f32_i32)?;
+        let block_dim_argmax_reduce = select_block_dim(&k_argmax_reduce, smem_per_thread_f32_i32)?;
         let shared_argmax_reduce = shared_mem_bytes(
             block_dim_argmax_reduce,
             std::mem::size_of::<f32>() + std::mem::size_of::<i32>(),
@@ -3122,10 +3143,8 @@ mod rocm {
 
 #[cfg(feature = "gpu-cuda")]
 pub use cuda::{
-    matmul_batched_f32_strided_device,
-    matmul_batched_f32_strided_device_with_policy,
-    matmul_f32_ex_device,
-    matmul_f32_ex_device_with_policy,
+    matmul_batched_f32_strided_device, matmul_batched_f32_strided_device_with_policy,
+    matmul_f32_ex_device, matmul_f32_ex_device_with_policy,
 };
 
 #[cfg(all(test, feature = "gpu-cuda"))]
@@ -3155,15 +3174,10 @@ mod tests {
         let n = 2;
         let a: Vec<f32> = (0..m * k).map(|i| i as f32 + 1.0).collect();
         let b: Vec<f32> = (0..k * n).map(|i| (i as f32 + 0.5) * 0.5).collect();
-        let cases = [
-            (false, false),
-            (true, false),
-            (false, true),
-            (true, true),
-        ];
+        let cases = [(false, false), (true, false), (false, true), (true, true)];
         for (trans_a, trans_b) in cases {
-            let gpu = super::cuda::matmul_f32_ex(&a, &b, m, k, n, trans_a, trans_b)
-                .expect("gpu matmul");
+            let gpu =
+                super::cuda::matmul_f32_ex(&a, &b, m, k, n, trans_a, trans_b).expect("gpu matmul");
             let cpu = super::matmul_cpu_ex(&a, &b, m, k, n, trans_a, trans_b);
             assert_close(&gpu, &cpu);
         }
@@ -3184,21 +3198,9 @@ mod tests {
         let b: Vec<f32> = (0..k * n).map(|i| (i as f32 + 1.25) * 0.2).collect();
         let d_a = stream.memcpy_stod(&a).expect("d_a");
         let d_b = stream.memcpy_stod(&b).expect("d_b");
-        let mut d_c = stream
-            .alloc_zeros::<f32>(m * n)
-            .expect("alloc d_c");
-        super::matmul_f32_ex_device(
-            stream.clone(),
-            &d_a,
-            &d_b,
-            &mut d_c,
-            m,
-            k,
-            n,
-            false,
-            false,
-        )
-        .expect("device matmul");
+        let mut d_c = stream.alloc_zeros::<f32>(m * n).expect("alloc d_c");
+        super::matmul_f32_ex_device(stream.clone(), &d_a, &d_b, &mut d_c, m, k, n, false, false)
+            .expect("device matmul");
         let gpu = stream.memcpy_dtov(&d_c).expect("dtoh c");
         let cpu = super::matmul_cpu_ex(&a, &b, m, k, n, false, false);
         assert_close(&gpu, &cpu);
@@ -3309,10 +3311,7 @@ mod tests {
             MatmulTensorCorePolicy::Float16,
         ) {
             for (lhs, rhs) in res.iter().zip(cpu.iter()) {
-                assert!(
-                    (lhs - rhs).abs() < 5e-2,
-                    "float16 mismatch: {lhs} vs {rhs}"
-                );
+                assert!((lhs - rhs).abs() < 5e-2, "float16 mismatch: {lhs} vs {rhs}");
             }
         } else {
             eprintln!("skipping float16 tensor core check");
@@ -3365,11 +3364,9 @@ mod tests {
             return;
         }
         let values = vec![0.1f32, f32::NAN, 0.5, 0.3];
-        let res_ignore =
-            super::argmax_f32_with_policy(&values, NanPolicy::Ignore).expect("ignore");
+        let res_ignore = super::argmax_f32_with_policy(&values, NanPolicy::Ignore).expect("ignore");
         assert_eq!(res_ignore, 2);
-        let res_prop =
-            super::argmax_f32_with_policy(&values, NanPolicy::Propagate).expect("prop");
+        let res_prop = super::argmax_f32_with_policy(&values, NanPolicy::Propagate).expect("prop");
         assert_eq!(res_prop, 1);
         let nan_only = vec![f32::NAN, f32::NAN];
         let res_ignore =
