@@ -456,13 +456,15 @@ mod cuda {
     use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
     use half::{bf16, f16};
     use std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         env, fs,
         path::PathBuf,
-        sync::{Arc, OnceLock},
+        sync::{Arc, Mutex, OnceLock},
     };
 
     static GLOBAL_CONTEXT: OnceLock<Arc<CudaContext>> = OnceLock::new();
+    static MODULE_CACHE: OnceLock<Mutex<HashMap<usize, HashMap<&'static str, Arc<CudaModule>>>>> =
+        OnceLock::new();
 
     const REDUCE_KERNEL_SRC: &str = r#"
 #include <math.h>
@@ -1492,21 +1494,11 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
     }
 
     fn load_reduce_module(ctx: &Arc<CudaContext>) -> Result<Arc<CudaModule>, String> {
-        let mut opts = CompileOptions::default();
-        opts.include_paths = nvrtc_include_paths();
-        let ptx = compile_ptx_with_opts(REDUCE_KERNEL_SRC, opts)
-            .map_err(|e| format!("nvrtc: {:?}", e))?;
-        ctx.load_module(ptx)
-            .map_err(|e| format!("load module: {:?}", e))
+        load_module_cached(ctx, "reduce", REDUCE_KERNEL_SRC)
     }
 
     fn load_matmul_module(ctx: &Arc<CudaContext>) -> Result<Arc<CudaModule>, String> {
-        let mut opts = CompileOptions::default();
-        opts.include_paths = nvrtc_include_paths();
-        let ptx = compile_ptx_with_opts(MATMUL_KERNEL_SRC, opts)
-            .map_err(|e| format!("nvrtc: {:?}", e))?;
-        ctx.load_module(ptx)
-            .map_err(|e| format!("load module: {:?}", e))
+        load_module_cached(ctx, "matmul", MATMUL_KERNEL_SRC)
     }
 
     fn nvrtc_include_paths() -> Vec<String> {
@@ -1556,6 +1548,43 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
     fn default_stream() -> Result<Arc<CudaStream>, String> {
         global_context().map(|ctx| ctx.default_stream())
     }
+
+    fn module_cache(
+    ) -> &'static Mutex<HashMap<usize, HashMap<&'static str, Arc<CudaModule>>>> {
+        MODULE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn load_module_cached(
+        ctx: &Arc<CudaContext>,
+        key: &'static str,
+        source: &str,
+    ) -> Result<Arc<CudaModule>, String> {
+        let ctx_key = Arc::as_ptr(ctx) as usize;
+        if let Ok(cache) = module_cache().lock() {
+            if let Some(mods) = cache.get(&ctx_key) {
+                if let Some(module) = mods.get(key) {
+                    return Ok(module.clone());
+                }
+            }
+        }
+
+        let mut opts = CompileOptions::default();
+        opts.include_paths = nvrtc_include_paths();
+        let ptx =
+            compile_ptx_with_opts(source, opts).map_err(|e| format!("nvrtc: {:?}", e))?;
+        let module = ctx
+            .load_module(ptx)
+            .map_err(|e| format!("load module: {:?}", e))?;
+
+        let mut cache = module_cache()
+            .lock()
+            .map_err(|_| "module cache poisoned".to_string())?;
+        let entry = cache.entry(ctx_key).or_insert_with(HashMap::new);
+        entry.entry(key).or_insert_with(|| module.clone());
+
+        Ok(module)
+    }
+
     fn path_to_string(path: &PathBuf) -> String {
         path.to_string_lossy().into_owned()
     }
