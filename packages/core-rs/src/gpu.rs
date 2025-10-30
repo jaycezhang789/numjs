@@ -1933,10 +1933,6 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         }
     }
 
-    fn default_stream() -> Result<Arc<CudaStream>, String> {
-        Ok(global_context()?.default_stream())
-    }
-
     fn module_cache(
     ) -> &'static Mutex<HashMap<usize, HashMap<&'static str, Arc<CudaModule>>>> {
         MODULE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
