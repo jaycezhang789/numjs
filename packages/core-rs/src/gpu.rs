@@ -82,13 +82,13 @@ fn sum_f32_kahan(values: &[f32]) -> f32 {
 
 #[derive(Clone, Copy, Debug)]
 pub enum MatmulTensorCorePolicy {
-    /// 优先精度，保持 FP32 计算路径（默认）
+    /// Favors precision by staying on the FP32 execution path (default)
     Accuracy,
-    /// 优先性能，在支持的硬件上启用 TF32 Tensor Core（cuBLASLt）
+    /// Favors throughput and enables TF32 Tensor Core on supported hardware (cuBLASLt)
     Performance,
-    /// 强制使用 FP16 Tensor Core（主机侧转换后执行）
+    /// Forces FP16 Tensor Core usage (host converts inputs before execution)
     Float16,
-    /// 强制使用 BF16 Tensor Core（主机侧转换后执行）
+    /// Forces BF16 Tensor Core usage (host converts inputs before execution)
     BFloat16,
 }
 
@@ -682,9 +682,9 @@ mod cuda {
         let block_dim = select_block_dim(&func, smem_per_thread_f32)?;
         let shared = shared_mem_bytes(block_dim, std::mem::size_of::<f32>())?;
         let mut current_len = values.len();
-        let mut current_slice: &CudaSlice<f32> = values;
-        let mut owned: Option<CudaSlice<f32>> = None;
+        let mut storage: Option<CudaSlice<f32>> = None;
         loop {
+            let current_slice = storage.as_ref().unwrap_or(values);
             let len_i32 = usize_to_i32("reduce_sum length", current_len)?;
             let blocks = blocks_for_len("reduce_sum length", current_len, block_dim)?;
             let mut next = stream
@@ -711,8 +711,7 @@ mod cuda {
                 break;
             }
             current_len = blocks as usize;
-            owned = Some(next);
-            current_slice = owned.as_ref().unwrap();
+            storage = Some(next);
         }
         Ok(())
     }
@@ -729,9 +728,9 @@ mod cuda {
         let block_dim = select_block_dim(&func, smem_per_thread_f32)?;
         let shared = shared_mem_bytes(block_dim, std::mem::size_of::<f32>())?;
         let mut current_len = values.len();
-        let mut current_slice: &CudaSlice<f32> = values;
-        let mut owned: Option<CudaSlice<f32>> = None;
+        let mut storage: Option<CudaSlice<f32>> = None;
         loop {
+            let current_slice = storage.as_ref().unwrap_or(values);
             let len_i32 = usize_to_i32("reduce_max length", current_len)?;
             let blocks = blocks_for_len("reduce_max length", current_len, block_dim)?;
             let mut next = stream
@@ -758,8 +757,7 @@ mod cuda {
                 break;
             }
             current_len = blocks as usize;
-            owned = Some(next);
-            current_slice = owned.as_ref().unwrap();
+            storage = Some(next);
         }
         Ok(())
     }
