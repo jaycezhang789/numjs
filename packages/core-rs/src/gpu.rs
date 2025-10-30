@@ -1,4 +1,8 @@
 use crate::CoreResult;
+#[cfg(feature = "gpu-cuda")]
+use cudarc::driver::{CudaSlice, CudaStream};
+#[cfg(feature = "gpu-cuda")]
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuBackendKind {
@@ -113,6 +117,25 @@ pub fn reduce_sum_f32_with_policy(values: &[f32], policy: SumPrecisionPolicy) ->
     Ok(result)
 }
 
+#[cfg(feature = "gpu-cuda")]
+pub fn reduce_sum_f32_device(
+    stream: Arc<CudaStream>,
+    values: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+) -> CoreResult<()> {
+    cuda::reduce_sum_f32_device(stream, values, out)
+}
+
+#[cfg(feature = "gpu-cuda")]
+pub fn reduce_sum_f32_device_with_policy(
+    stream: Arc<CudaStream>,
+    values: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    policy: SumPrecisionPolicy,
+) -> CoreResult<()> {
+    cuda::reduce_sum_f32_device_with_policy(stream, values, out, policy)
+}
+
 pub fn reduce_max_f32(values: &[f32]) -> CoreResult<f32> {
     reduce_max_f32_with_policy(values, NanPolicy::Ignore)
 }
@@ -160,6 +183,25 @@ pub fn reduce_max_f32_with_policy(values: &[f32], policy: NanPolicy) -> CoreResu
     }
 }
 
+#[cfg(feature = "gpu-cuda")]
+pub fn reduce_max_f32_device(
+    stream: Arc<CudaStream>,
+    values: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+) -> CoreResult<()> {
+    cuda::reduce_max_f32_device(stream, values, out)
+}
+
+#[cfg(feature = "gpu-cuda")]
+pub fn reduce_max_f32_device_with_policy(
+    stream: Arc<CudaStream>,
+    values: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    policy: NanPolicy,
+) -> CoreResult<()> {
+    cuda::reduce_max_f32_device_with_policy(stream, values, out, policy)
+}
+
 pub fn argmax_f32_with_policy(values: &[f32], policy: NanPolicy) -> CoreResult<usize> {
     if values.is_empty() {
         return Err("argmax on empty slice".into());
@@ -201,6 +243,25 @@ pub fn argmax_f32_with_policy(values: &[f32], policy: NanPolicy) -> CoreResult<u
             }
         }
     }
+}
+
+#[cfg(feature = "gpu-cuda")]
+pub fn argmax_f32_device(
+    stream: Arc<CudaStream>,
+    values: &CudaSlice<f32>,
+    out: &mut CudaSlice<i32>,
+) -> CoreResult<()> {
+    cuda::argmax_f32_device(stream, values, out)
+}
+
+#[cfg(feature = "gpu-cuda")]
+pub fn argmax_f32_device_with_policy(
+    stream: Arc<CudaStream>,
+    values: &CudaSlice<f32>,
+    out: &mut CudaSlice<i32>,
+    policy: NanPolicy,
+) -> CoreResult<()> {
+    cuda::argmax_f32_device_with_policy(stream, values, out, policy)
 }
 
 pub fn matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> CoreResult<Vec<f32>> {
@@ -462,9 +523,336 @@ mod cuda {
         sync::{Arc, Mutex, OnceLock},
     };
 
-    static GLOBAL_CONTEXT: OnceLock<Arc<CudaContext>> = OnceLock::new();
+    static GLOBAL_CONTEXT: OnceLock<Result<Arc<CudaContext>, String>> = OnceLock::new();
     static MODULE_CACHE: OnceLock<Mutex<HashMap<usize, HashMap<&'static str, Arc<CudaModule>>>>> =
         OnceLock::new();
+
+    fn write_scalar_f32(
+        stream: &Arc<CudaStream>,
+        out: &mut CudaSlice<f32>,
+        value: f32,
+    ) -> Result<(), String> {
+        if out.len() == 0 {
+            return Err("write_scalar_f32: output slice is empty".into());
+        }
+        let host = [value];
+        stream
+            .memcpy_htod(&host, out)
+            .map_err(|e| format!("memcpy_htod scalar f32: {:?}", e))
+    }
+
+    fn write_scalar_i32(
+        stream: &Arc<CudaStream>,
+        out: &mut CudaSlice<i32>,
+        value: i32,
+    ) -> Result<(), String> {
+        if out.len() == 0 {
+            return Err("write_scalar_i32: output slice is empty".into());
+        }
+        let host = [value];
+        stream
+            .memcpy_htod(&host, out)
+            .map_err(|e| format!("memcpy_htod scalar i32: {:?}", e))
+    }
+
+    fn extract_optional_index(idx: Option<i32>, len: usize) -> Option<usize> {
+        match idx.unwrap_or(len as i32) {
+            v if v >= 0 && (v as usize) < len => Some(v as usize),
+            _ => None,
+        }
+    }
+
+    fn first_index_with_stage(
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        values: &CudaSlice<f32>,
+        stage1_name: &str,
+        label: &str,
+    ) -> Result<Option<usize>, String> {
+        if values.len() == 0 {
+            return Ok(None);
+        }
+        let stage1 = module
+            .load_function(stage1_name)
+            .map_err(|e| format!("load {stage1_name}: {:?}", e))?;
+        let reduce = module
+            .load_function("min_index_stage_reduce")
+            .map_err(|e| format!("load min_index_stage_reduce: {:?}", e))?;
+        let block_dim_stage1 = select_block_dim(&stage1, smem_per_thread_i32)?;
+        let shared_stage1 = shared_mem_bytes(block_dim_stage1, std::mem::size_of::<i32>())?;
+        let mut blocks =
+            blocks_for_len("index reduce stage1", values.len(), block_dim_stage1)?;
+        let mut current = stream
+            .alloc_zeros::<i32>(blocks as usize)
+            .map_err(|e| format!("alloc index tmp: {:?}", e))?;
+        let len_i32 = usize_to_i32("index reduce length", values.len())?;
+        let cfg_stage1 = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (block_dim_stage1, 1, 1),
+            shared_mem_bytes: shared_stage1,
+        };
+        unsafe {
+            stream
+                .launch_builder(&stage1)
+                .arg(values)
+                .arg(&mut current)
+                .arg(&len_i32)
+                .launch(cfg_stage1)
+        }
+        .map_err(|e| format!("launch {stage1_name}: {:?}", e))?;
+        if blocks == 1 {
+            let host = stream
+                .memcpy_dtov(&current)
+                .map_err(|e| format!("{label}: {:?}", e))?;
+            return Ok(extract_optional_index(host.into_iter().next(), values.len()));
+        }
+        let block_dim_reduce = select_block_dim(&reduce, smem_per_thread_i32)?;
+        let shared_reduce =
+            shared_mem_bytes(block_dim_reduce, std::mem::size_of::<i32>())?;
+        let mut current_len = blocks as usize;
+        loop {
+            blocks = blocks_for_len("index reduce partial", current_len, block_dim_reduce)?;
+            let mut next = stream
+                .alloc_zeros::<i32>(blocks as usize)
+                .map_err(|e| format!("alloc index next: {:?}", e))?;
+            let len_i32 =
+                usize_to_i32("index reduce partial length", current_len)?;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (block_dim_reduce, 1, 1),
+                shared_mem_bytes: shared_reduce,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&reduce)
+                    .arg(&current)
+                    .arg(&mut next)
+                    .arg(&len_i32)
+                    .launch(cfg)
+            }
+            .map_err(|e| format!("launch min_index_stage_reduce: {:?}", e))?;
+            if blocks == 1 {
+                let host = stream
+                    .memcpy_dtov(&next)
+                    .map_err(|e| format!("{label}: {:?}", e))?;
+                return Ok(extract_optional_index(host.into_iter().next(), values.len()));
+            }
+            current_len = blocks as usize;
+            current = next;
+        }
+    }
+
+    fn first_nan_index(
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        values: &CudaSlice<f32>,
+    ) -> Result<Option<usize>, String> {
+        first_index_with_stage(
+            stream,
+            module,
+            values,
+            "first_nan_index_stage1",
+            "dtoh first_nan index",
+        )
+    }
+
+    fn first_valid_index(
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        values: &CudaSlice<f32>,
+    ) -> Result<Option<usize>, String> {
+        first_index_with_stage(
+            stream,
+            module,
+            values,
+            "first_valid_index_stage1",
+            "dtoh first_valid index",
+        )
+    }
+
+    fn reduce_sum_device_internal(
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        values: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), String> {
+        let func = module
+            .load_function("reduce_sum_stage1")
+            .map_err(|e| format!("load reduce_sum_stage1: {:?}", e))?;
+        let block_dim = select_block_dim(&func, smem_per_thread_f32)?;
+        let shared = shared_mem_bytes(block_dim, std::mem::size_of::<f32>())?;
+        let mut current_len = values.len();
+        let mut current_slice: &CudaSlice<f32> = values;
+        let mut owned: Option<CudaSlice<f32>> = None;
+        loop {
+            let len_i32 = usize_to_i32("reduce_sum length", current_len)?;
+            let blocks = blocks_for_len("reduce_sum length", current_len, block_dim)?;
+            let mut next = stream
+                .alloc_zeros::<f32>(blocks as usize)
+                .map_err(|e| format!("alloc reduce_sum tmp: {:?}", e))?;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: shared,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&func)
+                    .arg(current_slice)
+                    .arg(&mut next)
+                    .arg(&len_i32)
+                    .launch(cfg)
+            }
+            .map_err(|e| format!("launch reduce_sum: {:?}", e))?;
+            if blocks == 1 {
+                stream
+                    .memcpy_dtod(&next, out)
+                    .map_err(|e| format!("dtod reduce_sum result: {:?}", e))?;
+                break;
+            }
+            current_len = blocks as usize;
+            owned = Some(next);
+            current_slice = owned.as_ref().unwrap();
+        }
+        Ok(())
+    }
+
+    fn reduce_max_device_ignore_nan(
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        values: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), String> {
+        let func = module
+            .load_function("reduce_max_stage1_ignore_nan")
+            .map_err(|e| format!("load reduce_max_stage1_ignore_nan: {:?}", e))?;
+        let block_dim = select_block_dim(&func, smem_per_thread_f32)?;
+        let shared = shared_mem_bytes(block_dim, std::mem::size_of::<f32>())?;
+        let mut current_len = values.len();
+        let mut current_slice: &CudaSlice<f32> = values;
+        let mut owned: Option<CudaSlice<f32>> = None;
+        loop {
+            let len_i32 = usize_to_i32("reduce_max length", current_len)?;
+            let blocks = blocks_for_len("reduce_max length", current_len, block_dim)?;
+            let mut next = stream
+                .alloc_zeros::<f32>(blocks as usize)
+                .map_err(|e| format!("alloc reduce_max tmp: {:?}", e))?;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: shared,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&func)
+                    .arg(current_slice)
+                    .arg(&mut next)
+                    .arg(&len_i32)
+                    .launch(cfg)
+            }
+            .map_err(|e| format!("launch reduce_max: {:?}", e))?;
+            if blocks == 1 {
+                stream
+                    .memcpy_dtod(&next, out)
+                    .map_err(|e| format!("dtod reduce_max result: {:?}", e))?;
+                break;
+            }
+            current_len = blocks as usize;
+            owned = Some(next);
+            current_slice = owned.as_ref().unwrap();
+        }
+        Ok(())
+    }
+
+    fn argmax_device_ignore_nan(
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        values: &CudaSlice<f32>,
+        out: &mut CudaSlice<i32>,
+    ) -> Result<(), String> {
+        let stage1 = module
+            .load_function("argmax_stage1_ignore_nan")
+            .map_err(|e| format!("load argmax_stage1_ignore_nan: {:?}", e))?;
+        let block_dim_stage1 = select_block_dim(&stage1, smem_per_thread_f32_i32)?;
+        let shared_stage1 = shared_mem_bytes(
+            block_dim_stage1,
+            std::mem::size_of::<f32>() + std::mem::size_of::<i32>(),
+        )?;
+        let len_i32 = usize_to_i32("argmax length", values.len())?;
+        let mut blocks = blocks_for_len("argmax length", values.len(), block_dim_stage1)?;
+        let mut vals = stream
+            .alloc_zeros::<f32>(blocks as usize)
+            .map_err(|e| format!("alloc argmax partial values: {:?}", e))?;
+        let mut idxs = stream
+            .alloc_zeros::<i32>(blocks as usize)
+            .map_err(|e| format!("alloc argmax partial idx: {:?}", e))?;
+        let cfg_stage1 = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (block_dim_stage1, 1, 1),
+            shared_mem_bytes: shared_stage1,
+        };
+        unsafe {
+            stream
+                .launch_builder(&stage1)
+                .arg(values)
+                .arg(&mut vals)
+                .arg(&mut idxs)
+                .arg(&len_i32)
+                .launch(cfg_stage1)
+        }
+        .map_err(|e| format!("launch argmax_stage1_ignore_nan: {:?}", e))?;
+        if blocks == 1 {
+            stream
+                .memcpy_dtod(&idxs, out)
+                .map_err(|e| format!("dtod argmax result: {:?}", e))?;
+            return Ok(());
+        }
+        let reduce = module
+            .load_function("argmax_stage_reduce")
+            .map_err(|e| format!("load argmax_stage_reduce: {:?}", e))?;
+        let block_dim_reduce = select_block_dim(&reduce, smem_per_thread_f32_i32)?;
+        let shared_reduce = shared_mem_bytes(
+            block_dim_reduce,
+            std::mem::size_of::<f32>() + std::mem::size_of::<i32>(),
+        )?;
+        let mut current_len = blocks as usize;
+        loop {
+            blocks = blocks_for_len("argmax partial length", current_len, block_dim_reduce)?;
+            let mut next_vals = stream
+                .alloc_zeros::<f32>(blocks as usize)
+                .map_err(|e| format!("alloc argmax next values: {:?}", e))?;
+            let mut next_idxs = stream
+                .alloc_zeros::<i32>(blocks as usize)
+                .map_err(|e| format!("alloc argmax next idx: {:?}", e))?;
+            let len_i32 = usize_to_i32("argmax partial length", current_len)?;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (block_dim_reduce, 1, 1),
+                shared_mem_bytes: shared_reduce,
+            };
+            unsafe {
+                stream
+                    .launch_builder(&reduce)
+                    .arg(&vals)
+                    .arg(&idxs)
+                    .arg(&mut next_vals)
+                    .arg(&mut next_idxs)
+                    .arg(&len_i32)
+                    .launch(cfg)
+            }
+            .map_err(|e| format!("launch argmax_stage_reduce: {:?}", e))?;
+            if blocks == 1 {
+                stream
+                    .memcpy_dtod(&next_idxs, out)
+                    .map_err(|e| format!("dtod argmax result: {:?}", e))?;
+                break;
+            }
+            current_len = blocks as usize;
+            vals = next_vals;
+            idxs = next_idxs;
+        }
+        Ok(())
+    }
 
     const REDUCE_KERNEL_SRC: &str = r#"
 #include <math.h>
@@ -1536,17 +1924,17 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
     }
 
     fn global_context() -> Result<Arc<CudaContext>, String> {
-        GLOBAL_CONTEXT
-            .get_or_try_init(|| {
-                CudaContext::new(0)
-                    .map_err(|e| format!("cuda: {:?}", e))
-                    .map(Arc::new)
-            })
-            .cloned()
+        let entry = GLOBAL_CONTEXT.get_or_init(|| {
+            CudaContext::new(0).map_err(|e| format!("cuda: {:?}", e))
+        });
+        match entry {
+            Ok(ctx) => Ok(Arc::clone(ctx)),
+            Err(err) => Err(err.clone()),
+        }
     }
 
     fn default_stream() -> Result<Arc<CudaStream>, String> {
-        global_context().map(|ctx| ctx.default_stream())
+        Ok(global_context()?.default_stream())
     }
 
     fn module_cache(
@@ -2173,7 +2561,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
                         .memcpy_dtov(&d_c)
                         .map_err(|e| format!("dtoh c: {:?}", e)),
                     Err(err) => {
-                        // 回退到传统 cuBLAS
+                        // 鍥為€€鍒颁紶缁?cuBLAS
                         let cfg = build_cublas_config_row_major(m, k, n, trans_a, trans_b)?;
                         if cfg!(debug_assertions) {
                             eprintln!(
@@ -2773,51 +3161,22 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
     }
 
     pub fn reduce_sum_f32(values: &[f32]) -> CoreResult<f32> {
-        let n = values.len();
-        if n == 0 {
+        if values.is_empty() {
             return Ok(0.0);
         }
         let ctx = global_context()?;
         let stream = ctx.default_stream();
-        let module = load_reduce_module(&ctx)?;
-        let func = module
-            .load_function("reduce_sum_stage1")
-            .map_err(|e| format!("get func: {:?}", e))?;
-        let block_dim = select_block_dim(&func, smem_per_thread_f32)?;
-        let shared = shared_mem_bytes(block_dim, std::mem::size_of::<f32>())?;
-        let mut current = stream
+        let device_values = stream
             .memcpy_stod(values)
-            .map_err(|e| format!("htod: {:?}", e))?;
-        let mut current_len = n;
-        loop {
-            let len_i32 = usize_to_i32("reduce_sum length", current_len)?;
-            let blocks = blocks_for_len("reduce_sum length", current_len, block_dim)?;
-            let mut next: CudaSlice<f32> = stream
-                .alloc_zeros(blocks as usize)
-                .map_err(|e| format!("alloc tmp: {:?}", e))?;
-            let cfg = LaunchConfig {
-                grid_dim: (blocks, 1, 1),
-                block_dim: (block_dim, 1, 1),
-                shared_mem_bytes: shared,
-            };
-            unsafe {
-                stream
-                    .launch_builder(&func)
-                    .arg(&current)
-                    .arg(&mut next)
-                    .arg(&len_i32)
-                    .launch(cfg)
-            }
-            .map_err(|e| format!("launch reduce_sum: {:?}", e))?;
-            if blocks == 1 {
-                let host = stream
-                    .memcpy_dtov(&next)
-                    .map_err(|e| format!("dtoh: {:?}", e))?;
-                return Ok(host.into_iter().next().unwrap_or(0.0));
-            }
-            current = next;
-            current_len = blocks as usize;
-        }
+            .map_err(|e| format!("reduce_sum htod: {:?}", e))?;
+        let mut device_out = stream
+            .alloc_zeros::<f32>(1)
+            .map_err(|e| format!("reduce_sum alloc: {:?}", e))?;
+        reduce_sum_f32_device(stream.clone(), &device_values, &mut device_out)?;
+        let host = stream
+            .memcpy_dtov(&device_out)
+            .map_err(|e| format!("reduce_sum dtoh: {:?}", e))?;
+        Ok(host.into_iter().next().unwrap_or(0.0))
     }
 
     pub fn reduce_sum_f32_with_policy(
@@ -2831,287 +3190,199 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         }
     }
 
+    pub fn reduce_sum_f32_device(
+        stream: Arc<CudaStream>,
+        values: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> CoreResult<()> {
+        reduce_sum_f32_device_with_policy(
+            stream,
+            values,
+            out,
+            SumPrecisionPolicy::Default,
+        )
+    }
+
+    pub fn reduce_sum_f32_device_with_policy(
+        stream: Arc<CudaStream>,
+        values: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        policy: SumPrecisionPolicy,
+    ) -> CoreResult<()> {
+        if out.len() == 0 {
+            return Err("reduce_sum_f32_device: output slice is empty".into());
+        }
+        match policy {
+            SumPrecisionPolicy::Default => {
+                if values.len() == 0 {
+                    write_scalar_f32(&stream, out, 0.0)?;
+                    Ok(())
+                } else {
+                    let ctx = stream.context().clone();
+                    let module = load_reduce_module(&ctx)?;
+                    reduce_sum_device_internal(&stream, &module, values, out)
+                }
+            }
+            SumPrecisionPolicy::Float64 | SumPrecisionPolicy::Kahan => Err(
+                "reduce_sum_f32_device_with_policy: Float64/Kahan not supported on device"
+                    .into(),
+            ),
+        }
+    }
+
     pub fn reduce_max_f32_with_policy(values: &[f32], policy: NanPolicy) -> CoreResult<f32> {
-        let n = values.len();
-        if n == 0 {
+        if values.is_empty() {
             return Err("reduce_max on empty slice".into());
         }
         if matches!(policy, NanPolicy::Ignore) && !values.iter().any(|v| !v.is_nan()) {
             return Ok(f32::NAN);
         }
+        if matches!(policy, NanPolicy::Propagate) && values.iter().any(|v| v.is_nan()) {
+            return Ok(f32::NAN);
+        }
         let ctx = global_context()?;
         let stream = ctx.default_stream();
-        let module = load_reduce_module(&ctx)?;
-        let k_max = module
-            .load_function("reduce_max_stage1_ignore_nan")
-            .map_err(|e| format!("get func: {:?}", e))?;
-        let block_dim_max = select_block_dim(&k_max, smem_per_thread_f32)?;
-        let shared_max = shared_mem_bytes(block_dim_max, std::mem::size_of::<f32>())?;
-        let mut current = stream
+        let device_values = stream
             .memcpy_stod(values)
-            .map_err(|e| format!("htod: {:?}", e))?;
-        if matches!(policy, NanPolicy::Propagate) {
-            let k_nan = module
-                .load_function("first_nan_index_stage1")
-                .map_err(|e| format!("get func: {:?}", e))?;
-            let k_nan_reduce = module
-                .load_function("min_index_stage_reduce")
-                .map_err(|e| format!("get func: {:?}", e))?;
-            let block_dim_nan = select_block_dim(&k_nan, smem_per_thread_i32)?;
-            let shared_nan = shared_mem_bytes(block_dim_nan, std::mem::size_of::<i32>())?;
-            let block_dim_nan_reduce = select_block_dim(&k_nan_reduce, smem_per_thread_i32)?;
-            let shared_nan_reduce =
-                shared_mem_bytes(block_dim_nan_reduce, std::mem::size_of::<i32>())?;
-            let nan_blocks = blocks_for_len("reduce_max first_nan length", n, block_dim_nan)?;
-            let mut nan_current = stream
-                .alloc_zeros::<i32>(nan_blocks as usize)
-                .map_err(|e| format!("alloc tmp_nan: {:?}", e))?;
-            let len_i32 = usize_to_i32("reduce_max first_nan length", n)?;
-            let cfg = LaunchConfig {
-                grid_dim: (nan_blocks, 1, 1),
-                block_dim: (block_dim_nan, 1, 1),
-                shared_mem_bytes: shared_nan,
-            };
-            unsafe {
-                stream
-                    .launch_builder(&k_nan)
-                    .arg(&current)
-                    .arg(&mut nan_current)
-                    .arg(&len_i32)
-                    .launch(cfg)
-            }
-            .map_err(|e| format!("launch first_nan: {:?}", e))?;
-            let mut nan_len = nan_blocks as usize;
-            while nan_len > 1 {
-                let blocks = blocks_for_len(
-                    "reduce_max first_nan partial length",
-                    nan_len,
-                    block_dim_nan_reduce,
-                )?;
-                let mut next_nan = stream
-                    .alloc_zeros::<i32>(blocks as usize)
-                    .map_err(|e| format!("alloc next_nan: {:?}", e))?;
-                let len_i32 = usize_to_i32("reduce_max first_nan partial length", nan_len)?;
-                let cfg = LaunchConfig {
-                    grid_dim: (blocks, 1, 1),
-                    block_dim: (block_dim_nan_reduce, 1, 1),
-                    shared_mem_bytes: shared_nan_reduce,
-                };
-                unsafe {
-                    stream
-                        .launch_builder(&k_nan_reduce)
-                        .arg(&nan_current)
-                        .arg(&mut next_nan)
-                        .arg(&len_i32)
-                        .launch(cfg)
-                }
-                .map_err(|e| format!("launch min_index_reduce: {:?}", e))?;
-                nan_current = next_nan;
-                nan_len = blocks as usize;
-            }
-            let host = stream
-                .memcpy_dtov(&nan_current)
-                .map_err(|e| format!("dtoh: {:?}", e))?;
-            let min_idx = host.into_iter().next().unwrap_or(n as i32);
-            if min_idx >= 0 && (min_idx as usize) < n {
-                return Ok(f32::NAN);
-            }
+            .map_err(|e| format!("reduce_max htod: {:?}", e))?;
+        let mut device_out = stream
+            .alloc_zeros::<f32>(1)
+            .map_err(|e| format!("reduce_max alloc: {:?}", e))?;
+        reduce_max_f32_device_with_policy(
+            stream.clone(),
+            &device_values,
+            &mut device_out,
+            policy,
+        )?;
+        let host = stream
+            .memcpy_dtov(&device_out)
+            .map_err(|e| format!("reduce_max dtoh: {:?}", e))?;
+        Ok(host.into_iter().next().unwrap_or(f32::NEG_INFINITY))
+    }
+
+    pub fn reduce_max_f32_device(
+        stream: Arc<CudaStream>,
+        values: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> CoreResult<()> {
+        reduce_max_f32_device_with_policy(stream, values, out, NanPolicy::Ignore)
+    }
+
+    pub fn reduce_max_f32_device_with_policy(
+        stream: Arc<CudaStream>,
+        values: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        policy: NanPolicy,
+    ) -> CoreResult<()> {
+        if values.len() == 0 {
+            return Err("reduce_max_f32_device: empty input".into());
         }
-        let mut current_len = n;
-        loop {
-            let len_i32 = usize_to_i32("reduce_max length", current_len)?;
-            let blocks = blocks_for_len("reduce_max length", current_len, block_dim_max)?;
-            let mut next = stream
-                .alloc_zeros::<f32>(blocks as usize)
-                .map_err(|e| format!("alloc tmp: {:?}", e))?;
-            let cfg = LaunchConfig {
-                grid_dim: (blocks, 1, 1),
-                block_dim: (block_dim_max, 1, 1),
-                shared_mem_bytes: shared_max,
-            };
-            unsafe {
-                stream
-                    .launch_builder(&k_max)
-                    .arg(&current)
-                    .arg(&mut next)
-                    .arg(&len_i32)
-                    .launch(cfg)
+        if out.len() == 0 {
+            return Err("reduce_max_f32_device: output slice is empty".into());
+        }
+        let ctx = stream.context().clone();
+        let module = load_reduce_module(&ctx)?;
+        match policy {
+            NanPolicy::Ignore => {
+                if first_valid_index(&stream, &module, values)?.is_none() {
+                    write_scalar_f32(&stream, out, f32::NAN)?;
+                    Ok(())
+                } else {
+                    reduce_max_device_ignore_nan(&stream, &module, values, out)
+                }
             }
-            .map_err(|e| format!("launch max: {:?}", e))?;
-            if blocks == 1 {
-                let host = stream
-                    .memcpy_dtov(&next)
-                    .map_err(|e| format!("dtoh: {:?}", e))?;
-                let max_val = host.into_iter().next().unwrap_or(f32::NEG_INFINITY);
-                return Ok(max_val);
+            NanPolicy::Propagate => {
+                if first_nan_index(&stream, &module, values)?.is_some() {
+                    write_scalar_f32(&stream, out, f32::NAN)?;
+                    Ok(())
+                } else {
+                    reduce_max_device_ignore_nan(&stream, &module, values, out)
+                }
             }
-            current = next;
-            current_len = blocks as usize;
         }
     }
 
     pub fn argmax_f32_with_policy(values: &[f32], policy: NanPolicy) -> CoreResult<usize> {
-        let n = values.len();
-        if n == 0 {
+        if values.is_empty() {
             return Err("argmax on empty slice".into());
         }
-        if matches!(policy, NanPolicy::Ignore) && !values.iter().any(|v| !v.is_nan()) {
-            return Ok(0);
+        match policy {
+            NanPolicy::Ignore => {
+                if !values.iter().any(|v| !v.is_nan()) {
+                    return Ok(0);
+                }
+            }
+            NanPolicy::Propagate => {
+                if let Some(idx) = values.iter().position(|v| v.is_nan()) {
+                    return Ok(idx);
+                }
+            }
         }
         let ctx = global_context()?;
         let stream = ctx.default_stream();
-        let module = load_reduce_module(&ctx)?;
-        let k_argmax = module
-            .load_function("argmax_stage1_ignore_nan")
-            .map_err(|e| format!("get func: {:?}", e))?;
-        let block_dim_argmax = select_block_dim(&k_argmax, smem_per_thread_f32_i32)?;
-        let shared_argmax = shared_mem_bytes(
-            block_dim_argmax,
-            std::mem::size_of::<f32>() + std::mem::size_of::<i32>(),
-        )?;
-        let current = stream
+        let device_values = stream
             .memcpy_stod(values)
-            .map_err(|e| format!("htod: {:?}", e))?;
-        if matches!(policy, NanPolicy::Propagate) {
-            let k_nan = module
-                .load_function("first_nan_index_stage1")
-                .map_err(|e| format!("get func: {:?}", e))?;
-            let k_nan_reduce = module
-                .load_function("min_index_stage_reduce")
-                .map_err(|e| format!("get func: {:?}", e))?;
-            let block_dim_nan = select_block_dim(&k_nan, smem_per_thread_i32)?;
-            let shared_nan = shared_mem_bytes(block_dim_nan, std::mem::size_of::<i32>())?;
-            let block_dim_nan_reduce = select_block_dim(&k_nan_reduce, smem_per_thread_i32)?;
-            let shared_nan_reduce =
-                shared_mem_bytes(block_dim_nan_reduce, std::mem::size_of::<i32>())?;
-            let nan_blocks = blocks_for_len("argmax first_nan length", n, block_dim_nan)?;
-            let mut nan_current = stream
-                .alloc_zeros::<i32>(nan_blocks as usize)
-                .map_err(|e| format!("alloc tmp_nan: {:?}", e))?;
-            let len_i32 = usize_to_i32("argmax first_nan length", n)?;
-            let cfg = LaunchConfig {
-                grid_dim: (nan_blocks, 1, 1),
-                block_dim: (block_dim_nan, 1, 1),
-                shared_mem_bytes: shared_nan,
-            };
-            unsafe {
-                stream
-                    .launch_builder(&k_nan)
-                    .arg(&current)
-                    .arg(&mut nan_current)
-                    .arg(&len_i32)
-                    .launch(cfg)
-            }
-            .map_err(|e| format!("launch first_nan: {:?}", e))?;
-            let mut nan_len = nan_blocks as usize;
-            while nan_len > 1 {
-                let blocks = blocks_for_len(
-                    "argmax first_nan partial length",
-                    nan_len,
-                    block_dim_nan_reduce,
-                )?;
-                let mut next_nan = stream
-                    .alloc_zeros::<i32>(blocks as usize)
-                    .map_err(|e| format!("alloc next_nan: {:?}", e))?;
-                let len_i32 = usize_to_i32("argmax first_nan partial length", nan_len)?;
-                let cfg = LaunchConfig {
-                    grid_dim: (blocks, 1, 1),
-                    block_dim: (block_dim_nan_reduce, 1, 1),
-                    shared_mem_bytes: shared_nan_reduce,
-                };
-                unsafe {
-                    stream
-                        .launch_builder(&k_nan_reduce)
-                        .arg(&nan_current)
-                        .arg(&mut next_nan)
-                        .arg(&len_i32)
-                        .launch(cfg)
-                }
-                .map_err(|e| format!("launch min_index_reduce: {:?}", e))?;
-                nan_current = next_nan;
-                nan_len = blocks as usize;
-            }
-            let host = stream
-                .memcpy_dtov(&nan_current)
-                .map_err(|e| format!("dtoh: {:?}", e))?;
-            let min_idx = host.into_iter().next().unwrap_or(n as i32);
-            if min_idx >= 0 && (min_idx as usize) < n {
-                return Ok(min_idx as usize);
-            }
-        }
-        let len_i32 = usize_to_i32("argmax length", n)?;
-        let mut blocks = blocks_for_len("argmax length", n, block_dim_argmax)?;
-        let mut vals = stream
-            .alloc_zeros::<f32>(blocks as usize)
-            .map_err(|e| format!("alloc pmax: {:?}", e))?;
-        let mut idxs = stream
-            .alloc_zeros::<i32>(blocks as usize)
-            .map_err(|e| format!("alloc pidx: {:?}", e))?;
-        let cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (block_dim_argmax, 1, 1),
-            shared_mem_bytes: shared_argmax,
-        };
-        unsafe {
-            stream
-                .launch_builder(&k_argmax)
-                .arg(&current)
-                .arg(&mut vals)
-                .arg(&mut idxs)
-                .arg(&len_i32)
-                .launch(cfg)
-        }
-        .map_err(|e| format!("launch argmax stage1: {:?}", e))?;
-        let k_argmax_reduce = module
-            .load_function("argmax_stage_reduce")
-            .map_err(|e| format!("get func: {:?}", e))?;
-        let block_dim_argmax_reduce = select_block_dim(&k_argmax_reduce, smem_per_thread_f32_i32)?;
-        let shared_argmax_reduce = shared_mem_bytes(
-            block_dim_argmax_reduce,
-            std::mem::size_of::<f32>() + std::mem::size_of::<i32>(),
+            .map_err(|e| format!("argmax htod: {:?}", e))?;
+        let mut device_out = stream
+            .alloc_zeros::<i32>(1)
+            .map_err(|e| format!("argmax alloc: {:?}", e))?;
+        argmax_f32_device_with_policy(
+            stream.clone(),
+            &device_values,
+            &mut device_out,
+            policy,
         )?;
-        let mut current_len = blocks as usize;
-        while current_len > 1 {
-            blocks = blocks_for_len(
-                "argmax partial length",
-                current_len,
-                block_dim_argmax_reduce,
-            )?;
-            let mut next_vals = stream
-                .alloc_zeros::<f32>(blocks as usize)
-                .map_err(|e| format!("alloc next_vals: {:?}", e))?;
-            let mut next_idxs = stream
-                .alloc_zeros::<i32>(blocks as usize)
-                .map_err(|e| format!("alloc next_idxs: {:?}", e))?;
-            let len_i32 = usize_to_i32("argmax partial length", current_len)?;
-            let cfg = LaunchConfig {
-                grid_dim: (blocks, 1, 1),
-                block_dim: (block_dim_argmax_reduce, 1, 1),
-                shared_mem_bytes: shared_argmax_reduce,
-            };
-            unsafe {
-                stream
-                    .launch_builder(&k_argmax_reduce)
-                    .arg(&vals)
-                    .arg(&idxs)
-                    .arg(&mut next_vals)
-                    .arg(&mut next_idxs)
-                    .arg(&len_i32)
-                    .launch(cfg)
-            }
-            .map_err(|e| format!("launch argmax reduce: {:?}", e))?;
-            vals = next_vals;
-            idxs = next_idxs;
-            current_len = blocks as usize;
-        }
-        let hi = stream
-            .memcpy_dtov(&idxs)
-            .map_err(|e| format!("dtoh: {:?}", e))?;
-        let best_idx = hi.into_iter().next().unwrap_or(-1);
-        if best_idx < 0 {
+        let host = stream
+            .memcpy_dtov(&device_out)
+            .map_err(|e| format!("argmax dtoh: {:?}", e))?;
+        let best = host.into_iter().next().unwrap_or(-1);
+        if best < 0 {
             Ok(0)
         } else {
-            Ok(best_idx as usize)
+            Ok(best as usize)
+        }
+    }
+
+    pub fn argmax_f32_device(
+        stream: Arc<CudaStream>,
+        values: &CudaSlice<f32>,
+        out: &mut CudaSlice<i32>,
+    ) -> CoreResult<()> {
+        argmax_f32_device_with_policy(stream, values, out, NanPolicy::Ignore)
+    }
+
+    pub fn argmax_f32_device_with_policy(
+        stream: Arc<CudaStream>,
+        values: &CudaSlice<f32>,
+        out: &mut CudaSlice<i32>,
+        policy: NanPolicy,
+    ) -> CoreResult<()> {
+        if values.len() == 0 {
+            return Err("argmax_f32_device: empty input".into());
+        }
+        if out.len() == 0 {
+            return Err("argmax_f32_device: output slice is empty".into());
+        }
+        let ctx = stream.context().clone();
+        let module = load_reduce_module(&ctx)?;
+        match policy {
+            NanPolicy::Ignore => {
+                if first_valid_index(&stream, &module, values)?.is_none() {
+                    write_scalar_i32(&stream, out, 0)?;
+                    Ok(())
+                } else {
+                    argmax_device_ignore_nan(&stream, &module, values, out)
+                }
+            }
+            NanPolicy::Propagate => {
+                if let Some(idx) = first_nan_index(&stream, &module, values)? {
+                    let idx_i32 = usize_to_i32("argmax nan index", idx)?;
+                    write_scalar_i32(&stream, out, idx_i32)?;
+                    Ok(())
+                } else {
+                    argmax_device_ignore_nan(&stream, &module, values, out)
+                }
+            }
         }
     }
 }
@@ -3403,3 +3674,6 @@ mod tests {
         assert_eq!(res_ignore, 0);
     }
 }
+
+
+
