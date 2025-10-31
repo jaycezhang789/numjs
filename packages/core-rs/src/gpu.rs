@@ -716,6 +716,157 @@ mod cuda {
         Ok(())
     }
 
+    fn reduce_sum_device_internal_f64(
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        values: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), String> {
+        let func_from_f32 = module
+            .load_function("reduce_sum_stage1_f64_from_f32")
+            .map_err(|e| format!("load reduce_sum_stage1_f64_from_f32: {:?}", e))?;
+        let func_f64 = module
+            .load_function("reduce_sum_stage1_f64")
+            .map_err(|e| format!("load reduce_sum_stage1_f64: {:?}", e))?;
+        let block_dim_f32 = select_block_dim(&func_from_f32, smem_per_thread_f64)?;
+        let shared_f32 = shared_mem_bytes(block_dim_f32, std::mem::size_of::<f64>())?;
+        let block_dim_f64 = select_block_dim(&func_f64, smem_per_thread_f64)?;
+        let shared_f64 = shared_mem_bytes(block_dim_f64, std::mem::size_of::<f64>())?;
+
+        let mut current_len = values.len();
+        let mut storage: Option<CudaSlice<f64>> = None;
+        let mut use_f32_kernel = true;
+
+        loop {
+            let (func, block_dim, shared_bytes) = if use_f32_kernel {
+                (&func_from_f32, block_dim_f32, shared_f32)
+            } else {
+                (&func_f64, block_dim_f64, shared_f64)
+            };
+
+            let len_i32 = usize_to_i32("reduce_sum_f64 length", current_len)?;
+            let blocks = blocks_for_len("reduce_sum_f64 length", current_len, block_dim)?;
+            let mut next = stream
+                .alloc_zeros::<f64>(blocks as usize)
+                .map_err(|e| format!("alloc reduce_sum_f64 tmp: {:?}", e))?;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            };
+            unsafe {
+                let mut launch = stream.launch_builder(func);
+                if use_f32_kernel {
+                    launch
+                        .arg(values)
+                        .arg(&mut next)
+                        .arg(&len_i32)
+                        .launch(cfg)
+                } else {
+                    let current_slice = storage
+                        .as_ref()
+                        .expect("double storage should exist before second pass");
+                    launch
+                        .arg(current_slice)
+                        .arg(&mut next)
+                        .arg(&len_i32)
+                        .launch(cfg)
+                }
+            }
+            .map_err(|e| format!("launch reduce_sum_f64: {:?}", e))?;
+
+            if blocks == 1 {
+                let host = stream
+                    .memcpy_dtov(&next)
+                    .map_err(|e| format!("dtoh reduce_sum_f64: {:?}", e))?;
+                let value = host.into_iter().next().unwrap_or(0.0) as f32;
+                write_scalar_f32(stream, out, value)?;
+                break;
+            }
+
+            storage = Some(next);
+            current_len = blocks as usize;
+            use_f32_kernel = false;
+        }
+        Ok(())
+    }
+
+    fn reduce_sum_device_internal_kahan(
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        values: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), String> {
+        let func_from_f32 = module
+            .load_function("reduce_sum_stage1_kahan_from_f32")
+            .map_err(|e| format!("load reduce_sum_stage1_kahan_from_f32: {:?}", e))?;
+        let func_f64 = module
+            .load_function("reduce_sum_stage1_kahan")
+            .map_err(|e| format!("load reduce_sum_stage1_kahan: {:?}", e))?;
+        let block_dim_f32 = select_block_dim(&func_from_f32, smem_per_thread_2xf64)?;
+        let shared_f32 =
+            shared_mem_bytes(block_dim_f32, 2 * std::mem::size_of::<f64>())?;
+        let block_dim_f64 = select_block_dim(&func_f64, smem_per_thread_2xf64)?;
+        let shared_f64 =
+            shared_mem_bytes(block_dim_f64, 2 * std::mem::size_of::<f64>())?;
+
+        let mut current_len = values.len();
+        let mut storage: Option<CudaSlice<f64>> = None;
+        let mut use_f32_kernel = true;
+
+        loop {
+            let (func, block_dim, shared_bytes) = if use_f32_kernel {
+                (&func_from_f32, block_dim_f32, shared_f32)
+            } else {
+                (&func_f64, block_dim_f64, shared_f64)
+            };
+            let len_i32 = usize_to_i32("reduce_sum_kahan length", current_len)?;
+            let blocks = blocks_for_len("reduce_sum_kahan length", current_len, block_dim)?;
+            let mut next = stream
+                .alloc_zeros::<f64>(blocks as usize)
+                .map_err(|e| format!("alloc reduce_sum_kahan tmp: {:?}", e))?;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            };
+            unsafe {
+                let mut launch = stream.launch_builder(func);
+                if use_f32_kernel {
+                    launch
+                        .arg(values)
+                        .arg(&mut next)
+                        .arg(&len_i32)
+                        .launch(cfg)
+                } else {
+                    let current_slice = storage
+                        .as_ref()
+                        .expect("double storage should exist before second pass");
+                    launch
+                        .arg(current_slice)
+                        .arg(&mut next)
+                        .arg(&len_i32)
+                        .launch(cfg)
+                }
+            }
+            .map_err(|e| format!("launch reduce_sum_kahan: {:?}", e))?;
+
+            if blocks == 1 {
+                let host = stream
+                    .memcpy_dtov(&next)
+                    .map_err(|e| format!("dtoh reduce_sum_kahan: {:?}", e))?;
+                let value = host.into_iter().next().unwrap_or(0.0) as f32;
+                write_scalar_f32(stream, out, value)?;
+                break;
+            }
+
+            storage = Some(next);
+            current_len = blocks as usize;
+            use_f32_kernel = false;
+        }
+        Ok(())
+    }
+
     fn reduce_max_device_ignore_nan(
         stream: &Arc<CudaStream>,
         module: &Arc<CudaModule>,
@@ -876,6 +1027,126 @@ extern "C" __global__ void reduce_sum_stage1(const float* __restrict__ input,
     }
     if (tid == 0) {
         partial[blockIdx.x] = sdata[0];
+    }
+}
+
+extern "C" __global__ void reduce_sum_stage1_f64_from_f32(const float* __restrict__ input,
+                                                          double* __restrict__ partial,
+                                                          int length) {
+    extern __shared__ double sdata[];
+    int tid = threadIdx.x;
+    int global = blockIdx.x * blockDim.x + tid;
+    int stride = blockDim.x * gridDim.x;
+    double acc = 0.0;
+    for (int idx = global; idx < length; idx += stride) {
+        acc += double(input[idx]);
+    }
+    sdata[tid] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial[blockIdx.x] = sdata[0];
+    }
+}
+
+extern "C" __global__ void reduce_sum_stage1_f64(const double* __restrict__ input,
+                                                 double* __restrict__ partial,
+                                                 int length) {
+    extern __shared__ double sdata[];
+    int tid = threadIdx.x;
+    int global = blockIdx.x * blockDim.x + tid;
+    int stride = blockDim.x * gridDim.x;
+    double acc = 0.0;
+    for (int idx = global; idx < length; idx += stride) {
+        acc += input[idx];
+    }
+    sdata[tid] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial[blockIdx.x] = sdata[0];
+    }
+}
+
+__device__ __forceinline__ void kahan_add(double value, double& sum, double& comp) {
+    double y = value - comp;
+    double t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+}
+
+extern "C" __global__ void reduce_sum_stage1_kahan_from_f32(const float* __restrict__ input,
+                                                            double* __restrict__ partial,
+                                                            int length) {
+    extern __shared__ double shared[];
+    double* ssum = shared;
+    double* scomp = shared + blockDim.x;
+
+    int tid = threadIdx.x;
+    int global = blockIdx.x * blockDim.x + tid;
+    int stride = blockDim.x * gridDim.x;
+
+    double sum = 0.0;
+    double comp = 0.0;
+    for (int idx = global; idx < length; idx += stride) {
+        double v = double(input[idx]);
+        kahan_add(v, sum, comp);
+    }
+    ssum[tid] = sum;
+    scomp[tid] = comp;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            double peer = ssum[tid + s] + scomp[tid + s];
+            kahan_add(peer, ssum[tid], scomp[tid]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial[blockIdx.x] = ssum[0] + scomp[0];
+    }
+}
+
+extern "C" __global__ void reduce_sum_stage1_kahan(const double* __restrict__ input,
+                                                   double* __restrict__ partial,
+                                                   int length) {
+    extern __shared__ double shared[];
+    double* ssum = shared;
+    double* scomp = shared + blockDim.x;
+
+    int tid = threadIdx.x;
+    int global = blockIdx.x * blockDim.x + tid;
+    int stride = blockDim.x * gridDim.x;
+
+    double sum = 0.0;
+    double comp = 0.0;
+    for (int idx = global; idx < length; idx += stride) {
+        kahan_add(input[idx], sum, comp);
+    }
+    ssum[tid] = sum;
+    scomp[tid] = comp;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            double peer = ssum[tid + s] + scomp[tid + s];
+            kahan_add(peer, ssum[tid], scomp[tid]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial[blockIdx.x] = ssum[0] + scomp[0];
     }
 }
 
@@ -2169,6 +2440,14 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         (block_size as usize) * std::mem::size_of::<i32>()
     }
 
+    extern "C" fn smem_per_thread_f64(block_size: i32) -> usize {
+        (block_size as usize) * std::mem::size_of::<f64>()
+    }
+
+    extern "C" fn smem_per_thread_2xf64(block_size: i32) -> usize {
+        (block_size as usize) * 2 * std::mem::size_of::<f64>()
+    }
+
     fn select_block_dim(
         func: &CudaFunction,
         smem_fn: extern "C" fn(i32) -> usize,
@@ -3206,21 +3485,22 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         if out.len() == 0 {
             return Err("reduce_sum_f32_device: output slice is empty".into());
         }
+        if values.len() == 0 {
+            write_scalar_f32(&stream, out, 0.0)?;
+            return Ok(());
+        }
+        let ctx = stream.context().clone();
+        let module = load_reduce_module(&ctx)?;
         match policy {
             SumPrecisionPolicy::Default => {
-                if values.len() == 0 {
-                    write_scalar_f32(&stream, out, 0.0)?;
-                    Ok(())
-                } else {
-                    let ctx = stream.context().clone();
-                    let module = load_reduce_module(&ctx)?;
-                    reduce_sum_device_internal(&stream, &module, values, out)
-                }
+                reduce_sum_device_internal(&stream, &module, values, out)
             }
-            SumPrecisionPolicy::Float64 | SumPrecisionPolicy::Kahan => Err(
-                "reduce_sum_f32_device_with_policy: Float64/Kahan not supported on device"
-                    .into(),
-            ),
+            SumPrecisionPolicy::Float64 => {
+                reduce_sum_device_internal_f64(&stream, &module, values, out)
+            }
+            SumPrecisionPolicy::Kahan => {
+                reduce_sum_device_internal_kahan(&stream, &module, values, out)
+            }
         }
     }
 
