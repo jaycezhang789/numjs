@@ -133,6 +133,9 @@ pub fn reduce_sum_f32_device_with_policy(
     out: &mut CudaSlice<f32>,
     policy: SumPrecisionPolicy,
 ) -> CoreResult<()> {
+    if out.len() != 1 {
+        return Err("reduce_sum_f32_device: output slice must have length 1".into());
+    }
     cuda::reduce_sum_f32_device_with_policy(stream, values, out, policy)
 }
 
@@ -199,6 +202,9 @@ pub fn reduce_max_f32_device_with_policy(
     out: &mut CudaSlice<f32>,
     policy: NanPolicy,
 ) -> CoreResult<()> {
+    if out.len() != 1 {
+        return Err("reduce_max_f32_device: output slice must have length 1".into());
+    }
     cuda::reduce_max_f32_device_with_policy(stream, values, out, policy)
 }
 
@@ -261,6 +267,9 @@ pub fn argmax_f32_device_with_policy(
     out: &mut CudaSlice<i32>,
     policy: NanPolicy,
 ) -> CoreResult<()> {
+    if out.len() != 1 {
+        return Err("argmax_f32_device: output slice must have length 1".into());
+    }
     cuda::argmax_f32_device_with_policy(stream, values, out, policy)
 }
 
