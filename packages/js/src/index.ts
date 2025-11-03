@@ -1073,6 +1073,20 @@ export function gpuAvailable(): boolean {
   return gpuBackendKind() !== null || webGpuAvailable();
 }
 
+function refreshNativeGpuKindFromBackend(): GpuBackendKind | null {
+  if (!isNode) {
+    return activeGpuKind;
+  }
+  const previous = activeGpuKind;
+  activeGpuKind = null;
+  const detected = gpuBackendKind();
+  if (!detected) {
+    activeGpuKind = previous;
+    return previous ?? null;
+  }
+  return detected;
+}
+
 async function selectGpuEngine(
   mode: GpuExecutionMode | undefined
 ): Promise<WebGpuEngine | null> {
@@ -2114,8 +2128,9 @@ export async function matmulAsync(
           dtype === "fixed64"
             ? { fixedScale: getMatrixFixedScaleFromHandle(handle) ?? null }
             : undefined;
-        activeGpuKind = "cuda";
-        return Matrix.fromHandleWithDType(handle, dtype, metadata);
+        const matrix = Matrix.fromHandleWithDType(handle, dtype, metadata);
+        refreshNativeGpuKindFromBackend();
+        return matrix;
       } catch (error) {
         console.warn("[numjs] N-API gpu_matmul failed; falling back to other accelerators.", error);
       }
@@ -3200,8 +3215,9 @@ export async function sumAsync(
           resolvedDType === "fixed64"
             ? { fixedScale: getMatrixFixedScaleFromHandle(handle) ?? null }
             : undefined;
-        activeGpuKind = "cuda";
-        return Matrix.fromHandleWithDType(handle, resolvedDType, metadata);
+        const matrix = Matrix.fromHandleWithDType(handle, resolvedDType, metadata);
+        refreshNativeGpuKindFromBackend();
+        return matrix;
       } catch (error) {
         console.warn("[numjs] N-API gpu_sum failed; falling back to other accelerators.", error);
       }

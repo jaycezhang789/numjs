@@ -10,8 +10,8 @@ cpu-openblas = ["num_rs_core/cpu-openblas"]
 cpu-blis = ["num_rs_core/cpu-blis"]
 cpu-mkl = ["num_rs_core/cpu-mkl"]
 parallel = ["num_rs_core/parallel"]
-gpu = ["num_rs_core/gpu"]
-gpu-cuda = ["gpu", "num_rs_core/gpu-cuda"]
+gpu = ["num_rs_core/gpu", "once_cell"]
+gpu-cuda = ["gpu", "num_rs_core/gpu-cuda", "cust"]
 gpu-rocm = ["gpu", "num_rs_core/gpu-rocm"]
 
 [lib]
@@ -22,6 +22,8 @@ napi = { version = "2", features = ["napi6"] }
 napi-derive = "2"
 ndarray = "0.15"
 num_rs_core = { path = "../core-rs" }
+cust = { version = "0.3.2", optional = true, default-features = false, features = ["bytemuck"] }
+once_cell = { version = "1.19", optional = true }
 
 [build-dependencies]
 cc = "1"

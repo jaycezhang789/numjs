@@ -1,16 +1,18 @@
-//! ROCm backend scaffolding.
+#![cfg(feature = "gpu-rocm")]
+
+//! Placeholder ROCm backend wiring.
 //!
-//! Like the CUDA module, this file keeps the trait surface ready while
-//! returning placeholder errors until a full HIP/rocBLAS integration lands.
+//! Mirrors the CUDA-side abstraction so that HIP/rocBLAS bindings can slot in
+//! later without reshaping the public N-API.
 
 use super::{GpuBackendKind, GpuContext, GpuError, GpuResult};
 
-#[allow(dead_code)]
+/// Minimal stub used to satisfy the shared trait while the implementation lands.
 pub struct RocmContext;
 
 pub fn create_context() -> GpuResult<Box<dyn GpuContext>> {
     Err(GpuError::unavailable(
-        "ROCm backend not yet implemented; enable `gpu-rocm` and provide an implementation",
+        "ROCm backend is not implemented yet; enable `gpu-rocm` once HIP/rocBLAS bindings exist.",
     ))
 }
 
@@ -32,13 +34,13 @@ impl GpuContext for RocmContext {
         _k: usize,
     ) -> GpuResult<Vec<f32>> {
         Err(GpuError::unsupported(
-            "ROCm matmul is not yet implemented in this build",
+            "ROCm matmul is not implemented yet; future HIP/rocBLAS kernels will mirror CPU results.",
         ))
     }
 
     fn reduce_sum_f32(&self, _data: &[f32]) -> GpuResult<f32> {
         Err(GpuError::unsupported(
-            "ROCm reduce_sum is not yet implemented in this build",
+            "ROCm reduce_sum is not implemented yet; dedicated kernels will mirror CPU results.",
         ))
     }
 }

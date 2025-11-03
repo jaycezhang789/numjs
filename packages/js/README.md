@@ -106,6 +106,35 @@ await init({
 
 When running with the WASM backend you can pass a number to `threads` (e.g. `{ threads: 4 }`) to cap the worker count. Threaded WASM requires `SharedArrayBuffer` and a cross-origin isolated context.
 
+## GPU Acceleration (Preview)
+
+- `gpuAvailable()` and `gpuBackendKind()` mirror the Rust bindings, letting you check whether a CUDA or ROCm backend initialised successfully.
+- `gpuMatmul()` and `gpuSum()` call into the shared GPU context when available and fall back to the CPU path automatically, so you can probe the new kernels without changing existing code.
+- Building the N-API crate from source exposes three feature flags: `gpu` (shared scaffolding), `gpu-cuda` (enables the CUDA placeholder built on `cust`), and `gpu-rocm` (HIP/rocBLAS placeholder). Enable the relevant feature when compiling from source to participate in early testing.
+- The WebGPU dispatcher is guarded by `init({ webGpu: { useStub: true } })`; it prepares command queues and returns CPU results today, ready to swap in compute shaders once kernels are validated.
+- Expect rapid iteration. Until the kernels land, always keep a CPU fallback path in production deployments.
+
+### Native build prerequisites
+
+To compile the N-API crate with native GPU support you need the corresponding vendor SDKs installed locally:
+
+| Backend | Windows | Linux | macOS | Environment variables |
+| --- | --- | --- | --- | --- |
+| CUDA (`gpu-cuda`) | CUDA Toolkit 12.x (Visual Studio toolchain) | CUDA Toolkit 12.x (driver matching the toolkit) | Legacy CUDA Toolkit 10.2 (Apple deprecated CUDA – only for legacy deployments) | Set `CUDA_HOME` or `CUDA_PATH` to the toolkit root (e.g. `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.3` or `/usr/local/cuda`). Optional overrides: `CUDA_ROOT`, `CUDA_TOOLKIT_ROOT_DIR`. |
+| ROCm (`gpu-rocm`) | HIP/ROCm SDK 5.7+ (experimental) | ROCm 5.7+ stack (`/opt/rocm`) | Not officially supported | Set `ROCM_HOME` or `ROCM_PATH` to the ROCm installation (e.g. `/opt/rocm`). On Windows export `HIP_PATH`. |
+
+`build.rs` inspects these variables during compilation, adds the appropriate library search paths, and links against `cuda`, `cudart`, `cublas`, `cusolver` (CUDA) or `amdhip64`, `rocblas`, `rocsolver` (ROCm). If the toolkit paths are missing the build emits warnings; fix them by exporting the variables globally or prefixing the Cargo command, for example:
+
+```powershell
+$env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.3"
+cargo build -p num_rs_napi --features gpu-cuda
+```
+
+```bash
+export ROCM_HOME=/opt/rocm
+cargo build -p num_rs_napi --features gpu-rocm
+```
+
 ## Using numjs in the Browser
 
 ```ts

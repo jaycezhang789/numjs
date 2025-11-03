@@ -7,11 +7,22 @@ use napi::bindgen_prelude::{
 use napi::JsObject;
 use napi_derive::napi;
 
-use core_gpu::{MatmulTensorCorePolicy, SumPrecisionPolicy};
+#[cfg(feature = "gpu")]
+use once_cell::sync::OnceCell;
+#[cfg(feature = "gpu")]
+use std::sync::Mutex;
+
+#[cfg(feature = "gpu")]
+use crate::gpu::{
+    create_best_context as create_gpu_context, GpuBackendKind, GpuContext as ApiGpuContext,
+};
 use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
 use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
+#[cfg(feature = "gpu")]
 use num_rs_core::gpu as core_gpu;
+#[cfg(feature = "gpu")]
+use num_rs_core::gpu::{MatmulTensorCorePolicy, SumPrecisionPolicy};
 use num_rs_core::sparse::{self, CsrMatrixView};
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
@@ -31,6 +42,59 @@ use std::convert::TryFrom;
 use std::ptr;
 use std::sync::Arc;
 
+#[cfg(feature = "gpu")]
+type SharedGpuContext = Arc<Mutex<Option<Box<dyn ApiGpuContext>>>>;
+#[cfg(feature = "gpu")]
+static GPU_CONTEXT: OnceCell<SharedGpuContext> = OnceCell::new();
+
+#[cfg(feature = "gpu")]
+fn ensure_gpu_context_arc() -> Option<SharedGpuContext> {
+    let shared = GPU_CONTEXT
+        .get_or_init(|| Arc::new(Mutex::new(None)))
+        .clone();
+    let mut guard = shared
+        .lock()
+        .expect("GPU_CONTEXT mutex poisoned while initialising");
+    if guard.is_none() {
+        match create_gpu_context(None) {
+            Ok(context) => {
+                *guard = Some(context);
+            }
+            Err(err) => {
+                eprintln!("[numjs] GPU context initialisation failed: {err}");
+            }
+        }
+    }
+    let is_ready = guard.is_some();
+    drop(guard);
+    if is_ready {
+        Some(shared)
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_backend_string() -> Option<String> {
+    ensure_gpu_context_arc().and_then(|arc| {
+        let guard = arc
+            .lock()
+            .expect("GPU_CONTEXT mutex poisoned while reading backend");
+        guard
+            .as_ref()
+            .map(|ctx| match ctx.backend() {
+                GpuBackendKind::Cpu => "cpu",
+                GpuBackendKind::Cuda => "cuda",
+                GpuBackendKind::Rocm => "rocm",
+            })
+            .map(|name| name.to_string())
+    })
+}
+
+#[cfg(not(feature = "gpu"))]
+fn gpu_backend_string() -> Option<String> {
+    None
+}
 #[derive(Clone)]
 #[napi]
 pub struct Matrix {
@@ -251,14 +315,23 @@ pub fn matmul(a: &Matrix, b: &Matrix) -> Result<Matrix> {
 
 #[napi]
 pub fn gpu_available() -> bool {
-    core_gpu::active_backend_kind().is_some()
+    #[cfg(feature = "gpu")]
+    {
+        return ensure_gpu_context_arc().is_some();
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    {
+        return false;
+    }
 }
 
 #[napi]
 pub fn gpu_backend_kind() -> Option<String> {
-    core_gpu::backend_name().map(|kind| kind.to_string())
+    gpu_backend_string()
 }
 
+#[cfg(feature = "gpu")]
 fn parse_tensor_core_policy(policy: Option<String>) -> Result<MatmulTensorCorePolicy> {
     let default_policy = MatmulTensorCorePolicy::Performance;
     let Some(value) = policy else {
@@ -280,6 +353,7 @@ fn parse_tensor_core_policy(policy: Option<String>) -> Result<MatmulTensorCorePo
     Ok(policy)
 }
 
+#[cfg(feature = "gpu")]
 fn parse_sum_precision(policy: Option<String>) -> Result<SumPrecisionPolicy> {
     let default_policy = SumPrecisionPolicy::Default;
     let Some(value) = policy else {
@@ -299,31 +373,55 @@ fn parse_sum_precision(policy: Option<String>) -> Result<SumPrecisionPolicy> {
     Ok(policy)
 }
 
+#[cfg(feature = "gpu")]
 #[napi]
 pub fn gpu_matmul(a: &Matrix, b: &Matrix, tensor_core_policy: Option<String>) -> Result<Matrix> {
-    if let Some(_kind) = core_gpu::active_backend_kind() {
-        let rows = a.rows() as usize;
-        let shared = a.cols() as usize;
-        let cols = b.cols() as usize;
-        if shared != b.rows() as usize {
-            return Err(map_core_error(format!(
-                "gpu_matmul: left.cols ({shared}) must equal right.rows ({})",
-                b.rows()
-            )));
+    let rows = a.rows() as usize;
+    let shared = a.cols() as usize;
+    let cols = b.cols() as usize;
+    if shared != b.rows() as usize {
+        return Err(map_core_error(format!(
+            "gpu_matmul: left.cols ({shared}) must equal right.rows ({})",
+            b.rows()
+        )));
+    }
+    let lhs = ensure_float32_buffer(a.buffer())?;
+    let rhs = ensure_float32_buffer(b.buffer())?;
+    let lhs_view = lhs.try_as_slice::<f32>().map_err(map_core_error)?;
+    let rhs_view = rhs.try_as_slice::<f32>().map_err(map_core_error)?;
+    let policy = parse_tensor_core_policy(tensor_core_policy)?;
+
+    #[cfg(feature = "gpu")]
+    {
+        if let Some(shared_context) = ensure_gpu_context_arc() {
+            let mut guard = shared_context
+                .lock()
+                .expect("GPU_CONTEXT mutex poisoned during gpu_matmul");
+            if let Some(ctx) = guard.as_mut() {
+                match ctx.matmul_f32(lhs_view, rhs_view, rows, cols, shared) {
+                    Ok(values) => {
+                        let buffer =
+                            MatrixBuffer::from_vec(values, rows, cols).map_err(map_core_error)?;
+                        return Ok(Matrix::from_buffer(buffer));
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[numjs] gpu_matmul via {} backend failed: {err}. Falling back to core policies.",
+                            ctx.name()
+                        );
+                    }
+                }
+            }
         }
-        let lhs = ensure_float32_buffer(a.buffer())?;
-        let rhs = ensure_float32_buffer(b.buffer())?;
-        let lhs_view = lhs.try_as_slice::<f32>().map_err(map_core_error)?;
-        let rhs_view = rhs.try_as_slice::<f32>().map_err(map_core_error)?;
-        let policy = parse_tensor_core_policy(tensor_core_policy)?;
-        match core_gpu::matmul_f32_with_policy(lhs_view, rhs_view, rows, shared, cols, policy) {
-            Ok(values) => {
-                let buffer = MatrixBuffer::from_vec(values, rows, cols).map_err(map_core_error)?;
-                return Ok(Matrix::from_buffer(buffer));
-            }
-            Err(err) => {
-                eprintln!("[numjs] GPU matmul failed: {err}. Falling back to CPU.");
-            }
+    }
+
+    match core_gpu::matmul_f32_with_policy(lhs_view, rhs_view, rows, shared, cols, policy) {
+        Ok(values) => {
+            let buffer = MatrixBuffer::from_vec(values, rows, cols).map_err(map_core_error)?;
+            return Ok(Matrix::from_buffer(buffer));
+        }
+        Err(err) => {
+            eprintln!("[numjs] gpu_matmul core fallback failed: {err}. Falling back to CPU path.");
         }
     }
     map_matrix(core_matmul(a.buffer(), b.buffer()))
@@ -720,6 +818,7 @@ pub fn ifft2d(env: Env, real: &Matrix, imag: &Matrix) -> Result<JsObject> {
     Ok(obj)
 }
 
+#[cfg(feature = "gpu")]
 #[napi]
 pub fn gpu_sum(
     matrix: &Matrix,
@@ -731,24 +830,47 @@ pub fn gpu_sum(
         None => None,
     };
     let policy = parse_sum_precision(precision)?;
-    if let Some(_kind) = core_gpu::active_backend_kind() {
-        let buffer = ensure_float32_buffer(matrix.buffer())?;
-        let view = buffer.try_as_slice::<f32>().map_err(map_core_error)?;
-        match core_gpu::reduce_sum_f32_with_policy(view, policy) {
-            Ok(total) => {
-                let base = MatrixBuffer::from_vec(vec![total], 1, 1).map_err(map_core_error)?;
-                let mut result = Matrix::from_buffer(base);
-                if let Some(target_dtype) = target {
-                    if target_dtype != DType::Float32 {
-                        result =
-                            result.astype(target_dtype.as_str().to_string(), Some(false), None)?;
+    let buffer = ensure_float32_buffer(matrix.buffer())?;
+    let view = buffer.try_as_slice::<f32>().map_err(map_core_error)?;
+    let make_scalar_matrix = |total: f32| -> Result<Matrix> {
+        let base = MatrixBuffer::from_vec(vec![total], 1, 1).map_err(map_core_error)?;
+        let mut result = Matrix::from_buffer(base);
+        if let Some(target_dtype) = target.as_ref() {
+            if *target_dtype != DType::Float32 {
+                result = result.astype(target_dtype.as_str().to_string(), Some(false), None)?;
+            }
+        }
+        Ok(result)
+    };
+
+    #[cfg(feature = "gpu")]
+    {
+        if let Some(shared_context) = ensure_gpu_context_arc() {
+            let mut guard = shared_context
+                .lock()
+                .expect("GPU_CONTEXT mutex poisoned during gpu_sum");
+            if let Some(ctx) = guard.as_mut() {
+                match ctx.reduce_sum_f32(view) {
+                    Ok(total) => {
+                        return make_scalar_matrix(total);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[numjs] gpu_sum via {} backend failed: {err}. Falling back to core policies.",
+                            ctx.name()
+                        );
                     }
                 }
-                return Ok(result);
             }
-            Err(err) => {
-                eprintln!("[numjs] GPU sum failed: {err}. Falling back to CPU.");
-            }
+        }
+    }
+
+    match core_gpu::reduce_sum_f32_with_policy(view, policy) {
+        Ok(total) => {
+            return make_scalar_matrix(total);
+        }
+        Err(err) => {
+            eprintln!("[numjs] gpu_sum core fallback failed: {err}. Falling back to CPU path.");
         }
     }
     map_matrix(core_sum(matrix.buffer(), target))
@@ -869,6 +991,7 @@ fn convert_indices(indices: &[i64]) -> Result<Vec<isize>> {
         .collect()
 }
 
+#[cfg(feature = "gpu")]
 fn ensure_float32_buffer(buffer: &MatrixBuffer) -> Result<MatrixBuffer> {
     if buffer.dtype() == DType::Float32 {
         Ok(buffer.clone())
