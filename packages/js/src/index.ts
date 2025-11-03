@@ -3215,9 +3215,9 @@ export async function sumAsync(
           resolvedDType === "fixed64"
             ? { fixedScale: getMatrixFixedScaleFromHandle(handle) ?? null }
             : undefined;
-        const matrix = Matrix.fromHandleWithDType(handle, resolvedDType, metadata);
+        const resultMatrix = Matrix.fromHandleWithDType(handle, resolvedDType, metadata);
         refreshNativeGpuKindFromBackend();
-        return matrix;
+        return resultMatrix;
       } catch (error) {
         console.warn("[numjs] N-API gpu_sum failed; falling back to other accelerators.", error);
       }

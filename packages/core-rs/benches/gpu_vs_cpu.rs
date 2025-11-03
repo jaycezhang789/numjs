@@ -35,16 +35,24 @@ fn bench_reduce(c: &mut Criterion) {
     let len = 1 << 20;
     let data: Vec<f32> = (0..len).map(|i| (i as f32).sin()).collect();
     gpu::reduce_sum_f32(&data).expect("warmup gpu reduce");
-    c.bench_with_input(BenchmarkId::new("reduce_sum", "gpu"), &data, |b, input| {
-        b.iter(|| {
-            let _ = gpu::reduce_sum_f32(black_box(input)).unwrap();
-        })
-    });
-    c.bench_with_input(BenchmarkId::new("reduce_sum", "cpu"), &data, |b, input| {
-        b.iter(|| {
-            let _ = black_box(input).iter().copied().sum::<f32>();
-        })
-    });
+    c.bench_with_input(
+        BenchmarkId::new("reduce_sum", format!("gpu-{len}")),
+        &data,
+        |b, input| {
+            b.iter(|| {
+                let _ = gpu::reduce_sum_f32(black_box(input)).unwrap();
+            })
+        },
+    );
+    c.bench_with_input(
+        BenchmarkId::new("reduce_sum", format!("cpu-{len}")),
+        &data,
+        |b, input| {
+            b.iter(|| {
+                let _ = black_box(input).iter().copied().sum::<f32>();
+            })
+        },
+    );
 }
 
 #[cfg(feature = "gpu-cuda")]
@@ -57,16 +65,41 @@ fn bench_matmul(c: &mut Criterion) {
     let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.01).sin()).collect();
     let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.02).cos()).collect();
     gpu::matmul_f32(&a, &b, m, k, n).expect("warmup gpu matmul");
-    c.bench_function("matmul_gpu", |bch| {
-        bch.iter(|| {
-            let _ = gpu::matmul_f32(black_box(&a), black_box(&b), m, k, n).unwrap();
-        })
-    });
-    c.bench_function("matmul_cpu", |bch| {
-        bch.iter(|| {
-            let _ = cpu_matmul(black_box(&a), black_box(&b), m, k, n);
-        })
-    });
+    let dims_label = format!("{m}x{k}x{n}");
+    let matmul_input = (a.clone(), b.clone());
+    c.bench_with_input(
+        BenchmarkId::new("matmul", format!("gpu-{dims_label}")),
+        &matmul_input,
+        |bch, input| {
+            let (lhs, rhs) = (&input.0, &input.1);
+            bch.iter(|| {
+                let _ = gpu::matmul_f32(
+                    black_box(lhs.as_slice()),
+                    black_box(rhs.as_slice()),
+                    m,
+                    k,
+                    n,
+                )
+                .unwrap();
+            })
+        },
+    );
+    c.bench_with_input(
+        BenchmarkId::new("matmul", format!("cpu-{dims_label}")),
+        &matmul_input,
+        |bch, input| {
+            let (lhs, rhs) = (&input.0, &input.1);
+            bch.iter(|| {
+                let _ = cpu_matmul(
+                    black_box(lhs.as_slice()),
+                    black_box(rhs.as_slice()),
+                    m,
+                    k,
+                    n,
+                );
+            })
+        },
+    );
 }
 
 #[cfg(feature = "gpu-cuda")]

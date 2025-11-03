@@ -17,7 +17,6 @@ export declare function sigmoid(matrix: Matrix): Matrix
 export declare function matmul(a: Matrix, b: Matrix): Matrix
 export declare function gpuAvailable(): boolean
 export declare function gpuBackendKind(): string | null
-export declare function gpuMatmul(a: Matrix, b: Matrix, tensorCorePolicy?: string | undefined | null): Matrix
 export declare function clip(matrix: Matrix, min: number, max: number): Matrix
 export declare function whereSelect(condition: Matrix, truthy: Matrix, falsy: Matrix): Matrix
 export declare function whereSelectMulti(conditions: Array<Matrix>, choices: Array<Matrix>, defaultValue?: Matrix | undefined | null): Matrix
@@ -48,7 +47,6 @@ export declare function fftAxis(matrix: Matrix, axis: number): object
 export declare function fft2D(matrix: Matrix): object
 export declare function ifftAxis(real: Matrix, imag: Matrix, axis: number): object
 export declare function ifft2D(real: Matrix, imag: Matrix): object
-export declare function gpuSum(matrix: Matrix, dtype?: string | undefined | null, precision?: string | undefined | null): Matrix
 export declare function nansum(matrix: Matrix, dtype?: string | undefined | null): Matrix
 export declare function nanmean(matrix: Matrix, dtype?: string | undefined | null): Matrix
 export declare function median(matrix: Matrix, dtype?: string | undefined | null): Matrix
