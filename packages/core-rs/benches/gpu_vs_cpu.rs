@@ -1,23 +1,36 @@
-#![cfg_attr(not(feature = "gpu-cuda"), allow(unused_variables, dead_code))]
+#![cfg_attr(
+    not(any(feature = "gpu-cuda", feature = "gpu-rocm")),
+    allow(unused_variables, dead_code)
+)]
 
-#[cfg(feature = "gpu-cuda")]
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-#[cfg(feature = "gpu-cuda")]
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 use num_rs_core::gpu;
 
-#[cfg(feature = "gpu-cuda")]
-fn gpu_available() -> bool {
-    match gpu::backend_name() {
-        Some("cuda") => true,
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+fn gpu_backend_kind() -> Option<&'static str> {
+    gpu::backend_name()
+}
+
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+fn gpu_available() -> Option<&'static str> {
+    match gpu_backend_kind() {
+        Some(kind @ ("cuda" | "rocm")) => Some(kind),
         Some(other) => {
-            eprintln!("[bench] GPU backend detected but unsupported for these tests: {other}");
-            false
+            eprintln!(
+                "[bench] detected GPU backend '{other}', skipping because this benchmark supports only CUDA/ROCm"
+            );
+            None
         }
-        None => false,
+        None => {
+            eprintln!("[bench] no GPU backend detected; skipping GPU benchmarks");
+            None
+        }
     }
 }
 
-#[cfg(feature = "gpu-cuda")]
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 fn cpu_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; m * n];
     for i in 0..m {
@@ -33,7 +46,7 @@ fn cpu_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     out
 }
 
-#[cfg(feature = "gpu-cuda")]
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 fn assert_close(label: &str, lhs: &[f32], rhs: &[f32], tolerance: f32) {
     let mut max_err = 0.0f32;
     for (l, r) in lhs.iter().zip(rhs.iter()) {
@@ -47,12 +60,12 @@ fn assert_close(label: &str, lhs: &[f32], rhs: &[f32], tolerance: f32) {
     }
 }
 
-#[cfg(feature = "gpu-cuda")]
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 fn bench_reduce(c: &mut Criterion) {
-    if !gpu_available() {
-        eprintln!("[bench] skipping GPU reduce benchmarks: CUDA unavailable");
+    let Some(backend) = gpu_available() else {
         return;
-    }
+    };
+
     let sizes = [1 << 16, 1 << 18, 1 << 20];
     for &len in &sizes {
         let data: Vec<f32> = (0..len).map(|i| (i as f32).sin()).collect();
@@ -60,7 +73,7 @@ fn bench_reduce(c: &mut Criterion) {
         let cpu_sum: f32 = data.iter().copied().sum();
         assert_close("reduce_sum", &[gpu_sum], &[cpu_sum], 1e-4);
         c.bench_with_input(
-            BenchmarkId::new("reduce_sum", format!("gpu-{len}")),
+            BenchmarkId::new("reduce_sum", format!("gpu-{backend}-{len}")),
             &data,
             |b, input| {
                 b.iter(|| {
@@ -80,12 +93,12 @@ fn bench_reduce(c: &mut Criterion) {
     }
 }
 
-#[cfg(feature = "gpu-cuda")]
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 fn bench_matmul(c: &mut Criterion) {
-    if !gpu_available() {
-        eprintln!("[bench] skipping GPU matmul benchmarks: CUDA unavailable");
+    let Some(backend) = gpu_available() else {
         return;
-    }
+    };
+
     let shapes = [(64, 64, 64), (128, 128, 128), (256, 128, 256)];
     for &(m, k, n) in &shapes {
         let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.01).sin()).collect();
@@ -96,7 +109,7 @@ fn bench_matmul(c: &mut Criterion) {
         let dims_label = format!("{m}x{k}x{n}");
         let matmul_input = (a.clone(), b.clone());
         c.bench_with_input(
-            BenchmarkId::new("matmul", format!("gpu-{dims_label}")),
+            BenchmarkId::new("matmul", format!("gpu-{backend}-{dims_label}")),
             &matmul_input,
             |bch, input| {
                 let (lhs, rhs) = (&input.0, &input.1);
@@ -131,12 +144,14 @@ fn bench_matmul(c: &mut Criterion) {
     }
 }
 
-#[cfg(feature = "gpu-cuda")]
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 criterion_group!(gpu_vs_cpu, bench_reduce, bench_matmul);
-#[cfg(feature = "gpu-cuda")]
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 criterion_main!(gpu_vs_cpu);
 
-#[cfg(not(feature = "gpu-cuda"))]
+#[cfg(not(any(feature = "gpu-cuda", feature = "gpu-rocm")))]
 fn main() {
-    eprintln!("skipping gpu_vs_cpu benchmarks: build without gpu-cuda feature");
+    eprintln!(
+        "skipping gpu_vs_cpu benchmarks: build with `gpu-cuda` or `gpu-rocm` feature to enable"
+    );
 }
