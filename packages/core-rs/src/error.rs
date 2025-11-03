@@ -8,6 +8,12 @@ pub mod codes {
     pub const NUMERIC_ISSUE: &str = "E_NUMERIC_ISSUE";
     /// Cholesky factorisation failed because the matrix is not symmetric positive definite.
     pub const CHOLESKY_NOT_SPD: &str = "E_CHOLESKY_NOT_SPD";
+    /// GPU backend unavailable, driver missing, or hardware absent.
+    pub const GPU_UNAVAILABLE: &str = "E_GPU_UNAVAILABLE";
+    /// GPU backend encountered an execution or driver error.
+    pub const GPU_ERROR: &str = "E_GPU_ERROR";
+    /// Requested GPU feature is not implemented on this backend.
+    pub const GPU_NOT_IMPLEMENTED: &str = "E_GPU_NOT_IMPLEMENTED";
 }
 
 /// Helper that formats a code/message pair into a single string. The format is
@@ -30,4 +36,19 @@ pub fn numeric_issue(message: impl AsRef<str>) -> String {
 /// Convenience function for non-SPD Cholesky failures.
 pub fn cholesky_not_spd(message: impl AsRef<str>) -> String {
     format(codes::CHOLESKY_NOT_SPD, message)
+}
+
+/// Convenience function for GPU unavailability.
+pub fn gpu_unavailable(message: impl AsRef<str>) -> String {
+    format(codes::GPU_UNAVAILABLE, message)
+}
+
+/// Convenience function for GPU execution/driver errors.
+pub fn gpu_error(message: impl AsRef<str>) -> String {
+    format(codes::GPU_ERROR, message)
+}
+
+/// Convenience function for GPU features that are not implemented yet.
+pub fn gpu_not_implemented(message: impl AsRef<str>) -> String {
+    format(codes::GPU_NOT_IMPLEMENTED, message)
 }

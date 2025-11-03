@@ -425,9 +425,12 @@ pub fn matmul_batched_f32_with_policy(
         }
     }
     if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
-        return Err(
-            "matmul_batched_f32_with_policy: non-Accuracy policies require CUDA backend".into(),
-        );
+        if cfg!(debug_assertions) {
+            eprintln!(
+                "[num-rs] matmul_batched_f32_with_policy policy {:?} falling back to CPU Accuracy implementation",
+                policy
+            );
+        }
     }
     let mut out = vec![0.0f32; batch.saturating_mul(m.saturating_mul(n))];
     let a_each = m.saturating_mul(k);
@@ -510,10 +513,12 @@ pub fn matmul_batched_f32_strided_with_policy(
         }
     }
     if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
-        return Err(
-            "matmul_batched_f32_strided_with_policy: non-Accuracy policies require CUDA backend"
-                .into(),
-        );
+        if cfg!(debug_assertions) {
+            eprintln!(
+                "[num-rs] matmul_batched_f32_strided_with_policy policy {:?} falling back to CPU Accuracy implementation",
+                policy
+            );
+        }
     }
     let need_a = (m as i64) * (k as i64);
     let need_b = (k as i64) * (n as i64);
@@ -3702,6 +3707,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
 #[cfg(all(feature = "gpu-rocm", target_os = "linux"))]
 mod rocm {
     use super::{MatmulTensorCorePolicy, SumPrecisionPolicy};
+    use crate::error;
     use hip_sys::hipblas::*;
     use hip_sys::hiprt::*;
     use once_cell::sync::OnceCell;
@@ -3745,94 +3751,7 @@ mod rocm {
         n: usize,
         policy: MatmulTensorCorePolicy,
     ) -> RocmResult<Vec<f32>> {
-        if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
-            return Err(
-                "ROCm backend currently supports only MatmulTensorCorePolicy::Accuracy".into(),
-            );
-        }
-        let total = m
-            .checked_mul(n)
-            .ok_or_else(|| "matmul_f32: size overflow".to_string())?;
-        if total == 0 {
-            return Ok(Vec::new());
-        }
-        let ctx = global_context()?;
-        hip_check(unsafe { hipSetDevice(ctx.device_id) }, "hipSetDevice")?;
-
-        let a_col = to_column_major(a, m, k);
-        let b_col = to_column_major(b, k, n);
-
-        let d_a = DeviceBuffer::alloc(size_of::<f32>() * a_col.len())?;
-        let d_b = DeviceBuffer::alloc(size_of::<f32>() * b_col.len())?;
-        let d_c = DeviceBuffer::alloc(size_of::<f32>() * total)?;
-
-        hip_check(
-            unsafe {
-                hipMemcpy(
-                    d_a.ptr,
-                    a_col.as_ptr() as *const _,
-                    size_of::<f32>() * a_col.len(),
-                    hipMemcpyKind::hipMemcpyHostToDevice,
-                )
-            },
-            "hipMemcpy(A)",
-        )?;
-        hip_check(
-            unsafe {
-                hipMemcpy(
-                    d_b.ptr,
-                    b_col.as_ptr() as *const _,
-                    size_of::<f32>() * b_col.len(),
-                    hipMemcpyKind::hipMemcpyHostToDevice,
-                )
-            },
-            "hipMemcpy(B)",
-        )?;
-
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-
-        hipblas_check(
-            unsafe {
-                hipblasSgemm(
-                    ctx.handle,
-                    hipblasOperation_t::HIPBLAS_OP_N,
-                    hipblasOperation_t::HIPBLAS_OP_N,
-                    m as c_int,
-                    n as c_int,
-                    k as c_int,
-                    &alpha as *const f32,
-                    d_a.as_ptr::<f32>(),
-                    m as c_int,
-                    d_b.as_ptr::<f32>(),
-                    k as c_int,
-                    &beta as *const f32,
-                    d_c.as_mut_ptr::<f32>(),
-                    m as c_int,
-                )
-            },
-            "hipblasSgemm",
-        )?;
-
-        hip_check(
-            unsafe { hipStreamSynchronize(ctx.stream) },
-            "hipStreamSynchronize",
-        )?;
-
-        let mut c_col = vec![0.0f32; total];
-        hip_check(
-            unsafe {
-                hipMemcpy(
-                    c_col.as_mut_ptr() as *mut _,
-                    d_c.ptr,
-                    size_of::<f32>() * total,
-                    hipMemcpyKind::hipMemcpyDeviceToHost,
-                )
-            },
-            "hipMemcpy(C)",
-        )?;
-
-        Ok(from_column_major(&c_col, m, n))
+        gemm(a, b, m, k, n, false, false, policy)
     }
 
     pub fn matmul_f32_ex(
@@ -3866,117 +3785,7 @@ mod rocm {
         trans_b: bool,
         policy: MatmulTensorCorePolicy,
     ) -> RocmResult<Vec<f32>> {
-        if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
-            return Err("ROCm matmul currently supports only Accuracy policy".into());
-        }
-        let (a_rows, a_cols) = if trans_a { (k, m) } else { (m, k) };
-        let (b_rows, b_cols) = if trans_b { (n, k) } else { (k, n) };
-        if a.len() != a_rows.saturating_mul(a_cols) || b.len() != b_rows.saturating_mul(b_cols) {
-            return Err("matmul_f32_ex_with_policy: shape mismatch".into());
-        }
-        let total = m
-            .checked_mul(n)
-            .ok_or_else(|| "matmul_f32_ex_with_policy: size overflow".to_string())?;
-        if total == 0 {
-            return Ok(Vec::new());
-        }
-        let ctx = global_context()?;
-        hip_check(unsafe { hipSetDevice(ctx.device_id) }, "hipSetDevice")?;
-
-        let a_col = to_column_major(a, a_rows, a_cols);
-        let b_col = to_column_major(b, b_rows, b_cols);
-
-        let bytes_a = size_of::<f32>() * a_col.len();
-        let bytes_b = size_of::<f32>() * b_col.len();
-        let bytes_c = size_of::<f32>() * total;
-
-        let d_a = DeviceBuffer::alloc(bytes_a)?;
-        let d_b = DeviceBuffer::alloc(bytes_b)?;
-        let d_c = DeviceBuffer::alloc(bytes_c)?;
-
-        if bytes_a > 0 {
-            hip_check(
-                unsafe {
-                    hipMemcpy(
-                        d_a.ptr,
-                        a_col.as_ptr() as *const _,
-                        bytes_a,
-                        hipMemcpyKind::hipMemcpyHostToDevice,
-                    )
-                },
-                "hipMemcpy(A)",
-            )?;
-        }
-        if bytes_b > 0 {
-            hip_check(
-                unsafe {
-                    hipMemcpy(
-                        d_b.ptr,
-                        b_col.as_ptr() as *const _,
-                        bytes_b,
-                        hipMemcpyKind::hipMemcpyHostToDevice,
-                    )
-                },
-                "hipMemcpy(B)",
-            )?;
-        }
-
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-        let op_a = if trans_a {
-            hipblasOperation_t::HIPBLAS_OP_T
-        } else {
-            hipblasOperation_t::HIPBLAS_OP_N
-        };
-        let op_b = if trans_b {
-            hipblasOperation_t::HIPBLAS_OP_T
-        } else {
-            hipblasOperation_t::HIPBLAS_OP_N
-        };
-
-        hipblas_check(
-            unsafe {
-                hipblasSgemm(
-                    ctx.handle,
-                    op_a,
-                    op_b,
-                    m as c_int,
-                    n as c_int,
-                    k as c_int,
-                    &alpha as *const f32,
-                    d_a.as_ptr::<f32>(),
-                    a_rows as c_int,
-                    d_b.as_ptr::<f32>(),
-                    b_rows as c_int,
-                    &beta as *const f32,
-                    d_c.as_mut_ptr::<f32>(),
-                    m as c_int,
-                )
-            },
-            "hipblasSgemm(ex)",
-        )?;
-
-        hip_check(
-            unsafe { hipStreamSynchronize(ctx.stream) },
-            "hipStreamSynchronize",
-        )?;
-
-        let mut c_col = vec![0.0f32; total];
-        if bytes_c > 0 {
-            hip_check(
-                unsafe {
-                    hipMemcpy(
-                        c_col.as_mut_ptr() as *mut _,
-                        d_c.ptr,
-                        bytes_c,
-                        hipMemcpyKind::hipMemcpyDeviceToHost,
-                    )
-                },
-                "hipMemcpy(C)",
-            )?;
-        }
-
-        Ok(from_column_major(&c_col, m, n))
+        gemm(a, b, m, k, n, trans_a, trans_b, policy)
     }
 
     pub fn matmul_batched_f32(
@@ -4016,10 +3825,10 @@ mod rocm {
         trans_b: bool,
         stride_a: i64,
         stride_b: i64,
-        _stride_c: i64,
+        stride_c: i64,
     ) -> RocmResult<Vec<f32>> {
-        if stride_a <= 0 || stride_b <= 0 {
-            return Err("batched matmul: strides must be positive".into());
+        if stride_a <= 0 || stride_b <= 0 || stride_c == 0 {
+            return Err("batched matmul: strides must be non-zero".into());
         }
         if batch == 0 || m == 0 || n == 0 || k == 0 {
             return Ok(vec![0.0; batch.saturating_mul(m.saturating_mul(n))]);
@@ -4033,44 +3842,18 @@ mod rocm {
         let a_col = to_column_major_batched_strided(a, a_rows, a_cols, batch, stride_a)?;
         let b_col = to_column_major_batched_strided(b, b_rows, b_cols, batch, stride_b)?;
 
-        let total_c = batch
-            .checked_mul(m.saturating_mul(n))
+        let output_stride = stride_c.unsigned_abs() as usize;
+        let per_c = m
+            .checked_mul(n)
             .ok_or_else(|| "batched matmul: size overflow".to_string())?;
+        let required_c = output_stride
+            .checked_mul(batch.saturating_sub(1))
+            .and_then(|offset| offset.checked_add(per_c))
+            .ok_or_else(|| "batched matmul: stride_c overflow".to_string())?;
 
-        let bytes_a = size_of::<f32>() * a_col.len();
-        let bytes_b = size_of::<f32>() * b_col.len();
-        let bytes_c = size_of::<f32>() * total_c;
-
-        let d_a = DeviceBuffer::alloc(bytes_a)?;
-        let d_b = DeviceBuffer::alloc(bytes_b)?;
-        let d_c = DeviceBuffer::alloc(bytes_c)?;
-
-        if bytes_a > 0 {
-            hip_check(
-                unsafe {
-                    hipMemcpy(
-                        d_a.ptr,
-                        a_col.as_ptr() as *const _,
-                        bytes_a,
-                        hipMemcpyKind::hipMemcpyHostToDevice,
-                    )
-                },
-                "hipMemcpy(A batched)",
-            )?;
-        }
-        if bytes_b > 0 {
-            hip_check(
-                unsafe {
-                    hipMemcpy(
-                        d_b.ptr,
-                        b_col.as_ptr() as *const _,
-                        bytes_b,
-                        hipMemcpyKind::hipMemcpyHostToDevice,
-                    )
-                },
-                "hipMemcpy(B batched)",
-            )?;
-        }
+        let d_a = DeviceBuffer::from_slice(&a_col)?;
+        let d_b = DeviceBuffer::from_slice(&b_col)?;
+        let d_c = DeviceBuffer::alloc(size_of::<f32>() * per_c * batch)?;
 
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
@@ -4119,14 +3902,14 @@ mod rocm {
             "hipStreamSynchronize",
         )?;
 
-        let mut c_col = vec![0.0f32; total_c];
-        if bytes_c > 0 {
+        let mut dense_c = vec![0.0f32; per_c * batch];
+        if per_c > 0 {
             hip_check(
                 unsafe {
                     hipMemcpy(
-                        c_col.as_mut_ptr() as *mut _,
+                        dense_c.as_mut_ptr() as *mut _,
                         d_c.ptr,
-                        bytes_c,
+                        size_of::<f32>() * per_c * batch,
                         hipMemcpyKind::hipMemcpyDeviceToHost,
                     )
                 },
@@ -4134,7 +3917,21 @@ mod rocm {
             )?;
         }
 
-        Ok(from_column_major_batched(&c_col, m, n, batch))
+        let dense_row_major = from_column_major_batched(&dense_c, m, n, batch);
+
+        if stride_c == per_c as i64 {
+            return Ok(dense_row_major);
+        }
+
+        let mut result = vec![0.0f32; required_c];
+        for batch_idx in 0..batch {
+            let src = &dense_row_major[batch_idx * per_c..(batch_idx + 1) * per_c];
+            let dst_offset = output_stride * batch_idx;
+            let dst = &mut result[dst_offset..dst_offset + per_c];
+            dst.copy_from_slice(src);
+        }
+
+        Ok(result)
     }
 
     pub fn reduce_sum_f32(values: &[f32]) -> RocmResult<f32> {
@@ -4156,32 +3953,9 @@ mod rocm {
         let ctx = global_context()?;
         hip_check(unsafe { hipSetDevice(ctx.device_id) }, "hipSetDevice")?;
 
-        let d_values = DeviceBuffer::alloc(size_of::<f32>() * values.len())?;
-        let d_ones = DeviceBuffer::alloc(size_of::<f32>() * values.len())?;
-
-        hip_check(
-            unsafe {
-                hipMemcpy(
-                    d_values.ptr,
-                    values.as_ptr() as *const _,
-                    size_of::<f32>() * values.len(),
-                    hipMemcpyKind::hipMemcpyHostToDevice,
-                )
-            },
-            "hipMemcpy(values)",
-        )?;
+        let d_values = DeviceBuffer::from_slice(values)?;
         let ones = vec![1.0f32; values.len()];
-        hip_check(
-            unsafe {
-                hipMemcpy(
-                    d_ones.ptr,
-                    ones.as_ptr() as *const _,
-                    size_of::<f32>() * ones.len(),
-                    hipMemcpyKind::hipMemcpyHostToDevice,
-                )
-            },
-            "hipMemcpy(ones)",
-        )?;
+        let d_ones = DeviceBuffer::from_slice(&ones)?;
 
         let mut result = 0.0f32;
         hipblas_check(
@@ -4271,10 +4045,19 @@ mod rocm {
 
     fn hip_check(code: hipError_t, context: &str) -> RocmResult<()> {
         if code == hipError_t::hipSuccess {
-            Ok(())
-        } else {
-            Err(format!("{}: {}", context, hip_error_to_string(code)))
+            return Ok(());
         }
+        let raw = format!("{context}: {}", hip_error_to_string(code));
+        let formatted = match code {
+            hipError_t::hipErrorNoDevice
+            | hipError_t::hipErrorInvalidDevice
+            | hipError_t::hipErrorInvalidDevicePointer
+            | hipError_t::hipErrorInsufficientDriver
+            | hipError_t::hipErrorDeviceAlreadyInUse => error::gpu_unavailable(raw),
+            hipError_t::hipErrorInvalidValue => error::numeric_issue(raw),
+            _ => error::gpu_error(raw),
+        };
+        Err(formatted)
     }
 
     fn hipblas_status_to_string(status: hipblasStatus_t) -> String {
@@ -4290,10 +4073,18 @@ mod rocm {
 
     fn hipblas_check(status: hipblasStatus_t, context: &str) -> RocmResult<()> {
         if status == hipblasStatus_t::HIPBLAS_STATUS_SUCCESS {
-            Ok(())
-        } else {
-            Err(format!("{}: {}", context, hipblas_status_to_string(status)))
+            return Ok(());
         }
+        let raw = format!("{context}: {}", hipblas_status_to_string(status));
+        let formatted = match status {
+            hipblasStatus_t::HIPBLAS_STATUS_NOT_SUPPORTED => error::gpu_not_implemented(raw),
+            hipblasStatus_t::HIPBLAS_STATUS_ALLOC_FAILED
+            | hipblasStatus_t::HIPBLAS_STATUS_INTERNAL_ERROR => error::gpu_error(raw),
+            hipblasStatus_t::HIPBLAS_STATUS_INVALID_VALUE => error::numeric_issue(raw),
+            hipblasStatus_t::HIPBLAS_STATUS_EXECUTION_FAILED => error::gpu_error(raw),
+            _ => error::gpu_error(raw),
+        };
+        Err(formatted)
     }
 
     struct DeviceBuffer {
@@ -4317,6 +4108,25 @@ mod rocm {
             Ok(Self { ptr, _size: size })
         }
 
+        fn from_slice(data: &[f32]) -> RocmResult<Self> {
+            let size = size_of::<f32>() * data.len();
+            let buffer = Self::alloc(size)?;
+            if size > 0 {
+                hip_check(
+                    unsafe {
+                        hipMemcpy(
+                            buffer.ptr,
+                            data.as_ptr() as *const _,
+                            size,
+                            hipMemcpyKind::hipMemcpyHostToDevice,
+                        )
+                    },
+                    "hipMemcpy(host->device)",
+                )?;
+            }
+            Ok(buffer)
+        }
+
         fn as_ptr<T>(&self) -> *const T {
             self.ptr as *const T
         }
@@ -4334,6 +4144,126 @@ mod rocm {
                 }
             }
         }
+    }
+
+    fn gemm(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+        policy: MatmulTensorCorePolicy,
+    ) -> RocmResult<Vec<f32>> {
+        let effective_policy = match policy {
+            MatmulTensorCorePolicy::Accuracy => MatmulTensorCorePolicy::Accuracy,
+            MatmulTensorCorePolicy::Performance
+            | MatmulTensorCorePolicy::Float16
+            | MatmulTensorCorePolicy::BFloat16 => {
+                if cfg!(debug_assertions) {
+                    eprintln!(
+                        "[num-rs][rocm] policy {:?} not natively supported; executing FP32 GEMM fallback",
+                        policy
+                    );
+                }
+                MatmulTensorCorePolicy::Accuracy
+            }
+        };
+
+        let (a_rows, a_cols) = if trans_a { (k, m) } else { (m, k) };
+        let (b_rows, b_cols) = if trans_b { (n, k) } else { (k, n) };
+
+        let expected_a = a_rows
+            .checked_mul(a_cols)
+            .ok_or_else(|| "gemm: A size overflow".to_string())?;
+        let expected_b = b_rows
+            .checked_mul(b_cols)
+            .ok_or_else(|| "gemm: B size overflow".to_string())?;
+        if a.len() != expected_a || b.len() != expected_b {
+            return Err("gemm: shape mismatch".into());
+        }
+
+        let total = m
+            .checked_mul(n)
+            .ok_or_else(|| "gemm: result size overflow".to_string())?;
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+
+        let ctx = global_context()?;
+        hip_check(unsafe { hipSetDevice(ctx.device_id) }, "hipSetDevice")?;
+
+        let mut a_col = vec![0.0f32; expected_a];
+        let mut b_col = vec![0.0f32; expected_b];
+        convert_row_major_to_column_major_into(a, a_rows, a_cols, &mut a_col);
+        convert_row_major_to_column_major_into(b, b_rows, b_cols, &mut b_col);
+
+        let d_a = DeviceBuffer::from_slice(&a_col)?;
+        let d_b = DeviceBuffer::from_slice(&b_col)?;
+        let d_c = DeviceBuffer::alloc(size_of::<f32>() * total)?;
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let op_a = if trans_a {
+            hipblasOperation_t::HIPBLAS_OP_T
+        } else {
+            hipblasOperation_t::HIPBLAS_OP_N
+        };
+        let op_b = if trans_b {
+            hipblasOperation_t::HIPBLAS_OP_T
+        } else {
+            hipblasOperation_t::HIPBLAS_OP_N
+        };
+
+        hipblas_check(
+            unsafe {
+                hipblasSgemm(
+                    ctx.handle,
+                    op_a,
+                    op_b,
+                    m as c_int,
+                    n as c_int,
+                    k as c_int,
+                    &alpha as *const f32,
+                    d_a.as_ptr::<f32>(),
+                    a_rows as c_int,
+                    d_b.as_ptr::<f32>(),
+                    b_rows as c_int,
+                    &beta as *const f32,
+                    d_c.as_mut_ptr::<f32>(),
+                    m as c_int,
+                )
+            },
+            match effective_policy {
+                MatmulTensorCorePolicy::Accuracy => "hipblasSgemm",
+                MatmulTensorCorePolicy::Performance
+                | MatmulTensorCorePolicy::Float16
+                | MatmulTensorCorePolicy::BFloat16 => "hipblasSgemm (fallback)",
+            },
+        )?;
+
+        hip_check(
+            unsafe { hipStreamSynchronize(ctx.stream) },
+            "hipStreamSynchronize",
+        )?;
+
+        let mut c_col = vec![0.0f32; total];
+        if total > 0 {
+            hip_check(
+                unsafe {
+                    hipMemcpy(
+                        c_col.as_mut_ptr() as *mut _,
+                        d_c.ptr,
+                        size_of::<f32>() * total,
+                        hipMemcpyKind::hipMemcpyDeviceToHost,
+                    )
+                },
+                "hipMemcpy(C)",
+            )?;
+        }
+
+        Ok(from_column_major(&c_col, m, n))
     }
 
     fn to_column_major(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
