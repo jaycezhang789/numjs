@@ -47,6 +47,7 @@ Fixed-point matrices are backed by signed 64-bit integers plus a per-matrix scal
 - Small matrices automatically fall back to single-threaded execution to avoid oversubscription.
 - `matmul_batched` performs batched GEMM across 3D tensors and parallelises over batch items when profitable.
 - In browsers, opt-in WASM threads via `await init({ threads: true })` (requires `SharedArrayBuffer` and a cross-origin isolated context). You can cap the worker count with `init({ threads: 4 })`.
+- Use `await init({ webGpu: { useStub: true }})` to initialise the WebGPU command queue with a placeholder shader while still returning CPU results—helpful for feature-flagging the pipeline before real GPU kernels land.
 
 ## GPU Acceleration (Beta)
 

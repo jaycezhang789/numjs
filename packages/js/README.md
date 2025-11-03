@@ -97,7 +97,10 @@ Use `backendKind()` to inspect the result. To override the detection logic:
 await init({
   preferBackend: "napi",  // "auto" | "napi" | "wasm"
   threads: true,          // enable the WASM thread pool when available
-  webGpu: { forceFallback: false } // lazily initialise the experimental WebGPU executor
+  webGpu: {
+    forceFallback: false, // allow WebGPU when supported
+    useStub: true,        // initialise command queue but keep results on the CPU (placeholder kernels)
+  },
 });
 ```
 

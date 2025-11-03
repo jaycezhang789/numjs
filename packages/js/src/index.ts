@@ -60,6 +60,7 @@ export type GpuExecutionMode = "auto" | "gpu-only" | "cpu-only";
 
 export type WebGpuInitOptions = {
   forceFallback?: boolean;
+  useStub?: boolean;
 };
 
 export type MatmulTensorCorePolicy = "accuracy" | "performance" | "float16" | "bfloat16";
@@ -1078,7 +1079,7 @@ async function selectGpuEngine(
   if (mode === "cpu-only") {
     return null;
   }
-  const engine = await ensureWebGpuEngine();
+  const engine = await ensureWebGpuEngine(pendingInitOptions.webGpu);
   if (!engine && mode === "gpu-only") {
     throw new Error("WebGPU backend requested but unavailable in this environment");
   }

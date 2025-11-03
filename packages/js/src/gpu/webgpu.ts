@@ -51,6 +51,7 @@ export interface WebGpuEngine {
 
 export type CreateWebGpuEngineOptions = {
   forceFallback?: boolean;
+  useStub?: boolean;
 };
 
 export function isWebGpuSupported(): boolean {
@@ -72,7 +73,13 @@ export async function createWebGpuEngine(
   }
   const device = await adapter.requestDevice();
   const queue = device.queue;
-  const engine = new WebGpuEngineImpl({ adapter, device, queue });
+  const context: WebGpuDeviceContext = { adapter, device, queue };
+  if (options.useStub) {
+    const engine = new WebGpuStubEngine(context);
+    await engine.ensurePipelines();
+    return engine;
+  }
+  const engine = new WebGpuEngineImpl(context);
   await engine.ensurePipelines();
   return engine;
 }
@@ -326,6 +333,137 @@ class WebGpuEngineImpl implements WebGpuEngine {
   }
 }
 
+class WebGpuStubEngine implements WebGpuEngine {
+  readonly context: WebGpuDeviceContext;
+  private noopPipeline: GPUComputePipeline | null = null;
+
+  constructor(context: WebGpuDeviceContext) {
+    this.context = context;
+    this.context.device.lost.then((info) => {
+      console.warn("[numjs] WebGPU device lost (stub engine):", info.message);
+      this.noopPipeline = null;
+    });
+  }
+
+  async ensurePipelines(): Promise<void> {
+    await this.ensureNoopPipeline();
+  }
+
+  async matmul(inputs: WebGpuMatmulInputs): Promise<FloatArray> {
+    const pipeline = await this.ensureNoopPipeline();
+    dispatchNoop(this.context, pipeline);
+    return cpuMatmul(inputs);
+  }
+
+  async reduceSum(inputs: WebGpuReduceInputs): Promise<number> {
+    const pipeline = await this.ensureNoopPipeline();
+    dispatchNoop(this.context, pipeline);
+    return cpuReduceSum(inputs);
+  }
+
+  async conv2d(inputs: WebGpuConv2DInputs): Promise<FloatArray> {
+    const pipeline = await this.ensureNoopPipeline();
+    dispatchNoop(this.context, pipeline);
+    return cpuConv2D(inputs);
+  }
+
+  private async ensureNoopPipeline(): Promise<GPUComputePipeline> {
+    if (this.noopPipeline) {
+      return this.noopPipeline;
+    }
+    const module = this.context.device.createShaderModule({
+      code: NOOP_SHADER,
+    });
+    const pipeline = this.context.device.createComputePipeline({
+      layout: "auto",
+      compute: {
+        module,
+        entryPoint: "main",
+      },
+    });
+    this.noopPipeline = pipeline;
+    return pipeline;
+  }
+}
+
+function dispatchNoop(context: WebGpuDeviceContext, pipeline: GPUComputePipeline): void {
+  const { device, queue } = context;
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.dispatchWorkgroups(1);
+  pass.end();
+  queue.submit([encoder.finish()]);
+}
+
+function cpuMatmul(inputs: WebGpuMatmulInputs): Float32Array {
+  const { a, b, rowsA, colsA, colsB } = inputs;
+  const out = new Float32Array(rowsA * colsB);
+  for (let row = 0; row < rowsA; row += 1) {
+    const rowOffset = row * colsA;
+    const outOffset = row * colsB;
+    for (let col = 0; col < colsB; col += 1) {
+      let acc = 0;
+      for (let k = 0; k < colsA; k += 1) {
+        acc += a[rowOffset + k] * b[k * colsB + col];
+      }
+      out[outOffset + col] = acc;
+    }
+  }
+  return out;
+}
+
+function cpuReduceSum(inputs: WebGpuReduceInputs): number {
+  const { data } = inputs;
+  let total = 0;
+  for (let index = 0; index < data.length; index += 1) {
+    total += data[index];
+  }
+  return total;
+}
+
+function cpuConv2D(inputs: WebGpuConv2DInputs): Float32Array {
+  const {
+    input,
+    kernel,
+    inputRows,
+    inputCols,
+    kernelRows,
+    kernelCols,
+    stride = 1,
+    pad = 0,
+  } = inputs;
+  const outRows = Math.floor((inputRows + 2 * pad - kernelRows) / stride + 1);
+  const outCols = Math.floor((inputCols + 2 * pad - kernelCols) / stride + 1);
+  const output = new Float32Array(Math.max(outRows, 0) * Math.max(outCols, 0));
+  if (outRows <= 0 || outCols <= 0) {
+    return output;
+  }
+  for (let outRow = 0; outRow < outRows; outRow += 1) {
+    for (let outCol = 0; outCol < outCols; outCol += 1) {
+      let acc = 0;
+      for (let kr = 0; kr < kernelRows; kr += 1) {
+        for (let kc = 0; kc < kernelCols; kc += 1) {
+          const inRow = outRow * stride + kr - pad;
+          const inCol = outCol * stride + kc - pad;
+          if (
+            inRow >= 0 &&
+            inRow < inputRows &&
+            inCol >= 0 &&
+            inCol < inputCols
+          ) {
+            const inputIndex = inRow * inputCols + inCol;
+            const kernelIndex = kr * kernelCols + kc;
+            acc += input[inputIndex] * kernel[kernelIndex];
+          }
+        }
+      }
+      output[outRow * outCols + outCol] = acc;
+    }
+  }
+  return output;
+}
+
 function createStorageBuffer(device: GPUDevice, source: FloatArray): GPUBuffer {
   const buffer = device.createBuffer({
     size: alignTo(source.byteLength, 4),
@@ -351,6 +489,12 @@ function alignTo(value: number, multiple: number): number {
   const remainder = value % multiple;
   return remainder === 0 ? value : value + multiple - remainder;
 }
+
+const NOOP_SHADER = /* wgsl */ `
+@compute @workgroup_size(1)
+fn main() {
+}
+`;
 
 const MATMUL_SHADER = /* wgsl */ `
 struct Matrix {
