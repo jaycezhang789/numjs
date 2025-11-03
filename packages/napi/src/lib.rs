@@ -1,3 +1,5 @@
+pub mod gpu;
+
 use napi::bindgen_prelude::{
     BigInt64Array, Buffer, Env, Error, Float32Array, Float64Array, Result, TypedArrayType,
     Uint32Array,
@@ -5,10 +7,11 @@ use napi::bindgen_prelude::{
 use napi::JsObject;
 use napi_derive::napi;
 
+use core_gpu::{MatmulTensorCorePolicy, SumPrecisionPolicy};
 use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
 use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
-use num_rs_core::gpu::{self, MatmulTensorCorePolicy, SumPrecisionPolicy};
+use num_rs_core::gpu as core_gpu;
 use num_rs_core::sparse::{self, CsrMatrixView};
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
@@ -248,12 +251,12 @@ pub fn matmul(a: &Matrix, b: &Matrix) -> Result<Matrix> {
 
 #[napi]
 pub fn gpu_available() -> bool {
-    gpu::active_backend_kind().is_some()
+    core_gpu::active_backend_kind().is_some()
 }
 
 #[napi]
 pub fn gpu_backend_kind() -> Option<String> {
-    gpu::backend_name().map(|kind| kind.to_string())
+    core_gpu::backend_name().map(|kind| kind.to_string())
 }
 
 fn parse_tensor_core_policy(policy: Option<String>) -> Result<MatmulTensorCorePolicy> {
@@ -298,7 +301,7 @@ fn parse_sum_precision(policy: Option<String>) -> Result<SumPrecisionPolicy> {
 
 #[napi]
 pub fn gpu_matmul(a: &Matrix, b: &Matrix, tensor_core_policy: Option<String>) -> Result<Matrix> {
-    if let Some(_kind) = gpu::active_backend_kind() {
+    if let Some(_kind) = core_gpu::active_backend_kind() {
         let rows = a.rows() as usize;
         let shared = a.cols() as usize;
         let cols = b.cols() as usize;
@@ -313,7 +316,7 @@ pub fn gpu_matmul(a: &Matrix, b: &Matrix, tensor_core_policy: Option<String>) ->
         let lhs_view = lhs.try_as_slice::<f32>().map_err(map_core_error)?;
         let rhs_view = rhs.try_as_slice::<f32>().map_err(map_core_error)?;
         let policy = parse_tensor_core_policy(tensor_core_policy)?;
-        match gpu::matmul_f32_with_policy(lhs_view, rhs_view, rows, shared, cols, policy) {
+        match core_gpu::matmul_f32_with_policy(lhs_view, rhs_view, rows, shared, cols, policy) {
             Ok(values) => {
                 let buffer = MatrixBuffer::from_vec(values, rows, cols).map_err(map_core_error)?;
                 return Ok(Matrix::from_buffer(buffer));
@@ -718,16 +721,20 @@ pub fn ifft2d(env: Env, real: &Matrix, imag: &Matrix) -> Result<JsObject> {
 }
 
 #[napi]
-pub fn gpu_sum(matrix: &Matrix, dtype: Option<String>, precision: Option<String>) -> Result<Matrix> {
+pub fn gpu_sum(
+    matrix: &Matrix,
+    dtype: Option<String>,
+    precision: Option<String>,
+) -> Result<Matrix> {
     let target = match dtype {
         Some(value) => Some(value.parse::<DType>().map_err(map_core_error)?),
         None => None,
     };
     let policy = parse_sum_precision(precision)?;
-    if let Some(_kind) = gpu::active_backend_kind() {
+    if let Some(_kind) = core_gpu::active_backend_kind() {
         let buffer = ensure_float32_buffer(matrix.buffer())?;
         let view = buffer.try_as_slice::<f32>().map_err(map_core_error)?;
-        match gpu::reduce_sum_f32_with_policy(view, policy) {
+        match core_gpu::reduce_sum_f32_with_policy(view, policy) {
             Ok(total) => {
                 let base = MatrixBuffer::from_vec(vec![total], 1, 1).map_err(map_core_error)?;
                 let mut result = Matrix::from_buffer(base);

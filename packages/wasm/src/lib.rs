@@ -4,6 +4,7 @@ use js_sys::{
 use num_rs_core::buffer::{CastOptions, CastingKind, MatrixBuffer, SliceSpec};
 use num_rs_core::compress::compress as core_compress;
 use num_rs_core::dtype::DType;
+use num_rs_core::sparse::{self, CsrMatrixView};
 use num_rs_core::{
     add as core_add, broadcast_to as core_broadcast_to, clip as core_clip, concat as core_concat,
     cos as core_cos, div as core_div, dot as core_dot, exp as core_exp, fft2d as core_fft2d,
@@ -16,7 +17,6 @@ use num_rs_core::{
     sum as core_sum, take as core_take, tanh as core_tanh, transpose as core_transpose,
     where_select as core_where, where_select_multi as core_where_multi, write_npy_matrix,
 };
-use num_rs_core::sparse::{self, CsrMatrixView};
 #[cfg(feature = "linalg")]
 use num_rs_core::{eigen as core_eigen, qr as core_qr, solve as core_solve, svd as core_svd};
 use std::convert::TryFrom;
@@ -310,10 +310,12 @@ fn parse_sparse_payload(payload: JsValue) -> Result<ParsedSparse, JsValue> {
         .map_err(|_| JsValue::from_str("sparse_* payload must be an object"))?;
     let rows = Reflect::get(&object, &JsValue::from_str("rows"))?
         .as_f64()
-        .ok_or_else(|| JsValue::from_str("Sparse payload rows must be a number"))? as usize;
+        .ok_or_else(|| JsValue::from_str("Sparse payload rows must be a number"))?
+        as usize;
     let cols = Reflect::get(&object, &JsValue::from_str("cols"))?
         .as_f64()
-        .ok_or_else(|| JsValue::from_str("Sparse payload cols must be a number"))? as usize;
+        .ok_or_else(|| JsValue::from_str("Sparse payload cols must be a number"))?
+        as usize;
     let dtype_str = Reflect::get(&object, &JsValue::from_str("dtype"))?
         .as_string()
         .ok_or_else(|| JsValue::from_str("Sparse payload dtype must be a string"))?;
@@ -679,7 +681,8 @@ pub fn where_select_multi_wasm(
     choices: Box<[Matrix]>,
     default_value: Option<Matrix>,
 ) -> Result<Matrix, JsValue> {
-    let condition_refs: Vec<&MatrixBuffer> = conditions.iter().map(|matrix| matrix.buffer()).collect();
+    let condition_refs: Vec<&MatrixBuffer> =
+        conditions.iter().map(|matrix| matrix.buffer()).collect();
     let choice_refs: Vec<&MatrixBuffer> = choices.iter().map(|matrix| matrix.buffer()).collect();
     let default_ref = default_value.as_ref().map(|matrix| matrix.buffer());
     core_where_multi(&condition_refs, &choice_refs, default_ref)
@@ -691,7 +694,8 @@ pub fn where_select_multi_wasm(
 pub fn sparse_matmul(payload: JsValue, dense: &Matrix) -> Result<Matrix, JsValue> {
     let parsed = parse_sparse_payload(payload)?;
     let view = parsed.view()?;
-    let result = sparse::sparse_matmul(&view, dense.buffer()).map_err(|err| map_core_error(&err))?;
+    let result =
+        sparse::sparse_matmul(&view, dense.buffer()).map_err(|err| map_core_error(&err))?;
     let target_dtype = dense.dtype();
     sparse_result_to_matrix(result, &target_dtype)
 }
