@@ -109,6 +109,19 @@ pub fn reduce_sum_f32_with_policy(values: &[f32], policy: SumPrecisionPolicy) ->
             return cuda::reduce_sum_f32_with_policy(values, policy);
         }
     }
+    #[cfg(feature = "gpu-rocm")]
+    {
+        if rocm::is_available() {
+            match rocm::reduce_sum_f32_with_policy(values, policy) {
+                Ok(total) => return Ok(total),
+                Err(err) => {
+                    if cfg!(debug_assertions) {
+                        eprintln!("[num-rs][rocm] reduce_sum fallback: {err}");
+                    }
+                }
+            }
+        }
+    }
     let result = match policy {
         SumPrecisionPolicy::Default => values.iter().copied().sum(),
         SumPrecisionPolicy::Float64 => sum_f32_as_f64(values),
@@ -337,6 +350,19 @@ pub fn matmul_f32_ex_with_policy(
             return cuda::matmul_f32_ex_with_policy(a, b, m, k, n, trans_a, trans_b, policy);
         }
     }
+    #[cfg(feature = "gpu-rocm")]
+    {
+        if rocm::is_available() {
+            match rocm::matmul_f32_ex_with_policy(a, b, m, k, n, trans_a, trans_b, policy) {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    if cfg!(debug_assertions) {
+                        eprintln!("[num-rs][rocm] matmul_ex fallback: {err}");
+                    }
+                }
+            }
+        }
+    }
     if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
         return Err("matmul_f32_ex_with_policy: non-Accuracy policies require CUDA backend".into());
     }
@@ -383,6 +409,19 @@ pub fn matmul_batched_f32_with_policy(
             return cuda::matmul_batched_f32_with_policy(
                 a, b, batch, m, k, n, trans_a, trans_b, policy,
             );
+        }
+    }
+    #[cfg(feature = "gpu-rocm")]
+    {
+        if rocm::is_available() && matches!(policy, MatmulTensorCorePolicy::Accuracy) {
+            match rocm::matmul_batched_f32(a, b, batch, m, k, n, trans_a, trans_b) {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    if cfg!(debug_assertions) {
+                        eprintln!("[num-rs][rocm] matmul_batched fallback: {err}");
+                    }
+                }
+            }
         }
     }
     if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
@@ -453,6 +492,21 @@ pub fn matmul_batched_f32_strided_with_policy(
             return cuda::matmul_batched_f32_strided_with_policy(
                 a, b, batch, m, k, n, trans_a, trans_b, stride_a, stride_b, stride_c, policy,
             );
+        }
+    }
+    #[cfg(feature = "gpu-rocm")]
+    {
+        if rocm::is_available() && matches!(policy, MatmulTensorCorePolicy::Accuracy) {
+            match rocm::matmul_batched_f32_strided(
+                a, b, batch, m, k, n, trans_a, trans_b, stride_a, stride_b, stride_c,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    if cfg!(debug_assertions) {
+                        eprintln!("[num-rs][rocm] matmul_batched_strided fallback: {err}");
+                    }
+                }
+            }
         }
     }
     if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
@@ -589,8 +643,7 @@ mod cuda {
             .map_err(|e| format!("load min_index_stage_reduce: {:?}", e))?;
         let block_dim_stage1 = select_block_dim(&stage1, smem_per_thread_i32)?;
         let shared_stage1 = shared_mem_bytes(block_dim_stage1, std::mem::size_of::<i32>())?;
-        let mut blocks =
-            blocks_for_len("index reduce stage1", values.len(), block_dim_stage1)?;
+        let mut blocks = blocks_for_len("index reduce stage1", values.len(), block_dim_stage1)?;
         let mut current = stream
             .alloc_zeros::<i32>(blocks as usize)
             .map_err(|e| format!("alloc index tmp: {:?}", e))?;
@@ -613,19 +666,20 @@ mod cuda {
             let host = stream
                 .memcpy_dtov(&current)
                 .map_err(|e| format!("{label}: {:?}", e))?;
-            return Ok(extract_optional_index(host.into_iter().next(), values.len()));
+            return Ok(extract_optional_index(
+                host.into_iter().next(),
+                values.len(),
+            ));
         }
         let block_dim_reduce = select_block_dim(&reduce, smem_per_thread_i32)?;
-        let shared_reduce =
-            shared_mem_bytes(block_dim_reduce, std::mem::size_of::<i32>())?;
+        let shared_reduce = shared_mem_bytes(block_dim_reduce, std::mem::size_of::<i32>())?;
         let mut current_len = blocks as usize;
         loop {
             blocks = blocks_for_len("index reduce partial", current_len, block_dim_reduce)?;
             let mut next = stream
                 .alloc_zeros::<i32>(blocks as usize)
                 .map_err(|e| format!("alloc index next: {:?}", e))?;
-            let len_i32 =
-                usize_to_i32("index reduce partial length", current_len)?;
+            let len_i32 = usize_to_i32("index reduce partial length", current_len)?;
             let cfg = LaunchConfig {
                 grid_dim: (blocks, 1, 1),
                 block_dim: (block_dim_reduce, 1, 1),
@@ -644,7 +698,10 @@ mod cuda {
                 let host = stream
                     .memcpy_dtov(&next)
                     .map_err(|e| format!("{label}: {:?}", e))?;
-                return Ok(extract_optional_index(host.into_iter().next(), values.len()));
+                return Ok(extract_optional_index(
+                    host.into_iter().next(),
+                    values.len(),
+                ));
             }
             current_len = blocks as usize;
             current = next;
@@ -766,11 +823,7 @@ mod cuda {
             unsafe {
                 let mut launch = stream.launch_builder(func);
                 if use_f32_kernel {
-                    launch
-                        .arg(values)
-                        .arg(&mut next)
-                        .arg(&len_i32)
-                        .launch(cfg)
+                    launch.arg(values).arg(&mut next).arg(&len_i32).launch(cfg)
                 } else {
                     let current_slice = storage
                         .as_ref()
@@ -813,11 +866,9 @@ mod cuda {
             .load_function("reduce_sum_stage1_kahan")
             .map_err(|e| format!("load reduce_sum_stage1_kahan: {:?}", e))?;
         let block_dim_f32 = select_block_dim(&func_from_f32, smem_per_thread_2xf64)?;
-        let shared_f32 =
-            shared_mem_bytes(block_dim_f32, 2 * std::mem::size_of::<f64>())?;
+        let shared_f32 = shared_mem_bytes(block_dim_f32, 2 * std::mem::size_of::<f64>())?;
         let block_dim_f64 = select_block_dim(&func_f64, smem_per_thread_2xf64)?;
-        let shared_f64 =
-            shared_mem_bytes(block_dim_f64, 2 * std::mem::size_of::<f64>())?;
+        let shared_f64 = shared_mem_bytes(block_dim_f64, 2 * std::mem::size_of::<f64>())?;
 
         let mut current_len = values.len();
         let mut storage: Option<CudaSlice<f64>> = None;
@@ -842,11 +893,7 @@ mod cuda {
             unsafe {
                 let mut launch = stream.launch_builder(func);
                 if use_f32_kernel {
-                    launch
-                        .arg(values)
-                        .arg(&mut next)
-                        .arg(&len_i32)
-                        .launch(cfg)
+                    launch.arg(values).arg(&mut next).arg(&len_i32).launch(cfg)
                 } else {
                     let current_slice = storage
                         .as_ref()
@@ -2202,17 +2249,15 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
     }
 
     fn global_context() -> Result<Arc<CudaContext>, String> {
-        let entry = GLOBAL_CONTEXT.get_or_init(|| {
-            CudaContext::new(0).map_err(|e| format!("cuda: {:?}", e))
-        });
+        let entry = GLOBAL_CONTEXT
+            .get_or_init(|| CudaContext::new(0).map_err(|e| format!("cuda: {:?}", e)));
         match entry {
             Ok(ctx) => Ok(Arc::clone(ctx)),
             Err(err) => Err(err.clone()),
         }
     }
 
-    fn module_cache(
-    ) -> &'static Mutex<HashMap<usize, HashMap<&'static str, Arc<CudaModule>>>> {
+    fn module_cache() -> &'static Mutex<HashMap<usize, HashMap<&'static str, Arc<CudaModule>>>> {
         MODULE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
@@ -2232,8 +2277,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
 
         let mut opts = CompileOptions::default();
         opts.include_paths = nvrtc_include_paths();
-        let ptx =
-            compile_ptx_with_opts(source, opts).map_err(|e| format!("nvrtc: {:?}", e))?;
+        let ptx = compile_ptx_with_opts(source, opts).map_err(|e| format!("nvrtc: {:?}", e))?;
         let module = ctx
             .load_module(ptx)
             .map_err(|e| format!("load module: {:?}", e))?;
@@ -3477,12 +3521,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         values: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
     ) -> CoreResult<()> {
-        reduce_sum_f32_device_with_policy(
-            stream,
-            values,
-            out,
-            SumPrecisionPolicy::Default,
-        )
+        reduce_sum_f32_device_with_policy(stream, values, out, SumPrecisionPolicy::Default)
     }
 
     pub fn reduce_sum_f32_device_with_policy(
@@ -3531,12 +3570,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         let mut device_out = stream
             .alloc_zeros::<f32>(1)
             .map_err(|e| format!("reduce_max alloc: {:?}", e))?;
-        reduce_max_f32_device_with_policy(
-            stream.clone(),
-            &device_values,
-            &mut device_out,
-            policy,
-        )?;
+        reduce_max_f32_device_with_policy(stream.clone(), &device_values, &mut device_out, policy)?;
         let host = stream
             .memcpy_dtov(&device_out)
             .map_err(|e| format!("reduce_max dtoh: {:?}", e))?;
@@ -3609,12 +3643,7 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
         let mut device_out = stream
             .alloc_zeros::<i32>(1)
             .map_err(|e| format!("argmax alloc: {:?}", e))?;
-        argmax_f32_device_with_policy(
-            stream.clone(),
-            &device_values,
-            &mut device_out,
-            policy,
-        )?;
+        argmax_f32_device_with_policy(stream.clone(), &device_values, &mut device_out, policy)?;
         let host = stream
             .memcpy_dtov(&device_out)
             .map_err(|e| format!("argmax dtoh: {:?}", e))?;
@@ -3670,20 +3699,761 @@ extern "C" __global__ void matmul_tiled_128_strided(const float* __restrict__ A,
     }
 }
 
-#[cfg(feature = "gpu-rocm")]
+#[cfg(all(feature = "gpu-rocm", target_os = "linux"))]
 mod rocm {
+    use super::{MatmulTensorCorePolicy, SumPrecisionPolicy};
+    use hip_sys::hipblas::*;
+    use hip_sys::hiprt::*;
+    use once_cell::sync::OnceCell;
+    use std::ffi::CStr;
+    use std::mem::size_of;
+    use std::os::raw::c_int;
+    use std::ptr;
+
+    type RocmResult<T> = std::result::Result<T, String>;
+
+    struct RocmContext {
+        device_id: c_int,
+        stream: hipStream_t,
+        handle: hipblasHandle_t,
+    }
+
+    impl Drop for RocmContext {
+        fn drop(&mut self) {
+            unsafe {
+                hipblasDestroy(self.handle);
+                hipStreamDestroy(self.stream);
+            }
+        }
+    }
+
+    static CONTEXT: OnceCell<RocmResult<RocmContext>> = OnceCell::new();
+
+    pub fn is_available() -> bool {
+        global_context().is_ok()
+    }
+
+    pub fn matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> RocmResult<Vec<f32>> {
+        matmul_f32_with_policy(a, b, m, k, n, MatmulTensorCorePolicy::Accuracy)
+    }
+
+    pub fn matmul_f32_with_policy(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        policy: MatmulTensorCorePolicy,
+    ) -> RocmResult<Vec<f32>> {
+        if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
+            return Err(
+                "ROCm backend currently supports only MatmulTensorCorePolicy::Accuracy".into(),
+            );
+        }
+        let total = m
+            .checked_mul(n)
+            .ok_or_else(|| "matmul_f32: size overflow".to_string())?;
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+        let ctx = global_context()?;
+        hip_check(unsafe { hipSetDevice(ctx.device_id) }, "hipSetDevice")?;
+
+        let a_col = to_column_major(a, m, k);
+        let b_col = to_column_major(b, k, n);
+
+        let d_a = DeviceBuffer::alloc(size_of::<f32>() * a_col.len())?;
+        let d_b = DeviceBuffer::alloc(size_of::<f32>() * b_col.len())?;
+        let d_c = DeviceBuffer::alloc(size_of::<f32>() * total)?;
+
+        hip_check(
+            unsafe {
+                hipMemcpy(
+                    d_a.ptr,
+                    a_col.as_ptr() as *const _,
+                    size_of::<f32>() * a_col.len(),
+                    hipMemcpyKind::hipMemcpyHostToDevice,
+                )
+            },
+            "hipMemcpy(A)",
+        )?;
+        hip_check(
+            unsafe {
+                hipMemcpy(
+                    d_b.ptr,
+                    b_col.as_ptr() as *const _,
+                    size_of::<f32>() * b_col.len(),
+                    hipMemcpyKind::hipMemcpyHostToDevice,
+                )
+            },
+            "hipMemcpy(B)",
+        )?;
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+
+        hipblas_check(
+            unsafe {
+                hipblasSgemm(
+                    ctx.handle,
+                    hipblasOperation_t::HIPBLAS_OP_N,
+                    hipblasOperation_t::HIPBLAS_OP_N,
+                    m as c_int,
+                    n as c_int,
+                    k as c_int,
+                    &alpha as *const f32,
+                    d_a.as_ptr::<f32>(),
+                    m as c_int,
+                    d_b.as_ptr::<f32>(),
+                    k as c_int,
+                    &beta as *const f32,
+                    d_c.as_mut_ptr::<f32>(),
+                    m as c_int,
+                )
+            },
+            "hipblasSgemm",
+        )?;
+
+        hip_check(
+            unsafe { hipStreamSynchronize(ctx.stream) },
+            "hipStreamSynchronize",
+        )?;
+
+        let mut c_col = vec![0.0f32; total];
+        hip_check(
+            unsafe {
+                hipMemcpy(
+                    c_col.as_mut_ptr() as *mut _,
+                    d_c.ptr,
+                    size_of::<f32>() * total,
+                    hipMemcpyKind::hipMemcpyDeviceToHost,
+                )
+            },
+            "hipMemcpy(C)",
+        )?;
+
+        Ok(from_column_major(&c_col, m, n))
+    }
+
+    pub fn matmul_f32_ex(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> RocmResult<Vec<f32>> {
+        matmul_f32_ex_with_policy(
+            a,
+            b,
+            m,
+            k,
+            n,
+            trans_a,
+            trans_b,
+            MatmulTensorCorePolicy::Accuracy,
+        )
+    }
+
+    pub fn matmul_f32_ex_with_policy(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+        policy: MatmulTensorCorePolicy,
+    ) -> RocmResult<Vec<f32>> {
+        if !matches!(policy, MatmulTensorCorePolicy::Accuracy) {
+            return Err("ROCm matmul currently supports only Accuracy policy".into());
+        }
+        let (a_rows, a_cols) = if trans_a { (k, m) } else { (m, k) };
+        let (b_rows, b_cols) = if trans_b { (n, k) } else { (k, n) };
+        if a.len() != a_rows.saturating_mul(a_cols) || b.len() != b_rows.saturating_mul(b_cols) {
+            return Err("matmul_f32_ex_with_policy: shape mismatch".into());
+        }
+        let total = m
+            .checked_mul(n)
+            .ok_or_else(|| "matmul_f32_ex_with_policy: size overflow".to_string())?;
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+        let ctx = global_context()?;
+        hip_check(unsafe { hipSetDevice(ctx.device_id) }, "hipSetDevice")?;
+
+        let a_col = to_column_major(a, a_rows, a_cols);
+        let b_col = to_column_major(b, b_rows, b_cols);
+
+        let bytes_a = size_of::<f32>() * a_col.len();
+        let bytes_b = size_of::<f32>() * b_col.len();
+        let bytes_c = size_of::<f32>() * total;
+
+        let d_a = DeviceBuffer::alloc(bytes_a)?;
+        let d_b = DeviceBuffer::alloc(bytes_b)?;
+        let d_c = DeviceBuffer::alloc(bytes_c)?;
+
+        if bytes_a > 0 {
+            hip_check(
+                unsafe {
+                    hipMemcpy(
+                        d_a.ptr,
+                        a_col.as_ptr() as *const _,
+                        bytes_a,
+                        hipMemcpyKind::hipMemcpyHostToDevice,
+                    )
+                },
+                "hipMemcpy(A)",
+            )?;
+        }
+        if bytes_b > 0 {
+            hip_check(
+                unsafe {
+                    hipMemcpy(
+                        d_b.ptr,
+                        b_col.as_ptr() as *const _,
+                        bytes_b,
+                        hipMemcpyKind::hipMemcpyHostToDevice,
+                    )
+                },
+                "hipMemcpy(B)",
+            )?;
+        }
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let op_a = if trans_a {
+            hipblasOperation_t::HIPBLAS_OP_T
+        } else {
+            hipblasOperation_t::HIPBLAS_OP_N
+        };
+        let op_b = if trans_b {
+            hipblasOperation_t::HIPBLAS_OP_T
+        } else {
+            hipblasOperation_t::HIPBLAS_OP_N
+        };
+
+        hipblas_check(
+            unsafe {
+                hipblasSgemm(
+                    ctx.handle,
+                    op_a,
+                    op_b,
+                    m as c_int,
+                    n as c_int,
+                    k as c_int,
+                    &alpha as *const f32,
+                    d_a.as_ptr::<f32>(),
+                    a_rows as c_int,
+                    d_b.as_ptr::<f32>(),
+                    b_rows as c_int,
+                    &beta as *const f32,
+                    d_c.as_mut_ptr::<f32>(),
+                    m as c_int,
+                )
+            },
+            "hipblasSgemm(ex)",
+        )?;
+
+        hip_check(
+            unsafe { hipStreamSynchronize(ctx.stream) },
+            "hipStreamSynchronize",
+        )?;
+
+        let mut c_col = vec![0.0f32; total];
+        if bytes_c > 0 {
+            hip_check(
+                unsafe {
+                    hipMemcpy(
+                        c_col.as_mut_ptr() as *mut _,
+                        d_c.ptr,
+                        bytes_c,
+                        hipMemcpyKind::hipMemcpyDeviceToHost,
+                    )
+                },
+                "hipMemcpy(C)",
+            )?;
+        }
+
+        Ok(from_column_major(&c_col, m, n))
+    }
+
+    pub fn matmul_batched_f32(
+        a: &[f32],
+        b: &[f32],
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> RocmResult<Vec<f32>> {
+        let stride_a = (if trans_a {
+            k.saturating_mul(m)
+        } else {
+            m.saturating_mul(k)
+        }) as i64;
+        let stride_b = (if trans_b {
+            n.saturating_mul(k)
+        } else {
+            k.saturating_mul(n)
+        }) as i64;
+        let stride_c = (m.saturating_mul(n)) as i64;
+        matmul_batched_f32_strided(
+            a, b, batch, m, k, n, trans_a, trans_b, stride_a, stride_b, stride_c,
+        )
+    }
+
+    pub fn matmul_batched_f32_strided(
+        a: &[f32],
+        b: &[f32],
+        batch: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        trans_a: bool,
+        trans_b: bool,
+        stride_a: i64,
+        stride_b: i64,
+        _stride_c: i64,
+    ) -> RocmResult<Vec<f32>> {
+        if stride_a <= 0 || stride_b <= 0 {
+            return Err("batched matmul: strides must be positive".into());
+        }
+        if batch == 0 || m == 0 || n == 0 || k == 0 {
+            return Ok(vec![0.0; batch.saturating_mul(m.saturating_mul(n))]);
+        }
+        let ctx = global_context()?;
+        hip_check(unsafe { hipSetDevice(ctx.device_id) }, "hipSetDevice")?;
+
+        let (a_rows, a_cols) = if trans_a { (k, m) } else { (m, k) };
+        let (b_rows, b_cols) = if trans_b { (n, k) } else { (k, n) };
+
+        let a_col = to_column_major_batched_strided(a, a_rows, a_cols, batch, stride_a)?;
+        let b_col = to_column_major_batched_strided(b, b_rows, b_cols, batch, stride_b)?;
+
+        let total_c = batch
+            .checked_mul(m.saturating_mul(n))
+            .ok_or_else(|| "batched matmul: size overflow".to_string())?;
+
+        let bytes_a = size_of::<f32>() * a_col.len();
+        let bytes_b = size_of::<f32>() * b_col.len();
+        let bytes_c = size_of::<f32>() * total_c;
+
+        let d_a = DeviceBuffer::alloc(bytes_a)?;
+        let d_b = DeviceBuffer::alloc(bytes_b)?;
+        let d_c = DeviceBuffer::alloc(bytes_c)?;
+
+        if bytes_a > 0 {
+            hip_check(
+                unsafe {
+                    hipMemcpy(
+                        d_a.ptr,
+                        a_col.as_ptr() as *const _,
+                        bytes_a,
+                        hipMemcpyKind::hipMemcpyHostToDevice,
+                    )
+                },
+                "hipMemcpy(A batched)",
+            )?;
+        }
+        if bytes_b > 0 {
+            hip_check(
+                unsafe {
+                    hipMemcpy(
+                        d_b.ptr,
+                        b_col.as_ptr() as *const _,
+                        bytes_b,
+                        hipMemcpyKind::hipMemcpyHostToDevice,
+                    )
+                },
+                "hipMemcpy(B batched)",
+            )?;
+        }
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let op_a = if trans_a {
+            hipblasOperation_t::HIPBLAS_OP_T
+        } else {
+            hipblasOperation_t::HIPBLAS_OP_N
+        };
+        let op_b = if trans_b {
+            hipblasOperation_t::HIPBLAS_OP_T
+        } else {
+            hipblasOperation_t::HIPBLAS_OP_N
+        };
+        let stride_a_col = (a_rows as hipblasStride) * (a_cols as hipblasStride);
+        let stride_b_col = (b_rows as hipblasStride) * (b_cols as hipblasStride);
+        let stride_c_col = (m as hipblasStride) * (n as hipblasStride);
+
+        hipblas_check(
+            unsafe {
+                hipblasSgemmStridedBatched(
+                    ctx.handle,
+                    op_a,
+                    op_b,
+                    m as c_int,
+                    n as c_int,
+                    k as c_int,
+                    &alpha as *const f32,
+                    d_a.as_ptr::<f32>(),
+                    a_rows as c_int,
+                    stride_a_col,
+                    d_b.as_ptr::<f32>(),
+                    b_rows as c_int,
+                    stride_b_col,
+                    &beta as *const f32,
+                    d_c.as_mut_ptr::<f32>(),
+                    m as c_int,
+                    stride_c_col,
+                    batch as c_int,
+                )
+            },
+            "hipblasSgemmStridedBatched",
+        )?;
+
+        hip_check(
+            unsafe { hipStreamSynchronize(ctx.stream) },
+            "hipStreamSynchronize",
+        )?;
+
+        let mut c_col = vec![0.0f32; total_c];
+        if bytes_c > 0 {
+            hip_check(
+                unsafe {
+                    hipMemcpy(
+                        c_col.as_mut_ptr() as *mut _,
+                        d_c.ptr,
+                        bytes_c,
+                        hipMemcpyKind::hipMemcpyDeviceToHost,
+                    )
+                },
+                "hipMemcpy(C batched)",
+            )?;
+        }
+
+        Ok(from_column_major_batched(&c_col, m, n, batch))
+    }
+
+    pub fn reduce_sum_f32(values: &[f32]) -> RocmResult<f32> {
+        reduce_sum_f32_with_policy(values, SumPrecisionPolicy::Default)
+    }
+
+    pub fn reduce_sum_f32_with_policy(
+        values: &[f32],
+        policy: SumPrecisionPolicy,
+    ) -> RocmResult<f32> {
+        if !matches!(policy, SumPrecisionPolicy::Default) {
+            return Err(
+                "ROCm reduce_sum currently supports only SumPrecisionPolicy::Default".into(),
+            );
+        }
+        if values.is_empty() {
+            return Ok(0.0);
+        }
+        let ctx = global_context()?;
+        hip_check(unsafe { hipSetDevice(ctx.device_id) }, "hipSetDevice")?;
+
+        let d_values = DeviceBuffer::alloc(size_of::<f32>() * values.len())?;
+        let d_ones = DeviceBuffer::alloc(size_of::<f32>() * values.len())?;
+
+        hip_check(
+            unsafe {
+                hipMemcpy(
+                    d_values.ptr,
+                    values.as_ptr() as *const _,
+                    size_of::<f32>() * values.len(),
+                    hipMemcpyKind::hipMemcpyHostToDevice,
+                )
+            },
+            "hipMemcpy(values)",
+        )?;
+        let ones = vec![1.0f32; values.len()];
+        hip_check(
+            unsafe {
+                hipMemcpy(
+                    d_ones.ptr,
+                    ones.as_ptr() as *const _,
+                    size_of::<f32>() * ones.len(),
+                    hipMemcpyKind::hipMemcpyHostToDevice,
+                )
+            },
+            "hipMemcpy(ones)",
+        )?;
+
+        let mut result = 0.0f32;
+        hipblas_check(
+            unsafe {
+                hipblasSdot(
+                    ctx.handle,
+                    values.len() as c_int,
+                    d_values.as_ptr(),
+                    1,
+                    d_ones.as_ptr(),
+                    1,
+                    &mut result as *mut f32,
+                )
+            },
+            "hipblasSdot",
+        )?;
+
+        hip_check(
+            unsafe { hipStreamSynchronize(ctx.stream) },
+            "hipStreamSynchronize",
+        )?;
+
+        Ok(result)
+    }
+
+    fn global_context() -> RocmResult<&'static RocmContext> {
+        match CONTEXT.get_or_init(init_context) {
+            Ok(ctx) => Ok(ctx),
+            Err(err) => Err(err.clone()),
+        }
+    }
+
+    fn init_context() -> RocmResult<RocmContext> {
+        unsafe {
+            hip_check(hipInit(0), "hipInit")?;
+        }
+        let mut count: c_int = 0;
+        hip_check(
+            unsafe { hipGetDeviceCount(&mut count as *mut c_int) },
+            "hipGetDeviceCount",
+        )?;
+        if count <= 0 {
+            return Err("hipGetDeviceCount returned zero devices".into());
+        }
+        let device_id = 0;
+        hip_check(unsafe { hipSetDevice(device_id) }, "hipSetDevice")?;
+
+        let mut stream: hipStream_t = ptr::null_mut();
+        hip_check(
+            unsafe { hipStreamCreate(&mut stream as *mut hipStream_t) },
+            "hipStreamCreate",
+        )?;
+
+        let mut handle: hipblasHandle_t = ptr::null_mut();
+        hipblas_check(
+            unsafe { hipblasCreate(&mut handle as *mut hipblasHandle_t) },
+            "hipblasCreate",
+        )?;
+        hipblas_check(
+            unsafe { hipblasSetStream(handle, stream) },
+            "hipblasSetStream",
+        )?;
+        hipblas_check(
+            unsafe {
+                hipblasSetPointerMode(handle, hipblasPointerMode_t::HIPBLAS_POINTER_MODE_HOST)
+            },
+            "hipblasSetPointerMode",
+        )?;
+
+        Ok(RocmContext {
+            device_id,
+            stream,
+            handle,
+        })
+    }
+
+    fn hip_error_to_string(code: hipError_t) -> String {
+        unsafe {
+            let ptr = hipGetErrorString(code);
+            if ptr.is_null() {
+                format!("hip error {:?}", code as i32)
+            } else {
+                CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            }
+        }
+    }
+
+    fn hip_check(code: hipError_t, context: &str) -> RocmResult<()> {
+        if code == hipError_t::hipSuccess {
+            Ok(())
+        } else {
+            Err(format!("{}: {}", context, hip_error_to_string(code)))
+        }
+    }
+
+    fn hipblas_status_to_string(status: hipblasStatus_t) -> String {
+        unsafe {
+            let ptr = hipblasStatusToString(status);
+            if ptr.is_null() {
+                format!("hipblas status {:?}", status as i32)
+            } else {
+                CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            }
+        }
+    }
+
+    fn hipblas_check(status: hipblasStatus_t, context: &str) -> RocmResult<()> {
+        if status == hipblasStatus_t::HIPBLAS_STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!("{}: {}", context, hipblas_status_to_string(status)))
+        }
+    }
+
+    struct DeviceBuffer {
+        ptr: *mut ::libc::c_void,
+        _size: usize,
+    }
+
+    impl DeviceBuffer {
+        fn alloc(size: usize) -> RocmResult<Self> {
+            if size == 0 {
+                return Ok(Self {
+                    ptr: ptr::null_mut(),
+                    _size: 0,
+                });
+            }
+            let mut ptr = ptr::null_mut();
+            hip_check(
+                unsafe { hipMalloc(&mut ptr as *mut *mut ::libc::c_void, size) },
+                "hipMalloc",
+            )?;
+            Ok(Self { ptr, _size: size })
+        }
+
+        fn as_ptr<T>(&self) -> *const T {
+            self.ptr as *const T
+        }
+
+        fn as_mut_ptr<T>(&self) -> *mut T {
+            self.ptr as *mut T
+        }
+    }
+
+    impl Drop for DeviceBuffer {
+        fn drop(&mut self) {
+            if !self.ptr.is_null() {
+                unsafe {
+                    hipFree(self.ptr);
+                }
+            }
+        }
+    }
+
+    fn to_column_major(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; rows * cols];
+        convert_row_major_to_column_major_into(data, rows, cols, &mut out);
+        out
+    }
+
+    fn from_column_major(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; rows * cols];
+        convert_column_major_to_row_major_into(data, rows, cols, &mut out);
+        out
+    }
+
+    fn to_column_major_batched_strided(
+        data: &[f32],
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        stride: i64,
+    ) -> RocmResult<Vec<f32>> {
+        if stride <= 0 {
+            return Err("batched strided matmul: stride must be positive".into());
+        }
+        let stride = stride as usize;
+        let per_matrix = rows
+            .checked_mul(cols)
+            .ok_or_else(|| "batched strided matmul: size overflow".to_string())?;
+        if per_matrix == 0 {
+            return Ok(vec![0.0f32; batch * per_matrix]);
+        }
+        let required = stride
+            .checked_mul(batch.saturating_sub(1))
+            .and_then(|offset| offset.checked_add(per_matrix))
+            .ok_or_else(|| "batched strided matmul: stride overflow".to_string())?;
+        if data.len() < required {
+            return Err("batched strided matmul: input shorter than stride requires".into());
+        }
+        let mut out = vec![0.0f32; batch * per_matrix];
+        for b in 0..batch {
+            let start = b
+                .checked_mul(stride)
+                .ok_or_else(|| "batched strided matmul: stride overflow".to_string())?;
+            let src = &data[start..start + per_matrix];
+            let dst = &mut out[b * per_matrix..(b + 1) * per_matrix];
+            convert_row_major_to_column_major_into(src, rows, cols, dst);
+        }
+        Ok(out)
+    }
+
+    fn from_column_major_batched(data: &[f32], rows: usize, cols: usize, batch: usize) -> Vec<f32> {
+        let per_matrix = rows * cols;
+        let mut out = vec![0.0f32; batch * per_matrix];
+        for b in 0..batch {
+            let src = &data[b * per_matrix..(b + 1) * per_matrix];
+            let dst = &mut out[b * per_matrix..(b + 1) * per_matrix];
+            convert_column_major_to_row_major_into(src, rows, cols, dst);
+        }
+        out
+    }
+
+    fn convert_row_major_to_column_major_into(
+        data: &[f32],
+        rows: usize,
+        cols: usize,
+        out: &mut [f32],
+    ) {
+        for row in 0..rows {
+            for col in 0..cols {
+                out[col * rows + row] = data[row * cols + col];
+            }
+        }
+    }
+
+    fn convert_column_major_to_row_major_into(
+        data: &[f32],
+        rows: usize,
+        cols: usize,
+        out: &mut [f32],
+    ) {
+        for row in 0..rows {
+            for col in 0..cols {
+                out[row * cols + col] = data[col * rows + row];
+            }
+        }
+    }
+}
+
+#[cfg(any(not(feature = "gpu-rocm"), not(target_os = "linux")))]
+#[allow(dead_code)]
+mod rocm {
+    use super::{MatmulTensorCorePolicy, SumPrecisionPolicy};
+
+    type RocmResult<T> = std::result::Result<T, String>;
+
     pub fn is_available() -> bool {
         false
     }
+
     pub fn matmul_f32(
         _a: &[f32],
         _b: &[f32],
         _m: usize,
         _k: usize,
         _n: usize,
-    ) -> Result<Vec<f32>, String> {
-        Err("rocm not implemented".into())
+    ) -> RocmResult<Vec<f32>> {
+        Err("ROCm backend is not available on this platform".into())
     }
+
+    pub fn matmul_f32_with_policy(
+        _a: &[f32],
+        _b: &[f32],
+        _m: usize,
+        _k: usize,
+        _n: usize,
+        _policy: MatmulTensorCorePolicy,
+    ) -> RocmResult<Vec<f32>> {
+        Err("ROCm backend is not available on this platform".into())
+    }
+
     pub fn matmul_f32_ex(
         _a: &[f32],
         _b: &[f32],
@@ -3692,9 +4462,23 @@ mod rocm {
         _n: usize,
         _ta: bool,
         _tb: bool,
-    ) -> Result<Vec<f32>, String> {
-        Err("rocm not implemented".into())
+    ) -> RocmResult<Vec<f32>> {
+        Err("ROCm backend is not available on this platform".into())
     }
+
+    pub fn matmul_f32_ex_with_policy(
+        _a: &[f32],
+        _b: &[f32],
+        _m: usize,
+        _k: usize,
+        _n: usize,
+        _ta: bool,
+        _tb: bool,
+        _policy: MatmulTensorCorePolicy,
+    ) -> RocmResult<Vec<f32>> {
+        Err("ROCm backend is not available on this platform".into())
+    }
+
     pub fn matmul_batched_f32(
         _a: &[f32],
         _b: &[f32],
@@ -3704,9 +4488,10 @@ mod rocm {
         _n: usize,
         _ta: bool,
         _tb: bool,
-    ) -> Result<Vec<f32>, String> {
-        Err("rocm not implemented".into())
+    ) -> RocmResult<Vec<f32>> {
+        Err("ROCm backend is not available on this platform".into())
     }
+
     pub fn matmul_batched_f32_strided(
         _a: &[f32],
         _b: &[f32],
@@ -3719,8 +4504,19 @@ mod rocm {
         _sa: i64,
         _sb: i64,
         _sc: i64,
-    ) -> Result<Vec<f32>, String> {
-        Err("rocm not implemented".into())
+    ) -> RocmResult<Vec<f32>> {
+        Err("ROCm backend is not available on this platform".into())
+    }
+
+    pub fn reduce_sum_f32(_values: &[f32]) -> RocmResult<f32> {
+        Err("ROCm backend is not available on this platform".into())
+    }
+
+    pub fn reduce_sum_f32_with_policy(
+        _values: &[f32],
+        _policy: SumPrecisionPolicy,
+    ) -> RocmResult<f32> {
+        Err("ROCm backend is not available on this platform".into())
     }
 }
 
@@ -3957,6 +4753,3 @@ mod tests {
         assert_eq!(res_ignore, 0);
     }
 }
-
-
-

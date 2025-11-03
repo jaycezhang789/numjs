@@ -11,6 +11,10 @@ use cust::device::Device;
 use cust::memory::{DeviceBuffer, DeviceCopy};
 use cust::stream::{Stream, StreamFlags};
 use cust::CudaFlags;
+use num_rs_core::gpu as core_gpu;
+use num_rs_core::gpu::{
+    GpuBackendKind as CoreGpuBackendKind, MatmulTensorCorePolicy, SumPrecisionPolicy,
+};
 use std::fmt;
 
 pub struct CudaContext {
@@ -43,21 +47,35 @@ impl GpuContext for CudaContext {
 
     fn matmul_f32(
         &self,
-        _lhs: &[f32],
-        _rhs: &[f32],
-        _m: usize,
-        _n: usize,
-        _k: usize,
+        lhs: &[f32],
+        rhs: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> GpuResult<Vec<f32>> {
-        Err(GpuError::unsupported(
-            "CUDA matmul is not implemented yet; future work will delegate to cuBLAS.",
-        ))
+        if !matches!(
+            core_gpu::active_backend_kind(),
+            Some(CoreGpuBackendKind::Cuda)
+        ) {
+            return Err(GpuError::unavailable(
+                "CUDA backend not initialised in core runtime",
+            ));
+        }
+        core_gpu::matmul_f32_with_policy(lhs, rhs, m, k, n, MatmulTensorCorePolicy::Performance)
+            .map_err(|err| GpuError::backend(format!("CUDA matmul failed: {err}")))
     }
 
-    fn reduce_sum_f32(&self, _data: &[f32]) -> GpuResult<f32> {
-        Err(GpuError::unsupported(
-            "CUDA reduce_sum is not implemented yet; a custom kernel will align with CPU results.",
-        ))
+    fn reduce_sum_f32(&self, data: &[f32]) -> GpuResult<f32> {
+        if !matches!(
+            core_gpu::active_backend_kind(),
+            Some(CoreGpuBackendKind::Cuda)
+        ) {
+            return Err(GpuError::unavailable(
+                "CUDA backend not initialised in core runtime",
+            ));
+        }
+        core_gpu::reduce_sum_f32_with_policy(data, SumPrecisionPolicy::Default)
+            .map_err(|err| GpuError::backend(format!("CUDA reduce_sum failed: {err}")))
     }
 
     fn synchronize(&self) -> GpuResult<()> {

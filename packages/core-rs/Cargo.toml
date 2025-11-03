@@ -22,7 +22,7 @@ gpu-cuda = [
     "cudarc/cublaslt",
     "cudarc/f16",
 ]
-gpu-rocm = ["gpu"]
+gpu-rocm = ["gpu", "dep:hip-sys", "dep:once_cell"]
 sparse-native = ["sprs"]
 sparse-suitesparse = []
 
@@ -44,6 +44,10 @@ once_cell = { version = "1.19", optional = true }
 half = { version = "2.3", optional = true }
 rustfft = "6"
 sprs = { version = "0.11", optional = true }
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hip-sys = { version = "0.1.1", optional = true, features = ["blas"] }
 
 [dev-dependencies]
 proptest = "1"

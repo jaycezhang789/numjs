@@ -6,14 +6,24 @@
 //! later without reshaping the public N-API.
 
 use super::{GpuBackendKind, GpuContext, GpuError, GpuResult};
+use num_rs_core::gpu as core_gpu;
+use num_rs_core::gpu::{
+    GpuBackendKind as CoreGpuBackendKind, MatmulTensorCorePolicy, SumPrecisionPolicy,
+};
 
-/// Minimal stub used to satisfy the shared trait while the implementation lands.
+/// Minimal ROCm context that defers to the shared core bindings.
 pub struct RocmContext;
 
 pub fn create_context() -> GpuResult<Box<dyn GpuContext>> {
-    Err(GpuError::unavailable(
-        "ROCm backend is not implemented yet; enable `gpu-rocm` once HIP/rocBLAS bindings exist.",
-    ))
+    if !matches!(
+        core_gpu::active_backend_kind(),
+        Some(CoreGpuBackendKind::Rocm)
+    ) {
+        return Err(GpuError::unavailable(
+            "ROCm backend not initialised in core runtime",
+        ));
+    }
+    Ok(Box::new(RocmContext))
 }
 
 impl GpuContext for RocmContext {
@@ -27,20 +37,34 @@ impl GpuContext for RocmContext {
 
     fn matmul_f32(
         &self,
-        _lhs: &[f32],
-        _rhs: &[f32],
-        _m: usize,
-        _n: usize,
-        _k: usize,
+        lhs: &[f32],
+        rhs: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> GpuResult<Vec<f32>> {
-        Err(GpuError::unsupported(
-            "ROCm matmul is not implemented yet; future HIP/rocBLAS kernels will mirror CPU results.",
-        ))
+        if !matches!(
+            core_gpu::active_backend_kind(),
+            Some(CoreGpuBackendKind::Rocm)
+        ) {
+            return Err(GpuError::unavailable(
+                "ROCm backend not initialised in core runtime",
+            ));
+        }
+        core_gpu::matmul_f32_with_policy(lhs, rhs, m, k, n, MatmulTensorCorePolicy::Accuracy)
+            .map_err(|err| GpuError::backend(format!("ROCm matmul failed: {err}")))
     }
 
-    fn reduce_sum_f32(&self, _data: &[f32]) -> GpuResult<f32> {
-        Err(GpuError::unsupported(
-            "ROCm reduce_sum is not implemented yet; dedicated kernels will mirror CPU results.",
-        ))
+    fn reduce_sum_f32(&self, data: &[f32]) -> GpuResult<f32> {
+        if !matches!(
+            core_gpu::active_backend_kind(),
+            Some(CoreGpuBackendKind::Rocm)
+        ) {
+            return Err(GpuError::unavailable(
+                "ROCm backend not initialised in core runtime",
+            ));
+        }
+        core_gpu::reduce_sum_f32_with_policy(data, SumPrecisionPolicy::Default)
+            .map_err(|err| GpuError::backend(format!("ROCm reduce_sum failed: {err}")))
     }
 }
