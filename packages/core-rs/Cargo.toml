@@ -23,6 +23,8 @@ gpu-cuda = [
     "cudarc/f16",
 ]
 gpu-rocm = ["gpu", "dep:hip-sys", "dep:once_cell"]
+gpu-native-conv = ["gpu"]
+gpu-native-fft = ["gpu"]
 sparse-native = ["sprs"]
 sparse-suitesparse = []
 

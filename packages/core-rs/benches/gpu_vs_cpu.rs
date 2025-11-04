@@ -8,9 +8,11 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 use num_rs_core::{gpu, reset_copy_bytes, take_copy_bytes};
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
-use std::f32::consts::PI;
-#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
-use std::sync::Arc;
+use std::{
+    env,
+    f32::consts::PI,
+    sync::{Arc, Once},
+};
 
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 fn gpu_backend_kind() -> Option<&'static str> {
@@ -62,6 +64,36 @@ fn assert_close(label: &str, lhs: &[f32], rhs: &[f32], tolerance: f32) {
     if max_err > tolerance {
         panic!("[bench] {label} verification failed: max error {max_err}, tolerance {tolerance}");
     }
+}
+
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KernelStrategy {
+    Auto,
+    NativeOnly,
+    FallbackOnly,
+}
+
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+fn kernel_strategy_from_env(var: &str) -> KernelStrategy {
+    match env::var(var) {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim().to_ascii_lowercase().as_str() {
+            "native" | "gpu" => KernelStrategy::NativeOnly,
+            "fallback" | "cpu" | "matmul" => KernelStrategy::FallbackOnly,
+            _ => KernelStrategy::Auto,
+        },
+        _ => KernelStrategy::Auto,
+    }
+}
+
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+fn conv_kernel_strategy() -> KernelStrategy {
+    kernel_strategy_from_env("NUMJS_BENCH_CONV_KERNEL")
+}
+
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+fn fft_kernel_strategy() -> KernelStrategy {
+    kernel_strategy_from_env("NUMJS_BENCH_FFT_KERNEL")
 }
 
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
@@ -227,6 +259,79 @@ fn conv2d_cpu(input: &[f32], filters: &[f32], spec: Conv2dSpec) -> Vec<f32> {
     out
 }
 
+#[cfg(all(
+    any(feature = "gpu-cuda", feature = "gpu-rocm"),
+    feature = "gpu-native-conv"
+))]
+mod native_conv {
+    use super::{gpu, Conv2dSpec};
+
+    pub(super) fn run(
+        input: &[f32],
+        filters: &[f32],
+        spec: Conv2dSpec,
+    ) -> Result<Vec<f32>, String> {
+        Err(format!(
+            "gpu-native-conv feature enabled but no native conv2d kernel wired for backend {:?}. \
+             Implement native_conv::run to call your CUDA/ROCm/WebGPU kernels and return the GPU result.",
+            gpu::backend_name()
+        ))
+    }
+}
+
+#[cfg(all(
+    any(feature = "gpu-cuda", feature = "gpu-rocm"),
+    feature = "gpu-native-fft"
+))]
+mod native_fft {
+    use super::gpu;
+
+    pub(super) fn run(signal: &[f32], n: usize) -> Result<(Vec<f32>, Vec<f32>), String> {
+        Err(format!(
+            "gpu-native-fft feature enabled but no native FFT kernel wired for backend {:?}. \
+             Implement native_fft::run to dispatch to CUDA/ROCm/WebGPU FFT and return (real, imag).",
+            gpu::backend_name()
+        ))
+    }
+}
+
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+static CONV_NATIVE_WARN_ONCE: Once = Once::new();
+
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+fn run_gpu_conv2d(input: &[f32], filters: &[f32], spec: Conv2dSpec) -> Result<Vec<f32>, String> {
+    match conv_kernel_strategy() {
+        KernelStrategy::FallbackOnly => gpu_conv2d_via_matmul(input, filters, spec),
+        KernelStrategy::NativeOnly => try_native_conv2d(input, filters, spec),
+        KernelStrategy::Auto => match try_native_conv2d(input, filters, spec) {
+            Ok(val) => Ok(val),
+            Err(err) => {
+                CONV_NATIVE_WARN_ONCE.call_once(|| {
+                    eprintln!(
+                        "[bench][conv2d] native GPU kernel unavailable ({err}); falling back to im2col+matmul"
+                    );
+                });
+                gpu_conv2d_via_matmul(input, filters, spec)
+            }
+        },
+    }
+}
+
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+fn try_native_conv2d(input: &[f32], filters: &[f32], spec: Conv2dSpec) -> Result<Vec<f32>, String> {
+    #[cfg(feature = "gpu-native-conv")]
+    {
+        native_conv::run(input, filters, spec)
+    }
+    #[cfg(not(feature = "gpu-native-conv"))]
+    {
+        Err(
+            "native conv kernel disabled; rebuild with `gpu-native-conv` feature once available"
+                .into(),
+        )
+    }
+}
+
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
 fn cpu_batched_matmul(
     a: &[f32],
@@ -296,6 +401,48 @@ fn gpu_dft_using_matmul(
     let real = gpu::matmul_f32(cos, signal, n, n, 1)?;
     let imag = gpu::matmul_f32(sin, signal, n, n, 1)?;
     Ok((real, imag))
+}
+
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+static FFT_NATIVE_WARN_ONCE: Once = Once::new();
+
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+fn run_gpu_fft(
+    signal: &[f32],
+    cos: &[f32],
+    sin: &[f32],
+    n: usize,
+) -> Result<(Vec<f32>, Vec<f32>), String> {
+    match fft_kernel_strategy() {
+        KernelStrategy::FallbackOnly => gpu_dft_using_matmul(signal, cos, sin, n),
+        KernelStrategy::NativeOnly => try_native_fft(signal, n),
+        KernelStrategy::Auto => match try_native_fft(signal, n) {
+            Ok(res) => Ok(res),
+            Err(err) => {
+                FFT_NATIVE_WARN_ONCE.call_once(|| {
+                    eprintln!(
+                        "[bench][fft] native GPU kernel unavailable ({err}); falling back to DFT-via-matmul"
+                    );
+                });
+                gpu_dft_using_matmul(signal, cos, sin, n)
+            }
+        },
+    }
+}
+
+#[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
+fn try_native_fft(signal: &[f32], n: usize) -> Result<(Vec<f32>, Vec<f32>), String> {
+    #[cfg(feature = "gpu-native-fft")]
+    {
+        native_fft::run(signal, n)
+    }
+    #[cfg(not(feature = "gpu-native-fft"))]
+    {
+        Err(
+            "native FFT kernel disabled; rebuild with `gpu-native-fft` feature once available"
+                .into(),
+        )
+    }
 }
 
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm"))]
@@ -444,7 +591,7 @@ fn bench_conv2d(c: &mut Criterion) {
         let input_vec: Vec<f32> = (0..input_len).map(|i| (i as f32 * 0.013).cos()).collect();
         let filter_vec: Vec<f32> = (0..filter_len).map(|i| (i as f32 * 0.019).sin()).collect();
         let gpu_out =
-            gpu_conv2d_via_matmul(&input_vec, &filter_vec, spec).expect("warmup gpu conv2d");
+            run_gpu_conv2d(&input_vec, &filter_vec, spec).expect("warmup gpu conv2d kernel");
         let cpu_out = conv2d_cpu(&input_vec, &filter_vec, spec);
         assert_close("conv2d", &gpu_out, &cpu_out, 1e-3);
 
@@ -470,7 +617,7 @@ fn bench_conv2d(c: &mut Criterion) {
             &gpu_inputs,
             |bch, data| {
                 bch.iter(|| {
-                    let _ = gpu_conv2d_via_matmul(
+                    let _ = run_gpu_conv2d(
                         black_box(data.0.as_slice()),
                         black_box(data.1.as_slice()),
                         spec,
@@ -566,13 +713,13 @@ fn bench_fft_dft(c: &mut Criterion) {
     for &n in &sizes {
         let fixture = build_dft_fixture(n);
         let (cpu_real, cpu_imag) = cpu_dft(&fixture.signal);
-        let (gpu_real, gpu_imag) = gpu_dft_using_matmul(
+        let (gpu_real, gpu_imag) = run_gpu_fft(
             &fixture.signal,
             fixture.cos.as_slice(),
             fixture.sin.as_slice(),
             n,
         )
-        .expect("warmup gpu fft");
+        .expect("warmup gpu fft kernel");
         assert_close("fft-real", &gpu_real, &cpu_real, 1e-3);
         assert_close("fft-imag", &gpu_imag, &cpu_imag, 1e-3);
 
@@ -582,7 +729,7 @@ fn bench_fft_dft(c: &mut Criterion) {
             &fixture_gpu,
             |bch, data| {
                 bch.iter(|| {
-                    let _ = gpu_dft_using_matmul(
+                    let _ = run_gpu_fft(
                         black_box(data.signal.as_slice()),
                         black_box(data.cos.as_slice()),
                         black_box(data.sin.as_slice()),
